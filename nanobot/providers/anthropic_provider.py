@@ -51,8 +51,9 @@ class AnthropicProvider(LLMProvider):
 
     @staticmethod
     def _strip_prefix(model: str) -> str:
-        if model.startswith("anthropic/"):
-            return model[len("anthropic/"):]
+        for prefix in ("anthropic/", "claude-ai/", "claude_ai/"):
+            if model.startswith(prefix):
+                return model[len(prefix):]
         return model
 
     # ------------------------------------------------------------------
@@ -392,6 +393,10 @@ class AnthropicProvider(LLMProvider):
     # Public API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_temperature_deprecated_error(e: Exception) -> bool:
+        return "temperature" in str(e).lower() and "deprecated" in str(e).lower()
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -410,6 +415,13 @@ class AnthropicProvider(LLMProvider):
             response = await self._client.messages.create(**kwargs)
             return self._parse_response(response)
         except Exception as e:
+            if self._is_temperature_deprecated_error(e):
+                kwargs.pop("temperature", None)
+                try:
+                    response = await self._client.messages.create(**kwargs)
+                    return self._parse_response(response)
+                except Exception as e2:
+                    return LLMResponse(content=f"Error calling LLM: {e2}", finish_reason="error")
             return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
 
     async def chat_stream(
@@ -435,6 +447,17 @@ class AnthropicProvider(LLMProvider):
                 response = await stream.get_final_message()
             return self._parse_response(response)
         except Exception as e:
+            if self._is_temperature_deprecated_error(e):
+                kwargs.pop("temperature", None)
+                try:
+                    async with self._client.messages.stream(**kwargs) as stream:
+                        if on_content_delta:
+                            async for text in stream.text_stream:
+                                await on_content_delta(text)
+                        response = await stream.get_final_message()
+                    return self._parse_response(response)
+                except Exception as e2:
+                    return LLMResponse(content=f"Error calling LLM: {e2}", finish_reason="error")
             return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
 
     def get_default_model(self) -> str:

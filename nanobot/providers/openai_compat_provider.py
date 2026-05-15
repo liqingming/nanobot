@@ -433,7 +433,11 @@ class OpenAICompatProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason or "stop",
             usage=self._extract_usage(response),
-            reasoning_content=getattr(msg, "reasoning_content", None) or None,
+            reasoning_content=(
+                getattr(msg, "reasoning_content", None)
+                or (msg.model_extra or {}).get("reasoning_content")
+                or None
+            ),
         )
 
     @classmethod
@@ -469,6 +473,8 @@ class OpenAICompatProvider(LLMProvider):
             if fn_prov:
                 buf["fn_prov"] = fn_prov
 
+        reasoning_parts: list[str] = []
+
         for chunk in chunks:
             if isinstance(chunk, str):
                 content_parts.append(chunk)
@@ -492,6 +498,9 @@ class OpenAICompatProvider(LLMProvider):
                 text = cls._extract_text_content(delta.get("content"))
                 if text:
                     content_parts.append(text)
+                rc = delta.get("reasoning_content")
+                if rc:
+                    reasoning_parts.append(str(rc))
                 for idx, tc in enumerate(delta.get("tool_calls") or []):
                     _accum_tc(tc, idx)
                 usage = cls._extract_usage(chunk_map) or usage
@@ -506,6 +515,9 @@ class OpenAICompatProvider(LLMProvider):
             delta = choice.delta
             if delta and delta.content:
                 content_parts.append(delta.content)
+            rc = getattr(delta, "reasoning_content", None) if delta else None
+            if rc:
+                reasoning_parts.append(rc)
             for tc in (delta.tool_calls or []) if delta else []:
                 _accum_tc(tc, getattr(tc, "index", 0))
 
@@ -524,6 +536,7 @@ class OpenAICompatProvider(LLMProvider):
             ],
             finish_reason=finish_reason,
             usage=usage,
+            reasoning_content="".join(reasoning_parts) or None,
         )
 
     @staticmethod
