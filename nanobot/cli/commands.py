@@ -923,6 +923,8 @@ def agent(
                                 )
                             continue
                         if msg.metadata.get("_streamed"):
+                            if msg.content:
+                                turn_response.append((msg.content, dict(msg.metadata or {})))
                             turn_done.set()
                             continue
 
@@ -988,6 +990,11 @@ def agent(
                             if content and not meta.get("_streamed"):
                                 if renderer:
                                     await renderer.close()
+                                _print_agent_response(
+                                    content, render_markdown=markdown, metadata=meta,
+                                )
+                            elif content and renderer and not renderer.streamed:
+                                await renderer.close()
                                 _print_agent_response(
                                     content, render_markdown=markdown, metadata=meta,
                                 )
