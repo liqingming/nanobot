@@ -128,11 +128,22 @@ class SplitTUI:
         self._stream_cache: str = ""         # cached ANSI render of stream_buf
         self._stream_cache_key: int = 0      # len(stream_buf) when cache was built
         self._scroll_offset: int = 0         # lines from bottom; 0 = newest visible
+        self._last_sep: bool = False         # True if last appended item was a separator
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._app: Application | None = None
         self._setup(history_file)
 
     # ── Session history restore ────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_ts(ts_iso: str | None) -> str | None:
+        """Convert ISO timestamp stored in session to display format, or None."""
+        if not ts_iso:
+            return None
+        try:
+            return datetime.fromisoformat(ts_iso).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
 
     @staticmethod
     def _extract_text(content: Any) -> str:
@@ -160,12 +171,16 @@ class SplitTUI:
                     idx = text.find("\n\n")
                     text = text[idx + 2:] if idx != -1 else ""
                 if text.strip():
-                    self._output_lines.append(self._render_user_echo(text.strip()))
+                    ts = self._fmt_ts(msg.get("timestamp"))
+                    self._append_sep()
+                    self._append_block(self._render_user_echo(text.strip(), ts=ts))
+                    self._append_sep()
 
             elif role == "assistant":
                 text = self._extract_text(content)
                 if text.strip():
-                    self._output_lines.append(self._render_response(text.strip()))
+                    ts = self._fmt_ts(msg.get("timestamp"))
+                    self._append_block(self._render_response(text.strip(), ts=ts))
 
         if self._output_lines:
             self._pin_to_bottom()
@@ -206,8 +221,30 @@ class SplitTUI:
     def _render_system(self, text: str) -> str:
         return _rich_to_ansi(lambda c: c.print(f"[dim]{text}[/dim]"))
 
-    def _render_user_echo(self, text: str) -> str:
-        return _rich_to_ansi(lambda c: (c.print(), c.print(f"[bold blue]You:[/bold blue] {text}")))
+    def _render_separator(self) -> str:
+        w = _ansi_width()
+        return _rich_to_ansi(lambda c: c.print(f"[dim]{'─' * w}[/dim]"))
+
+    def _render_user_echo(self, text: str, ts: str | None = None) -> str:
+        ts = ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        def _fn(c: Console) -> None:
+            c.print()
+            c.print(f"[bold blue]You[/bold blue] [dim]{ts}[/dim]")
+            c.print(text)
+        return _rich_to_ansi(_fn)
+
+    # ── Internal append helpers ────────────────────────────────────────────
+
+    def _append_sep(self) -> None:
+        """Append a separator, skipping if one was already just appended."""
+        if not self._last_sep:
+            self._output_lines.append(self._render_separator())
+            self._last_sep = True
+
+    def _append_block(self, rendered: str) -> None:
+        """Append any non-separator block and reset the separator flag."""
+        self._output_lines.append(rendered)
+        self._last_sep = False
 
     def _render_thinking(self) -> str:
         ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -331,25 +368,28 @@ class SplitTUI:
 
     def add_user_echo(self, text: str) -> None:
         """Echo the user's submitted message to the output pane."""
-        self._output_lines.append(self._render_user_echo(text))
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._append_sep()
+        self._append_block(self._render_user_echo(text, ts=ts))
+        self._append_sep()
         self._pin_to_bottom()
         self._invalidate()
 
     def add_response(self, content: str, metadata: dict | None = None, ts: str | None = None) -> None:
         """Add a completed nanobot response block."""
-        self._output_lines.append(self._render_response(content, metadata, ts))
+        self._append_block(self._render_response(content, metadata, ts))
         self._pin_to_bottom()
         self._invalidate()
 
     def add_progress(self, text: str) -> None:
         """Add a progress / tool-hint line."""
-        self._output_lines.append(self._render_progress(text))
+        self._append_block(self._render_progress(text))
         self._pin_to_bottom()
         self._invalidate()
 
     def add_system(self, text: str) -> None:
         """Add a system notification line (e.g., 'queued')."""
-        self._output_lines.append(self._render_system(text))
+        self._append_block(self._render_system(text))
         self._pin_to_bottom()
         self._invalidate()
 
@@ -375,7 +415,7 @@ class SplitTUI:
     def flush_stream(self, metadata: dict | None = None) -> None:
         """Finalize the current stream: render to history and clear buffer."""
         if self._stream_buf.strip():
-            self._output_lines.append(
+            self._append_block(
                 self._render_response(self._stream_buf, metadata, ts=self._stream_ts)
             )
         self._stream_buf = ""
