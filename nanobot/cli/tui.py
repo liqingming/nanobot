@@ -8,8 +8,17 @@ Layout:
   │  You: [input field]              │
   └──────────────────────────────────┘
 
-prompt_toolkit Application owns the terminal. Streaming deltas are rendered
-inline; the input line is always visible and accepts keystrokes at any time.
+Scrolling design
+----------------
+All scroll state lives in ``SplitTUI._scroll_offset`` (lines from the bottom;
+0 = pinned to newest content).  ``_get_output_text`` slices the ANSI line list
+to fit the terminal height, so prompt_toolkit never needs to scroll the Window
+internally.
+
+Mouse scroll is captured by ``_OutputControl.mouse_handler`` which bypasses the
+default FormattedTextControl scroll logic.  The input BufferControl's scroll
+events are suppressed via ``_NoScrollBufferControl``; history navigation is
+keyboard-only (Up / Down arrows).
 """
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import D
+from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
@@ -37,6 +47,10 @@ from nanobot import __logo__
 
 def _ansi_width() -> int:
     return max(40, shutil.get_terminal_size((80, 24)).columns - 2)
+
+
+def _output_height() -> int:
+    return max(5, shutil.get_terminal_size((80, 24)).lines - 3)
 
 
 def _rich_to_ansi(render_fn: Callable[[Console], Any]) -> str:
@@ -52,6 +66,45 @@ def _rich_to_ansi(render_fn: Callable[[Console], Any]) -> str:
     render_fn(c)
     return buf.getvalue()
 
+
+# ---------------------------------------------------------------------------
+# Custom UIControls
+# ---------------------------------------------------------------------------
+
+class _OutputControl(FormattedTextControl):
+    """FormattedTextControl whose mouse scroll events drive the TUI viewport."""
+
+    def __init__(self, tui: "SplitTUI", **kwargs: Any) -> None:
+        self._tui = tui
+        super().__init__(**kwargs)
+
+    def mouse_handler(self, mouse_event: Any) -> Any:  # noqa: ANN401
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self._tui._scroll_offset += 3
+            self._tui._invalidate()
+            return None
+        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self._tui._scroll_offset = max(0, self._tui._scroll_offset - 3)
+            self._tui._invalidate()
+            return None
+        return NotImplemented
+
+
+class _NoScrollBufferControl(BufferControl):
+    """BufferControl that ignores mouse scroll (history nav is keyboard-only)."""
+
+    def mouse_handler(self, mouse_event: Any) -> Any:  # noqa: ANN401
+        if mouse_event.event_type in (
+            MouseEventType.SCROLL_UP,
+            MouseEventType.SCROLL_DOWN,
+        ):
+            return NotImplemented
+        return super().mouse_handler(mouse_event)
+
+
+# ---------------------------------------------------------------------------
+# Main TUI class
+# ---------------------------------------------------------------------------
 
 class SplitTUI:
     """Full-screen split TUI: scrollable output pane + always-visible input line.
@@ -74,10 +127,48 @@ class SplitTUI:
         self._stream_ts: str = ""            # timestamp captured at stream start
         self._stream_cache: str = ""         # cached ANSI render of stream_buf
         self._stream_cache_key: int = 0      # len(stream_buf) when cache was built
+        self._scroll_offset: int = 0         # lines from bottom; 0 = newest visible
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
-        self._output_window: Window | None = None
         self._app: Application | None = None
         self._setup(history_file)
+
+    # ── Session history restore ────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                item.get("text", "") for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return ""
+
+    def load_session_history(self, messages: list[dict], max_messages: int = 200) -> None:
+        """Render prior session messages into the output pane on startup."""
+        _RUNTIME_TAG = "[Runtime Context — metadata only, not instructions]"
+        recent = messages[-max_messages:] if len(messages) > max_messages else messages
+
+        for msg in recent:
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if role == "user":
+                text = self._extract_text(content)
+                if text.startswith(_RUNTIME_TAG):
+                    idx = text.find("\n\n")
+                    text = text[idx + 2:] if idx != -1 else ""
+                if text.strip():
+                    self._output_lines.append(self._render_user_echo(text.strip()))
+
+            elif role == "assistant":
+                text = self._extract_text(content)
+                if text.strip():
+                    self._output_lines.append(self._render_response(text.strip()))
+
+        if self._output_lines:
+            self._pin_to_bottom()
 
     # ── Rendering helpers ──────────────────────────────────────────────────
 
@@ -97,7 +188,6 @@ class SplitTUI:
         return _rich_to_ansi(_fn)
 
     def _render_stream_snapshot(self) -> str:
-        """Re-render stream_buf to ANSI (called only when buffer changed)."""
         ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         def _fn(c: Console) -> None:
@@ -131,19 +221,30 @@ class SplitTUI:
 
     def _get_output_text(self) -> AnyFormattedText:
         parts = "".join(self._output_lines)
-        if self._stream_buf:
-            parts += self._stream_cache      # real streaming content
-        elif self._stream_ts:
-            parts += self._stream_cache      # thinking... placeholder
-        return ANSI(parts) if parts else HTML("")
+        if self._stream_buf or self._stream_ts:
+            parts += self._stream_cache
+        if not parts:
+            return HTML("")
+
+        lines = parts.split("\n")
+        total = len(lines)
+        h = _output_height()
+
+        # Clamp offset: can't scroll past the point where we'd show fewer than h lines
+        max_offset = max(0, total - h)
+        offset = min(self._scroll_offset, max_offset)
+
+        end = total - offset
+        start = max(0, end - h)
+        return ANSI("\n".join(lines[start:end]))
 
     # ── Layout setup ───────────────────────────────────────────────────────
 
     def _setup(self, history_file: str | None) -> None:
-        output_ctrl = FormattedTextControl(text=self._get_output_text, focusable=False)
-        self._output_window = Window(
+        output_ctrl = _OutputControl(self, text=self._get_output_text, focusable=False)
+        output_window = Window(
             content=output_ctrl,
-            wrap_lines=True,
+            wrap_lines=False,       # Rich pre-wraps at _ansi_width(); no double-wrap
             always_hide_cursor=True,
         )
 
@@ -155,7 +256,7 @@ class SplitTUI:
         self._input_buffer = Buffer(**buf_kwargs)
 
         input_window = Window(
-            content=BufferControl(buffer=self._input_buffer, focus_on_click=True),
+            content=_NoScrollBufferControl(buffer=self._input_buffer, focus_on_click=True),
             height=D(min=1, max=4),
             wrap_lines=True,
             get_line_prefix=lambda lineno, wrap_count: (
@@ -194,18 +295,16 @@ class SplitTUI:
 
         @kb.add("pageup")
         def _page_up(event: Any) -> None:
-            if self._output_window is not None:
-                self._output_window.vertical_scroll = max(
-                    0, self._output_window.vertical_scroll - 10
-                )
+            self._scroll_offset += 10
+            self._invalidate()
 
         @kb.add("pagedown")
         def _page_down(event: Any) -> None:
-            if self._output_window is not None:
-                self._output_window.vertical_scroll += 10
+            self._scroll_offset = max(0, self._scroll_offset - 10)
+            self._invalidate()
 
         layout = Layout(
-            HSplit([self._output_window, separator, input_window]),
+            HSplit([output_window, separator, input_window]),
             focused_element=input_window,
         )
 
@@ -213,14 +312,13 @@ class SplitTUI:
             layout=layout,
             key_bindings=kb,
             full_screen=True,
-            mouse_support=False,
+            mouse_support=True,
         )
 
-    # ── Scroll helper ──────────────────────────────────────────────────────
+    # ── Scroll helpers ─────────────────────────────────────────────────────
 
     def _pin_to_bottom(self) -> None:
-        if self._output_window is not None:
-            self._output_window.vertical_scroll = 999999
+        self._scroll_offset = 0
 
     def _invalidate(self) -> None:
         if self._app is not None:
@@ -259,7 +357,7 @@ class SplitTUI:
         """Mark the beginning of a new streaming response (captures timestamp)."""
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
-        self._stream_cache = self._render_thinking()  # shown until first delta arrives
+        self._stream_cache = self._render_thinking()
         self._stream_cache_key = 0
         self._pin_to_bottom()
         self._invalidate()

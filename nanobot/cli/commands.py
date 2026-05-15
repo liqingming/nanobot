@@ -910,6 +910,11 @@ def agent(
 
         async def run_interactive():
             tui = SplitTUI(render_markdown=markdown, history_file=history_file)
+
+            # Restore prior conversation into the output pane
+            session = agent_loop.sessions.get_or_create(f"{cli_channel}:{cli_chat_id}")
+            tui.load_session_history(session.messages)
+
             bus_task = asyncio.create_task(agent_loop.run())
             is_processing = False
             pending_queue: list[str] = []
