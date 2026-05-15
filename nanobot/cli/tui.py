@@ -165,34 +165,52 @@ class _PopupMenuControl(UIControl):
         all_items = self._tui._popup_items
         idx = self._tui._popup_idx
         mode = self._tui._popup_mode
+        n = len(all_items)
 
         # Scroll popup window to keep selected item visible
         start = max(0, idx - self.MAX_VISIBLE + 1)
-        if start + self.MAX_VISIBLE > len(all_items):
-            start = max(0, len(all_items) - self.MAX_VISIBLE)
-        visible = all_items[start : start + self.MAX_VISIBLE]
+        if start + self.MAX_VISIBLE > n:
+            start = max(0, n - self.MAX_VISIBLE)
+        end = min(n, start + self.MAX_VISIBLE)
+        visible = all_items[start:end]
+        has_above = start > 0
+        has_below = end < n
+
+        # Build line descriptors with optional scroll hints
+        line_descs: list[tuple[str, Any]] = []
+        if has_above:
+            line_descs.append(("up", start))
+        for i, (value, label) in enumerate(visible):
+            line_descs.append(("item", (start + i, value, label)))
+        if has_below:
+            line_descs.append(("down", n - end))
 
         def get_line(i: int) -> list[tuple[str, str]]:
-            if i >= len(visible):
+            if i >= len(line_descs):
                 return [("", "")]
-            value, label = visible[i]
-            actual_idx = start + i
+            kind, data = line_descs[i]
+            if kind == "up":
+                hint = f"  ↑ 还有 {data} 项"
+                return [("fg:ansibrightblack", hint + " " * max(0, width - _wcswidth(hint)))]
+            if kind == "down":
+                hint = f"  ↓ 还有 {data} 项"
+                return [("fg:ansibrightblack", hint + " " * max(0, width - _wcswidth(hint)))]
+            actual_idx, value, label = data
             selected = actual_idx == idx
             prefix = " ▶ " if selected else "   "
             sel_style = "bg:#1e3a5f bold fg:ansiwhite"
             nrm_style = "fg:ansibrightblack"
             style = sel_style if selected else nrm_style
             if mode == "command":
-                # value = "/cmd", label = description; pad name to 12 display cols
                 dw = max(0, _wcswidth(value))
                 pad = max(0, 12 - dw)
                 body = f"{prefix}{value}{' ' * pad}  {label}"
             else:
                 body = f"{prefix}{value}"
-            tail = " " * max(0, width - _wcswidth(body))
+            tail = " " * max(0, width - 1 - _wcswidth(body))
             return [(style, body + tail)]
 
-        return UIContent(get_line=get_line, line_count=len(visible), show_cursor=False)
+        return UIContent(get_line=get_line, line_count=len(line_descs), show_cursor=False)
 
     def is_focusable(self) -> bool:
         return False
@@ -568,9 +586,7 @@ class SplitTUI:
         popup_menu = ConditionalContainer(
             Window(
                 content=popup_ctrl,
-                height=lambda: D.exact(
-                    min(len(self._popup_items), _PopupMenuControl.MAX_VISIBLE)
-                ),
+                height=lambda: D.exact(self._popup_height()),
                 always_hide_cursor=True,
             ),
             filter=Condition(lambda: bool(self._popup_items)),
@@ -636,6 +652,19 @@ class SplitTUI:
         self._popup_on_select = None
         self._popup_all_topics = []
         self._invalidate()
+
+    def _popup_height(self) -> int:
+        """Total rendered lines for the popup (items + scroll hint rows)."""
+        n = len(self._popup_items)
+        if n == 0:
+            return 0
+        MAX = _PopupMenuControl.MAX_VISIBLE
+        idx = self._popup_idx
+        start = max(0, idx - MAX + 1)
+        if start + MAX > n:
+            start = max(0, n - MAX)
+        end = min(n, start + MAX)
+        return (end - start) + (1 if start > 0 else 0) + (1 if end < n else 0)
 
     def _update_popup(self) -> None:
         """Recompute popup items based on current buffer text (called on text change)."""
