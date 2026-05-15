@@ -915,6 +915,14 @@ def agent(
             session = agent_loop.sessions.get_or_create(f"{cli_channel}:{cli_chat_id}")
             tui.load_session_history(session.messages)
 
+            # Show initial context usage estimate so the bar is visible from startup
+            if agent_loop.context_window_tokens:
+                try:
+                    ctx_est, _ = agent_loop.memory_consolidator.estimate_session_prompt_tokens(session)
+                    tui.update_context_usage(ctx_est, agent_loop.context_window_tokens)
+                except Exception:
+                    pass
+
             bus_task = asyncio.create_task(agent_loop.run())
             is_processing = False
             pending_queue: list[str] = []
