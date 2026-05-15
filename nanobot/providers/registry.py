@@ -193,6 +193,16 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="anthropic",
         supports_prompt_caching=True,
     ),
+    # Claude.ai: OAuth-based, uses claude.ai subscription account (no API key needed)
+    ProviderSpec(
+        name="claude_ai",
+        keywords=("claude-ai",),
+        env_key="",
+        display_name="Claude.ai",
+        backend="claude_ai_oauth",
+        is_oauth=True,
+        supports_prompt_caching=True,
+    ),
     # OpenAI: SDK default base URL (no override needed)
     ProviderSpec(
         name="openai",

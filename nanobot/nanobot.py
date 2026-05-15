@@ -131,7 +131,15 @@ def _make_provider(config: Any) -> Any:
         if needs_key and not exempt:
             raise ValueError(f"No API key configured for provider '{provider_name}'.")
 
-    if backend == "openai_codex":
+    if backend == "claude_ai_oauth":
+        from nanobot.providers.claude_ai_oauth_provider import ClaudeAIOAuthProvider
+
+        provider = ClaudeAIOAuthProvider(
+            default_model=model,
+            api_base=config.get_api_base(model),
+            extra_headers=p.extra_headers if p else None,
+        )
+    elif backend == "openai_codex":
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
         provider = OpenAICodexProvider(default_model=model)

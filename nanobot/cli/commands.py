@@ -405,7 +405,14 @@ def _make_provider(config: Config):
             raise typer.Exit(1)
 
     # --- instantiation by backend ---
-    if backend == "openai_codex":
+    if backend == "claude_ai_oauth":
+        from nanobot.providers.claude_ai_oauth_provider import ClaudeAIOAuthProvider
+        provider = ClaudeAIOAuthProvider(
+            default_model=model,
+            api_base=config.get_api_base(model),
+            extra_headers=p.extra_headers if p else None,
+        )
+    elif backend == "openai_codex":
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
         provider = OpenAICodexProvider(default_model=model)
     elif backend == "azure_openai":
@@ -1319,6 +1326,37 @@ def _login_github_copilot() -> None:
     except Exception as e:
         console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)
+
+
+@_register_login("claude_ai")
+def _login_claude_ai() -> None:
+    from nanobot.providers.claude_ai_oauth_provider import (
+        CLAUDE_CODE_CRED_FILE,
+        save_oauth_token,
+    )
+
+    # Try to import from Claude Code credentials silently
+    if CLAUDE_CODE_CRED_FILE.exists():
+        try:
+            import json as _json
+            data = _json.loads(CLAUDE_CODE_CRED_FILE.read_text(encoding="utf-8"))
+            token = (data.get("claudeAiOauth") or {}).get("accessToken", "")
+            if token:
+                save_oauth_token(token)
+                console.print("[green]✓ OAuth token imported from Claude Code credentials[/green]")
+                return
+        except Exception:
+            pass
+
+    # Fall back to manual token entry
+    console.print("[cyan]Paste your Claude.ai OAuth access token below.[/cyan]")
+    console.print("[dim]Tip: run 'claude login' first, then the token is in ~/.claude/.credentials.json[/dim]\n")
+    token = typer.prompt("Access token", hide_input=True)
+    if not token.strip():
+        console.print("[red]✗ No token provided[/red]")
+        raise typer.Exit(1)
+    save_oauth_token(token.strip())
+    console.print("[green]✓ Claude.ai OAuth token saved[/green]")
 
 
 if __name__ == "__main__":

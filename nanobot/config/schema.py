@@ -86,6 +86,7 @@ class ProvidersConfig(Base):
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
+    claude_ai: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Claude.ai subscription (OAuth)
 
 
 class HeartbeatConfig(Base):
