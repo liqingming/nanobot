@@ -129,6 +129,8 @@ class SplitTUI:
         self._stream_cache_key: int = 0      # len(stream_buf) when cache was built
         self._scroll_offset: int = 0         # lines from bottom; 0 = newest visible
         self._last_sep: bool = False         # True if last appended item was a separator
+        self._thinking_frame: int = 0        # spinner frame index
+        self._thinking_task: Any = None      # asyncio.Task for spinner animation
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._app: Application | None = None
         self._setup(history_file)
@@ -246,13 +248,32 @@ class SplitTUI:
         self._output_lines.append(rendered)
         self._last_sep = False
 
+    _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
     def _render_thinking(self) -> str:
         ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        spinner = self._SPINNER[self._thinking_frame % len(self._SPINNER)]
         def _fn(c: Console) -> None:
             c.print()
             c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
-            c.print("[dim]thinking...[/dim]")
+            c.print(f"[dim]{spinner} thinking...[/dim]")
         return _rich_to_ansi(_fn)
+
+    async def _animate_thinking(self) -> None:
+        import asyncio
+        try:
+            while True:
+                await asyncio.sleep(0.1)
+                self._thinking_frame += 1
+                self._stream_cache = self._render_thinking()
+                self._invalidate()
+        except asyncio.CancelledError:
+            pass
+
+    def _cancel_thinking(self) -> None:
+        if self._thinking_task is not None:
+            self._thinking_task.cancel()
+            self._thinking_task = None
 
     # ── FormattedTextControl callback ──────────────────────────────────────
 
@@ -395,15 +416,20 @@ class SplitTUI:
 
     def stream_start(self) -> None:
         """Mark the beginning of a new streaming response (captures timestamp)."""
+        import asyncio
+        self._cancel_thinking()
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
+        self._thinking_frame = 0
         self._stream_cache = self._render_thinking()
         self._stream_cache_key = 0
         self._pin_to_bottom()
         self._invalidate()
+        self._thinking_task = asyncio.ensure_future(self._animate_thinking())
 
     def stream_delta(self, delta: str) -> None:
         """Append a streaming delta and refresh the output pane."""
+        self._cancel_thinking()
         self._stream_buf += delta
         key = len(self._stream_buf)
         if key != self._stream_cache_key:
@@ -414,6 +440,7 @@ class SplitTUI:
 
     def flush_stream(self, metadata: dict | None = None) -> None:
         """Finalize the current stream: render to history and clear buffer."""
+        self._cancel_thinking()
         if self._stream_buf.strip():
             self._append_block(
                 self._render_response(self._stream_buf, metadata, ts=self._stream_ts)
@@ -427,6 +454,7 @@ class SplitTUI:
 
     def pop_stream(self) -> str:
         """Return accumulated stream text and clear without adding to history."""
+        self._cancel_thinking()
         buf = self._stream_buf
         self._stream_buf = ""
         self._stream_cache = ""
