@@ -133,6 +133,8 @@ class SplitTUI:
         self._last_sep: bool = False         # True if last appended item was a separator
         self._thinking_frame: int = 0        # spinner frame index
         self._thinking_task: Any = None      # asyncio.Task for spinner animation
+        self._ctx_used: int = 0              # last known prompt tokens
+        self._ctx_total: int = 0             # context window size
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._app: Application | None = None
         self._setup(history_file)
@@ -301,7 +303,25 @@ class SplitTUI:
             self._thinking_task.cancel()
             self._thinking_task = None
 
-    # ── FormattedTextControl callback ──────────────────────────────────────
+    # ── FormattedTextControl callbacks ────────────────────────────────────
+
+    def _get_status_text(self) -> AnyFormattedText:
+        if not self._ctx_total:
+            return [("", "")]
+        pct = min(100, round(self._ctx_used * 100 / self._ctx_total))
+        bar_width = 12
+        filled = round(pct * bar_width / 100)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        if pct >= 85:
+            style = "bold fg:ansired"
+        elif pct >= 70:
+            style = "fg:ansiyellow"
+        else:
+            style = "fg:ansibrightblack"
+        label = f"ctx {pct}%  {bar}  "
+        w = shutil.get_terminal_size((80, 24)).columns
+        padding = max(0, w - len(label))
+        return [("", " " * padding), (style, label)]
 
     def _get_output_text(self) -> AnyFormattedText:
         parts = "".join(self._output_lines)
@@ -389,8 +409,11 @@ class SplitTUI:
 
         bottom_border = Window(height=1, char="─", style="class:separator")
 
+        status_ctrl = FormattedTextControl(text=self._get_status_text, focusable=False)
+        status_window = Window(content=status_ctrl, height=1, always_hide_cursor=True)
+
         layout = Layout(
-            HSplit([output_window, separator, input_window, bottom_border]),
+            HSplit([output_window, separator, input_window, bottom_border, status_window]),
             focused_element=input_window,
         )
 
@@ -414,6 +437,12 @@ class SplitTUI:
 
     def set_on_submit(self, callback: Callable[[str], Awaitable[None]]) -> None:
         self._on_submit = callback
+
+    def update_context_usage(self, used: int, total: int) -> None:
+        """Refresh the context-usage indicator (called after each agent turn)."""
+        self._ctx_used = used
+        self._ctx_total = total
+        self._invalidate()
 
     def add_user_echo(self, text: str) -> None:
         """Echo the user's submitted message to the output pane."""

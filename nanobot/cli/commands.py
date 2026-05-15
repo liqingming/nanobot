@@ -946,6 +946,12 @@ def agent(
             async def _turn_complete() -> None:
                 nonlocal is_processing
                 is_processing = False
+                usage = agent_loop._last_usage
+                if usage and agent_loop.context_window_tokens:
+                    tui.update_context_usage(
+                        usage.get("prompt_tokens", 0),
+                        agent_loop.context_window_tokens,
+                    )
                 if pending_queue:
                     await _send_message(pending_queue.pop(0))
 
