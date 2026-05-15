@@ -518,19 +518,21 @@ class SplitTUI:
                 value, _ = self._popup_items[self._popup_idx]
                 cb = self._popup_on_select
                 self.hide_popup()
-                self._input_buffer.reset()
+                self._input_buffer.reset()          # topic selected, not typed — skip history
                 if cb:
                     asyncio.ensure_future(cb(value))
                 return
             if self._popup_mode == "command" and self._popup_items:
                 value, _ = self._popup_items[self._popup_idx]
                 self.hide_popup()
-                self._input_buffer.reset()
+                # Save the full command (not the partial typed text) to history
+                self._input_buffer.set_document(Document(value, len(value)))
+                self._input_buffer.reset(append_to_history=True)
                 if value.strip() and self._on_submit:
                     asyncio.ensure_future(self._on_submit(value))
                 return
             text = self._input_buffer.text
-            self._input_buffer.reset()
+            self._input_buffer.reset(append_to_history=True)
             if text.strip() and self._on_submit:
                 asyncio.ensure_future(self._on_submit(text))
 
@@ -560,9 +562,7 @@ class SplitTUI:
                 self._popup_idx = max(0, self._popup_idx - 1)
                 self._invalidate()
                 return
-            buf = self._input_buffer
-            if not buf.text or buf.cursor_position == 0:
-                buf.history_backward()
+            self._input_buffer.history_backward()
 
         @kb.add("down")
         def _down(event: Any) -> None:
