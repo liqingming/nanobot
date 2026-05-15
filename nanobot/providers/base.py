@@ -197,6 +197,11 @@ class LLMProvider(ABC):
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
 
     @staticmethod
+    def _is_max_tokens_error(content: str | None) -> bool:
+        err = (content or "").lower()
+        return "max_tokens" in err and ("invalid" in err or "valid range" in err or "exceed" in err)
+
+    @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """Replace image_url blocks with text placeholder. Returns None if no images found."""
         found = False
@@ -296,6 +301,9 @@ class LLMProvider(ABC):
                 return response
 
             if not self._is_transient_error(response.content):
+                if self._is_max_tokens_error(response.content):
+                    logger.warning("max_tokens value rejected by API, retrying with fallback=8192")
+                    return await self._safe_chat_stream(**{**kw, "max_tokens": 8192})
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
@@ -347,6 +355,9 @@ class LLMProvider(ABC):
                 return response
 
             if not self._is_transient_error(response.content):
+                if self._is_max_tokens_error(response.content):
+                    logger.warning("max_tokens value rejected by API, retrying with fallback=8192")
+                    return await self._safe_chat(**{**kw, "max_tokens": 8192})
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
