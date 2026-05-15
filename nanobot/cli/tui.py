@@ -361,8 +361,10 @@ class SplitTUI:
             self._scroll_offset = max(0, self._scroll_offset - 10)
             self._invalidate()
 
+        bottom_border = Window(height=1, char="─", style="class:separator")
+
         layout = Layout(
-            HSplit([output_window, separator, input_window]),
+            HSplit([output_window, separator, input_window, bottom_border]),
             focused_element=input_window,
         )
 
