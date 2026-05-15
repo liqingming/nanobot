@@ -19,11 +19,12 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path, timezone: str | None = None):
-        self.workspace = workspace
+    def __init__(self, data_dir: Path, workspace: Path | None = None, timezone: str | None = None):
+        self.data_dir = data_dir          # where nanobot stores metadata (memory, skills, bootstrap files)
+        self.workspace = workspace or data_dir  # actual working dir shown to the agent
         self.timezone = timezone
-        self.memory = MemoryStore(workspace)
-        self.skills = SkillsLoader(workspace)
+        self.memory = MemoryStore(data_dir)
+        self.skills = SkillsLoader(data_dir)
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
@@ -57,6 +58,7 @@ Skills with available="false" need dependencies installed first - you can try in
     def _get_identity(self) -> str:
         """Get the core identity section."""
         workspace_path = str(self.workspace.expanduser().resolve())
+        data_path = str(self.data_dir.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
@@ -82,9 +84,9 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
-- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+- Long-term memory: {data_path}/memory/MEMORY.md (write important facts here)
+- History log: {data_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+- Custom skills: {data_path}/skills/{{skill-name}}/SKILL.md
 
 {platform_policy}
 
@@ -115,7 +117,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
+            file_path = self.data_dir / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")

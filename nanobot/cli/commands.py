@@ -817,8 +817,18 @@ def agent(
     from nanobot.bus.queue import MessageBus
     from nanobot.cron.service import CronService
 
+    if workspace is None:
+        workspace = str(Path.cwd())
     config = _load_runtime_config(config, workspace)
-    sync_workspace_templates(config.workspace_path)
+
+    # For non-default workspaces, store nanobot metadata in the central cache dir
+    # (~/.nanobot/caches/<name>_<hash>/) so project directories stay clean.
+    if is_default_workspace(config.workspace_path):
+        data_dir = config.workspace_path
+    else:
+        from nanobot.config.paths import get_workspace_cache_dir
+        data_dir = get_workspace_cache_dir(config.workspace_path)
+    sync_workspace_templates(data_dir)
 
     bus = MessageBus()
     provider = _make_provider(config)
@@ -827,8 +837,8 @@ def agent(
     if is_default_workspace(config.workspace_path):
         _migrate_cron_store(config)
 
-    # Create cron service with workspace-scoped store
-    cron_store_path = config.workspace_path / "cron" / "jobs.json"
+    # Create cron service with data_dir-scoped store
+    cron_store_path = data_dir / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
     if logs:
@@ -840,6 +850,7 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        data_dir=data_dir,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
@@ -1341,6 +1352,71 @@ def _login_claude_ai() -> None:
         raise typer.Exit(1)
     save_oauth_token(token.strip())
     console.print("[green]✓ Claude.ai OAuth token saved[/green]")
+
+
+# ============================================================================
+# Cache Management
+# ============================================================================
+
+cache_app = typer.Typer(help="Manage nanobot workspace caches")
+app.add_typer(cache_app, name="cache")
+
+
+@cache_app.command("migrate")
+def cache_migrate(
+    old_path: str = typer.Argument(..., help="Old workspace directory path"),
+    new_path: str = typer.Argument(..., help="New workspace directory path"),
+):
+    """Migrate workspace cache when a project directory is moved or renamed.
+
+    Computes the cache directory names for both paths and renames the old
+    cache to the new one, preserving all sessions, memory, and history.
+    """
+    import shutil
+
+    from nanobot.config.paths import get_workspace_cache_dir
+
+    old = Path(old_path).expanduser().resolve()
+    new = Path(new_path).expanduser().resolve()
+
+    old_cache = get_workspace_cache_dir(old)
+    new_cache = get_workspace_cache_dir(new)
+
+    if old_cache == new_cache:
+        console.print("[yellow]Both paths resolve to the same cache directory — nothing to do.[/yellow]")
+        raise typer.Exit(0)
+
+    if not old_cache.exists():
+        console.print(f"[red]No cache found for:[/red] {old}")
+        console.print(f"[dim]Expected: {old_cache}[/dim]")
+        raise typer.Exit(1)
+
+    if new_cache.exists():
+        console.print(f"[red]Cache already exists for new path:[/red] {new}")
+        console.print(f"[dim]{new_cache}[/dim]")
+        console.print("[dim]Remove it first if you want to overwrite.[/dim]")
+        raise typer.Exit(1)
+
+    shutil.move(str(old_cache), str(new_cache))
+    console.print(f"[green]✓ Cache migrated[/green]")
+    console.print(f"  [dim]{old_cache}[/dim]")
+    console.print(f"  [dim]→ {new_cache}[/dim]")
+
+
+@cache_app.command("list")
+def cache_list():
+    """List all workspace caches and their associated paths."""
+    caches_root = Path.home() / ".nanobot" / "caches"
+    if not caches_root.exists() or not any(caches_root.iterdir()):
+        console.print("[dim]No workspace caches found.[/dim]")
+        return
+
+    console.print(f"[bold]Workspace caches[/bold] [dim]({caches_root})[/dim]\n")
+    for d in sorted(caches_root.iterdir()):
+        if not d.is_dir():
+            continue
+        size_mb = sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) / 1_048_576
+        console.print(f"  [cyan]{d.name}[/cyan]  [dim]{size_mb:.1f} MB[/dim]")
 
 
 if __name__ == "__main__":

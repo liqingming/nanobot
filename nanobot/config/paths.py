@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from pathlib import Path
 
 from nanobot.config.loader import get_config_path
@@ -32,6 +34,18 @@ def get_cron_dir() -> Path:
 def get_logs_dir() -> Path:
     """Return the logs directory."""
     return get_runtime_subdir("logs")
+
+
+def get_workspace_cache_dir(workspace: Path) -> Path:
+    """Return the cache directory for a non-default workspace.
+
+    All per-workspace nanobot metadata (sessions, memory, cron, skills, templates)
+    is stored under ~/.nanobot/caches/<name>_<hash>/ so project directories stay clean.
+    """
+    resolved = str(workspace.resolve())
+    h = hashlib.sha1(resolved.encode()).hexdigest()[:8]
+    safe_name = re.sub(r"[^\w-]", "_", workspace.name) or "root"
+    return ensure_dir(Path.home() / ".nanobot" / "caches" / f"{safe_name}_{h}")
 
 
 def get_workspace_path(workspace: str | None = None) -> Path:

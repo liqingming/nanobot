@@ -161,6 +161,7 @@ class AgentLoop:
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
+        data_dir: Path | None = None,
         model: str | None = None,
         max_iterations: int = 40,
         context_window_tokens: int = 65_536,
@@ -193,8 +194,9 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone)
-        self.sessions = session_manager or SessionManager(workspace)
+        _data = data_dir or workspace
+        self.context = ContextBuilder(_data, workspace=workspace, timezone=timezone)
+        self.sessions = session_manager or SessionManager(_data)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
@@ -222,7 +224,7 @@ class AgentLoop:
             asyncio.Semaphore(_max) if _max > 0 else None
         )
         self.memory_consolidator = MemoryConsolidator(
-            workspace=workspace,
+            workspace=_data,
             provider=provider,
             model=self.model,
             sessions=self.sessions,
