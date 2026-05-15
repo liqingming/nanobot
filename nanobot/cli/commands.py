@@ -885,38 +885,68 @@ def agent(
 
         asyncio.run(run_once())
     else:
-        # Interactive mode — route through bus like other channels
+        # Interactive mode — split-pane TUI (output pane + persistent input line)
         from nanobot.bus.events import InboundMessage
-        _init_prompt_session()
-        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+        from nanobot.cli.tui import SplitTUI
+        from nanobot.config.paths import get_cli_history_path
 
         if ":" in session_id:
             cli_channel, cli_chat_id = session_id.split(":", 1)
         else:
             cli_channel, cli_chat_id = "cli", session_id
 
-        def _handle_signal(signum, frame):
-            sig_name = signal.Signals(signum).name
-            _restore_terminal()
-            console.print(f"\nReceived {sig_name}, goodbye!")
-            sys.exit(0)
-
-        signal.signal(signal.SIGINT, _handle_signal)
-        signal.signal(signal.SIGTERM, _handle_signal)
-        # SIGHUP is not available on Windows
-        if hasattr(signal, 'SIGHUP'):
-            signal.signal(signal.SIGHUP, _handle_signal)
-        # Ignore SIGPIPE to prevent silent process termination when writing to closed pipes
-        # SIGPIPE is not available on Windows
-        if hasattr(signal, 'SIGPIPE'):
-            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        history_file = str(get_cli_history_path())
 
         async def run_interactive():
+            tui = SplitTUI(render_markdown=markdown, history_file=history_file)
             bus_task = asyncio.create_task(agent_loop.run())
-            turn_done = asyncio.Event()
-            turn_done.set()
-            turn_response: list[tuple[str, dict]] = []
-            renderer: StreamRenderer | None = None
+            is_processing = False
+            pending_queue: list[str] = []
+
+            # Override signals so Ctrl+C / SIGTERM cleanly exit the TUI
+            def _tui_signal(signum, frame):  # noqa: ARG001
+                tui.exit()
+
+            signal.signal(signal.SIGINT, _tui_signal)
+            signal.signal(signal.SIGTERM, _tui_signal)
+            if hasattr(signal, "SIGHUP"):
+                signal.signal(signal.SIGHUP, _tui_signal)
+            if hasattr(signal, "SIGPIPE"):
+                signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+            async def _send_message(text: str) -> None:
+                nonlocal is_processing
+                is_processing = True
+                tui.stream_start()
+                tui.add_user_echo(text)
+                await bus.publish_inbound(InboundMessage(
+                    channel=cli_channel,
+                    sender_id="user",
+                    chat_id=cli_chat_id,
+                    content=text,
+                    metadata={"_wants_stream": True},
+                ))
+
+            async def _turn_complete() -> None:
+                nonlocal is_processing
+                is_processing = False
+                if pending_queue:
+                    await _send_message(pending_queue.pop(0))
+
+            async def _on_submit(user_input: str) -> None:
+                text = user_input.strip()
+                if not text:
+                    return
+                if _is_exit_command(text):
+                    tui.exit()
+                    return
+                if is_processing:
+                    pending_queue.append(user_input)
+                    tui.add_system("Message queued — will send when nanobot finishes.")
+                else:
+                    await _send_message(user_input)
+
+            tui.set_on_submit(_on_submit)
 
             async def _consume_outbound():
                 while True:
@@ -924,19 +954,21 @@ def agent(
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
 
                         if msg.metadata.get("_stream_delta"):
-                            if renderer:
-                                await renderer.on_delta(msg.content)
+                            tui.stream_delta(msg.content)
                             continue
+
                         if msg.metadata.get("_stream_end"):
-                            if renderer:
-                                await renderer.on_end(
-                                    resuming=msg.metadata.get("_resuming", False),
-                                )
+                            if msg.metadata.get("_resuming"):
+                                # Intermediate flush: first half before tool call
+                                tui.flush_stream()
+                                tui.stream_start()
                             continue
+
                         if msg.metadata.get("_streamed"):
-                            if msg.content:
-                                turn_response.append((msg.content, dict(msg.metadata or {})))
-                            turn_done.set()
+                            content = tui.pop_stream() or msg.content or ""
+                            if content.strip():
+                                tui.add_response(content, dict(msg.metadata or {}))
+                            await _turn_complete()
                             continue
 
                         if msg.metadata.get("_progress"):
@@ -947,19 +979,14 @@ def agent(
                             elif ch and not is_tool_hint and not ch.send_progress:
                                 pass
                             else:
-                                await _print_interactive_progress_line(msg.content, _thinking)
+                                tui.add_progress(msg.content)
                             continue
 
-                        if not turn_done.is_set():
-                            if msg.content:
-                                turn_response.append((msg.content, dict(msg.metadata or {})))
-                            turn_done.set()
-                        elif msg.content:
-                            await _print_interactive_response(
-                                msg.content,
-                                render_markdown=markdown,
-                                metadata=msg.metadata,
-                            )
+                        # Non-streaming response (or unsolicited push from cron etc.)
+                        if msg.content:
+                            tui.add_response(msg.content, dict(msg.metadata or {}))
+                        if is_processing:
+                            await _turn_complete()
 
                     except asyncio.TimeoutError:
                         continue
@@ -969,56 +996,9 @@ def agent(
             outbound_task = asyncio.create_task(_consume_outbound())
 
             try:
-                while True:
-                    try:
-                        _flush_pending_tty_input()
-                        user_input = await _read_interactive_input_async()
-                        command = user_input.strip()
-                        if not command:
-                            continue
-
-                        if _is_exit_command(command):
-                            _restore_terminal()
-                            console.print("\nGoodbye!")
-                            break
-
-                        turn_done.clear()
-                        turn_response.clear()
-                        renderer = StreamRenderer(render_markdown=markdown)
-
-                        await bus.publish_inbound(InboundMessage(
-                            channel=cli_channel,
-                            sender_id="user",
-                            chat_id=cli_chat_id,
-                            content=user_input,
-                            metadata={"_wants_stream": True},
-                        ))
-
-                        await turn_done.wait()
-
-                        if turn_response:
-                            content, meta = turn_response[0]
-                            if content and not meta.get("_streamed"):
-                                if renderer:
-                                    await renderer.close()
-                                _print_agent_response(
-                                    content, render_markdown=markdown, metadata=meta,
-                                )
-                            elif content and renderer and not renderer.streamed:
-                                await renderer.close()
-                                _print_agent_response(
-                                    content, render_markdown=markdown, metadata=meta,
-                                )
-                        elif renderer and not renderer.streamed:
-                            await renderer.close()
-                    except KeyboardInterrupt:
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
-                    except EOFError:
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
+                await tui.run_async()
+            except (KeyboardInterrupt, EOFError):
+                pass
             finally:
                 agent_loop.stop()
                 outbound_task.cancel()
