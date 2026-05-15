@@ -28,14 +28,17 @@ from datetime import datetime
 from io import StringIO
 from typing import Any
 
+from wcwidth import wcswidth as _wcswidth
+
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.formatted_text import ANSI, HTML, AnyFormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import HSplit, Window
-from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, Window
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
@@ -102,6 +105,30 @@ class _NoScrollBufferControl(BufferControl):
         return super().mouse_handler(mouse_event)
 
 
+class _RightAlignedLabelControl(UIControl):
+    """UIControl that right-aligns a text label using the actual render width
+    passed by prompt_toolkit — no terminal-size guessing required."""
+
+    def __init__(self, get_text: Callable[[], str]) -> None:
+        self._get_text = get_text
+
+    def create_content(self, width: int, height: int) -> UIContent:
+        label = self._get_text()
+        # wcswidth gives display columns (CJK chars = 2), len() gives char count
+        display_w = max(0, _wcswidth(label))
+        # Windows console: last column is not writable, use width-1 as effective
+        effective = max(0, width - 1)
+        padding = max(0, effective - display_w)
+
+        def get_line(i: int) -> list[tuple[str, str]]:
+            return [("", " " * padding), ("bold fg:ansicyan", label)]
+
+        return UIContent(get_line=get_line, line_count=1, show_cursor=False)
+
+    def is_focusable(self) -> bool:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Main TUI class
 # ---------------------------------------------------------------------------
@@ -135,6 +162,7 @@ class SplitTUI:
         self._thinking_task: Any = None      # asyncio.Task for spinner animation
         self._ctx_used: int = 0              # last known prompt tokens
         self._ctx_total: int = 0             # context window size
+        self._topic: str = ""               # current topic name (chat_id)
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._app: Application | None = None
         self._setup(history_file)
@@ -244,6 +272,9 @@ class SplitTUI:
             c.print()
             c.print("  [bold]命令[/bold]")
             c.print("    [cyan]exit  quit  /exit  /quit  :q[/cyan]   退出 nanobot")
+            c.print("    [cyan]/new [名称][/cyan]                   新建话题")
+            c.print("    [cyan]/switch <名称>[/cyan]                切换话题")
+            c.print("    [cyan]/topics[/cyan]                       列出所有话题")
             c.print()
             c.print(f"  [dim]{rule}[/dim]")
             c.print()
@@ -305,23 +336,28 @@ class SplitTUI:
 
     # ── FormattedTextControl callbacks ────────────────────────────────────
 
+
     def _get_status_text(self) -> AnyFormattedText:
-        if not self._ctx_total:
-            return [("", "")]
-        pct = min(100, round(self._ctx_used * 100 / self._ctx_total))
-        bar_width = 12
-        filled = round(pct * bar_width / 100)
-        bar = "█" * filled + "░" * (bar_width - filled)
-        if pct >= 85:
-            style = "bold fg:ansired"
-        elif pct >= 70:
-            style = "fg:ansiyellow"
-        else:
-            style = "fg:ansibrightblack"
-        label = f"ctx {pct}%  {bar}  "
         w = shutil.get_terminal_size((80, 24)).columns
-        padding = max(0, w - len(label))
-        return [("", " " * padding), (style, label)]
+
+        if self._ctx_total:
+            pct = min(100, round(self._ctx_used * 100 / self._ctx_total))
+            bar_width = 12
+            filled = round(pct * bar_width / 100)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            ctx_style = (
+                "bold fg:ansired" if pct >= 85
+                else "fg:ansiyellow" if pct >= 70
+                else "fg:ansibrightblack"
+            )
+            ctx_text = f"ctx {pct}%  {bar}  "
+            ctx_part: list[tuple[str, str]] = [(ctx_style, ctx_text)]
+        else:
+            ctx_text = ""
+            ctx_part = []
+
+        padding = max(0, w - len(ctx_text))
+        return [("", " " * padding)] + ctx_part
 
     def _get_output_text(self) -> AnyFormattedText:
         parts = "".join(self._output_lines)
@@ -352,6 +388,14 @@ class SplitTUI:
             always_hide_cursor=True,
         )
 
+        topic_line = ConditionalContainer(
+            Window(
+                content=_RightAlignedLabelControl(lambda: f" {self._topic} "),
+                height=1,
+                always_hide_cursor=True,
+            ),
+            filter=Condition(lambda: bool(self._topic)),
+        )
         separator = Window(height=1, char="─", style="class:separator")
 
         buf_kwargs: dict[str, Any] = {"name": "nanobot_input", "multiline": False}
@@ -413,7 +457,7 @@ class SplitTUI:
         status_window = Window(content=status_ctrl, height=1, always_hide_cursor=True)
 
         layout = Layout(
-            HSplit([output_window, separator, input_window, bottom_border, status_window]),
+            HSplit([output_window, topic_line, separator, input_window, bottom_border, status_window]),
             focused_element=input_window,
         )
 
@@ -442,6 +486,25 @@ class SplitTUI:
         """Refresh the context-usage indicator (called after each agent turn)."""
         self._ctx_used = used
         self._ctx_total = total
+        self._invalidate()
+
+    def set_topic(self, name: str) -> None:
+        """Update the displayed topic name in the status bar."""
+        self._topic = name
+        self._invalidate()
+
+    def reset_history(self) -> None:
+        """Clear all output history (used when switching topics)."""
+        self._cancel_thinking()
+        self._output_lines.clear()
+        self._stream_buf = ""
+        self._stream_cache = ""
+        self._stream_cache_key = 0
+        self._stream_ts = ""
+        self._last_sep = False
+        self._scroll_offset = 0
+        self._ctx_used = 0
+        self._ctx_total = 0
         self._invalidate()
 
     def add_user_echo(self, text: str) -> None:

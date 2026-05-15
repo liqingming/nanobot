@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import contextmanager, nullcontext
+from datetime import datetime
 
 import os
 import select
@@ -911,17 +912,23 @@ def agent(
         async def run_interactive():
             tui = SplitTUI(render_markdown=markdown, history_file=history_file, model=config.agents.defaults.model)
 
-            # Restore prior conversation into the output pane
-            session = agent_loop.sessions.get_or_create(f"{cli_channel}:{cli_chat_id}")
-            tui.load_session_history(session.messages)
+            # Mutable topic state — chat_id changes when user switches topics
+            topic_state: dict[str, str] = {"chat_id": cli_chat_id}
 
-            # Show initial context usage estimate so the bar is visible from startup
-            if agent_loop.context_window_tokens:
-                try:
-                    ctx_est, _ = agent_loop.memory_consolidator.estimate_session_prompt_tokens(session)
-                    tui.update_context_usage(ctx_est, agent_loop.context_window_tokens)
-                except Exception:
-                    pass
+            def _load_topic(name: str) -> None:
+                """Load session history and context estimate for the given topic."""
+                s = agent_loop.sessions.get_or_create(f"{cli_channel}:{name}")
+                tui.set_topic(name)
+                tui.load_session_history(s.messages)
+                if agent_loop.context_window_tokens:
+                    try:
+                        ctx_est, _ = agent_loop.memory_consolidator.estimate_session_prompt_tokens(s)
+                        tui.update_context_usage(ctx_est, agent_loop.context_window_tokens)
+                    except Exception:
+                        pass
+
+            # Restore prior conversation into the output pane
+            _load_topic(cli_chat_id)
 
             bus_task = asyncio.create_task(agent_loop.run())
             is_processing = False
@@ -946,7 +953,7 @@ def agent(
                 await bus.publish_inbound(InboundMessage(
                     channel=cli_channel,
                     sender_id="user",
-                    chat_id=cli_chat_id,
+                    chat_id=topic_state["chat_id"],
                     content=text,
                     metadata={"_wants_stream": True},
                 ))
@@ -963,6 +970,11 @@ def agent(
                 if pending_queue:
                     await _send_message(pending_queue.pop(0))
 
+            async def _switch_topic(name: str) -> None:
+                topic_state["chat_id"] = name
+                tui.reset_history()
+                _load_topic(name)
+
             async def _on_submit(user_input: str) -> None:
                 text = user_input.strip()
                 if not text:
@@ -970,6 +982,44 @@ def agent(
                 if _is_exit_command(text):
                     tui.exit()
                     return
+
+                # ── 话题管理命令 ──────────────────────────────────────────────
+                if text == "/topics":
+                    sessions_list = agent_loop.sessions.list_sessions()
+                    prefix = f"{cli_channel}:"
+                    matches = [s for s in sessions_list if s["key"].startswith(prefix)]
+                    if matches:
+                        lines = ["可用话题:"]
+                        for s in matches:
+                            t = s["key"][len(prefix):]
+                            marker = "  ◀ 当前" if t == topic_state["chat_id"] else ""
+                            lines.append(f"  {t}{marker}")
+                        tui.add_system("\n".join(lines))
+                    else:
+                        tui.add_system("当前没有已保存的话题。")
+                    return
+
+                if text.startswith("/new"):
+                    if is_processing:
+                        tui.add_system("请等待当前响应完成后再新建话题。")
+                        return
+                    parts = text.split(None, 1)
+                    name = parts[1].strip() if len(parts) > 1 else datetime.now().strftime("topic_%Y%m%d_%H%M%S")
+                    await _switch_topic(name)
+                    tui.add_system(f"已创建并切换到话题: {name}")
+                    return
+
+                if text.startswith("/switch "):
+                    if is_processing:
+                        tui.add_system("请等待当前响应完成后再切换话题。")
+                        return
+                    name = text[8:].strip()
+                    if name:
+                        await _switch_topic(name)
+                        tui.add_system(f"已切换到话题: {name}")
+                    return
+                # ─────────────────────────────────────────────────────────────
+
                 if is_processing:
                     pending_queue.append(user_input)
                     tui.add_system("Message queued — will send when nanobot finishes.")
