@@ -42,7 +42,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 
-from nanobot import __logo__
+from nanobot import __logo__, __version__
 
 
 def _ansi_width() -> int:
@@ -120,8 +120,10 @@ class SplitTUI:
         self,
         render_markdown: bool = True,
         history_file: str | None = None,
+        model: str | None = None,
     ) -> None:
         self._render_md = render_markdown
+        self._model = model
         self._output_lines: list[str] = []   # completed ANSI blocks
         self._stream_buf: str = ""            # raw text accumulating during streaming
         self._stream_ts: str = ""            # timestamp captured at stream start
@@ -223,6 +225,30 @@ class SplitTUI:
     def _render_system(self, text: str) -> str:
         return _rich_to_ansi(lambda c: c.print(f"[dim]{text}[/dim]"))
 
+    def _render_welcome(self) -> str:
+        w = _ansi_width()
+        rule = "─" * w
+        def _fn(c: Console) -> None:
+            c.print()
+            model_str = f"  [dim]{self._model}[/dim]" if self._model else ""
+            c.print(f"  [cyan bold]{__logo__} nanobot[/cyan bold]  [dim]v{__version__}[/dim]{model_str}")
+            c.print()
+            c.print(f"  [dim]{rule}[/dim]")
+            c.print()
+            c.print("  [bold]快捷键[/bold]")
+            c.print("    [cyan]PageUp / PageDown[/cyan]   滚动历史记录")
+            c.print("    [cyan]↑ / ↓[/cyan]              切换输入历史")
+            c.print("    [cyan]Ctrl+C / Ctrl+D[/cyan]    退出")
+            c.print()
+            c.print("  [bold]命令[/bold]")
+            c.print("    [cyan]exit  quit  /exit  /quit  :q[/cyan]   退出 nanobot")
+            c.print()
+            c.print(f"  [dim]{rule}[/dim]")
+            c.print()
+            c.print("  输入消息后按 [bold]Enter[/bold] 发送。")
+            c.print()
+        return _rich_to_ansi(_fn)
+
     def _render_separator(self) -> str:
         w = _ansi_width()
         return _rich_to_ansi(lambda c: c.print(f"[dim]{'─' * w}[/dim]"))
@@ -282,7 +308,7 @@ class SplitTUI:
         if self._stream_buf or self._stream_ts:
             parts += self._stream_cache
         if not parts:
-            return HTML("")
+            parts = self._render_welcome()
 
         lines = parts.split("\n")
         total = len(lines)

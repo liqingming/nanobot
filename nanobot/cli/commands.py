@@ -909,7 +909,7 @@ def agent(
         history_file = str(get_cli_history_path())
 
         async def run_interactive():
-            tui = SplitTUI(render_markdown=markdown, history_file=history_file)
+            tui = SplitTUI(render_markdown=markdown, history_file=history_file, model=config.agents.defaults.model)
 
             # Restore prior conversation into the output pane
             session = agent_loop.sessions.get_or_create(f"{cli_channel}:{cli_chat_id}")
