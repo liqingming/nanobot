@@ -927,6 +927,12 @@ def agent(
                     except Exception:
                         pass
 
+            tui.set_commands([
+                ("/new", "新建话题"),
+                ("/resume", "切换/恢复话题"),
+                ("/exit", "退出 nanobot"),
+            ])
+
             # Restore prior conversation into the output pane
             _load_topic(cli_chat_id)
 
@@ -984,21 +990,6 @@ def agent(
                     return
 
                 # ── 话题管理命令 ──────────────────────────────────────────────
-                if text == "/topics":
-                    sessions_list = agent_loop.sessions.list_sessions()
-                    prefix = f"{cli_channel}:"
-                    matches = [s for s in sessions_list if s["key"].startswith(prefix)]
-                    if matches:
-                        lines = ["可用话题:"]
-                        for s in matches:
-                            t = s["key"][len(prefix):]
-                            marker = "  ◀ 当前" if t == topic_state["chat_id"] else ""
-                            lines.append(f"  {t}{marker}")
-                        tui.add_system("\n".join(lines))
-                    else:
-                        tui.add_system("当前没有已保存的话题。")
-                    return
-
                 if text.startswith("/new"):
                     if is_processing:
                         tui.add_system("请等待当前响应完成后再新建话题。")
@@ -1009,14 +1000,33 @@ def agent(
                     tui.add_system(f"已创建并切换到话题: {name}")
                     return
 
-                if text.startswith("/switch "):
+                if text.startswith("/resume"):
                     if is_processing:
                         tui.add_system("请等待当前响应完成后再切换话题。")
                         return
-                    name = text[8:].strip()
-                    if name:
-                        await _switch_topic(name)
-                        tui.add_system(f"已切换到话题: {name}")
+                    arg = text[7:].strip()
+                    if arg:
+                        # /resume <name> — direct switch
+                        await _switch_topic(arg)
+                        tui.add_system(f"已切换到话题: {arg}")
+                    else:
+                        # /resume — interactive picker
+                        sessions_list = agent_loop.sessions.list_sessions()
+                        prefix = f"{cli_channel}:"
+                        topics = [
+                            s["key"][len(prefix):]
+                            for s in sessions_list
+                            if s["key"].startswith(prefix)
+                        ]
+                        if not topics:
+                            tui.add_system("当前没有已保存的话题。")
+                            return
+
+                        async def _on_topic_select(name: str) -> None:
+                            await _switch_topic(name)
+                            tui.add_system(f"已切换到话题: {name}")
+
+                        tui.show_topic_popup(topics, _on_topic_select)
                     return
                 # ─────────────────────────────────────────────────────────────
 

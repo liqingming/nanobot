@@ -22,6 +22,7 @@ keyboard-only (Up / Down arrows).
 """
 from __future__ import annotations
 
+import asyncio
 import shutil
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -32,6 +33,7 @@ from wcwidth import wcswidth as _wcswidth
 
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import ANSI, HTML, AnyFormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -40,6 +42,7 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import D
+from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
 from rich.markdown import Markdown
@@ -129,6 +132,72 @@ class _RightAlignedLabelControl(UIControl):
         return False
 
 
+class _CommandLexer(Lexer):
+    """Colors the input text indigo when it exactly matches a known command."""
+
+    def __init__(self, tui: "SplitTUI") -> None:
+        self._tui = tui
+
+    def lex_document(self, document: Document):  # type: ignore[override]
+        text = document.text
+        cmds = {cmd for cmd, _ in self._tui._all_commands}
+        is_cmd = text in cmds
+
+        def get_line(lineno: int) -> list[tuple[str, str]]:
+            if lineno != 0:
+                return [("", "")]
+            if is_cmd:
+                return [("fg:#5c6bc0 bold", text)]
+            return [("", text)]
+
+        return get_line
+
+
+class _PopupMenuControl(UIControl):
+    """Floating popup for command completion and topic selection."""
+
+    MAX_VISIBLE = 6
+
+    def __init__(self, tui: "SplitTUI") -> None:
+        self._tui = tui
+
+    def create_content(self, width: int, height: int) -> UIContent:
+        all_items = self._tui._popup_items
+        idx = self._tui._popup_idx
+        mode = self._tui._popup_mode
+
+        # Scroll popup window to keep selected item visible
+        start = max(0, idx - self.MAX_VISIBLE + 1)
+        if start + self.MAX_VISIBLE > len(all_items):
+            start = max(0, len(all_items) - self.MAX_VISIBLE)
+        visible = all_items[start : start + self.MAX_VISIBLE]
+
+        def get_line(i: int) -> list[tuple[str, str]]:
+            if i >= len(visible):
+                return [("", "")]
+            value, label = visible[i]
+            actual_idx = start + i
+            selected = actual_idx == idx
+            prefix = " ▶ " if selected else "   "
+            sel_style = "bg:#1e3a5f bold fg:ansiwhite"
+            nrm_style = "fg:ansibrightblack"
+            style = sel_style if selected else nrm_style
+            if mode == "command":
+                # value = "/cmd", label = description; pad name to 12 display cols
+                dw = max(0, _wcswidth(value))
+                pad = max(0, 12 - dw)
+                body = f"{prefix}{value}{' ' * pad}  {label}"
+            else:
+                body = f"{prefix}{value}"
+            tail = " " * max(0, width - _wcswidth(body))
+            return [(style, body + tail)]
+
+        return UIContent(get_line=get_line, line_count=len(visible), show_cursor=False)
+
+    def is_focusable(self) -> bool:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Main TUI class
 # ---------------------------------------------------------------------------
@@ -165,6 +234,13 @@ class SplitTUI:
         self._topic: str = ""               # current topic name (chat_id)
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._app: Application | None = None
+        # Command / topic popup state
+        self._all_commands: list[tuple[str, str]] = []
+        self._popup_mode: str = "hidden"    # "hidden" | "command" | "topic"
+        self._popup_items: list[tuple[str, str]] = []   # (value, label) visible items
+        self._popup_idx: int = 0
+        self._popup_on_select: Callable[[str], Awaitable[None]] | None = None
+        self._popup_all_topics: list[str] = []
         self._setup(history_file)
 
     # ── Session history restore ────────────────────────────────────────────
@@ -273,8 +349,7 @@ class SplitTUI:
             c.print("  [bold]命令[/bold]")
             c.print("    [cyan]exit  quit  /exit  /quit  :q[/cyan]   退出 nanobot")
             c.print("    [cyan]/new [名称][/cyan]                   新建话题")
-            c.print("    [cyan]/switch <名称>[/cyan]                切换话题")
-            c.print("    [cyan]/topics[/cyan]                       列出所有话题")
+            c.print("    [cyan]/resume [名称][/cyan]                切换/恢复话题（无参数时交互选择）")
             c.print()
             c.print(f"  [dim]{rule}[/dim]")
             c.print()
@@ -402,9 +477,14 @@ class SplitTUI:
         if history_file:
             buf_kwargs["history"] = FileHistory(history_file)
         self._input_buffer = Buffer(**buf_kwargs)
+        self._input_buffer.on_text_changed += lambda _: self._update_popup()
 
         input_window = Window(
-            content=_NoScrollBufferControl(buffer=self._input_buffer, focus_on_click=True),
+            content=_NoScrollBufferControl(
+                buffer=self._input_buffer,
+                focus_on_click=True,
+                lexer=_CommandLexer(self),
+            ),
             height=D(min=1, max=4),
             wrap_lines=True,
             get_line_prefix=lambda lineno, wrap_count: (
@@ -416,11 +496,36 @@ class SplitTUI:
 
         @kb.add("enter")
         def _submit(event: Any) -> None:
+            if self._popup_mode == "topic" and self._popup_items:
+                value, _ = self._popup_items[self._popup_idx]
+                cb = self._popup_on_select
+                self.hide_popup()
+                self._input_buffer.reset()
+                if cb:
+                    asyncio.ensure_future(cb(value))
+                return
+            if self._popup_mode == "command" and self._popup_items:
+                value, _ = self._popup_items[self._popup_idx]
+                self.hide_popup()
+                self._input_buffer.reset()
+                if value.strip() and self._on_submit:
+                    asyncio.ensure_future(self._on_submit(value))
+                return
             text = self._input_buffer.text
             self._input_buffer.reset()
             if text.strip() and self._on_submit:
-                import asyncio
                 asyncio.ensure_future(self._on_submit(text))
+
+        @kb.add("tab")
+        def _tab(event: Any) -> None:
+            if self._popup_mode == "command" and self._popup_items:
+                value, _ = self._popup_items[self._popup_idx]
+                self._input_buffer.set_document(Document(value, len(value)))
+
+        @kb.add("escape")
+        def _escape(event: Any) -> None:
+            if self._popup_items:
+                self.hide_popup()
 
         @kb.add("c-c")
         def _ctrl_c(event: Any) -> None:
@@ -433,12 +538,20 @@ class SplitTUI:
 
         @kb.add("up")
         def _up(event: Any) -> None:
+            if self._popup_items:
+                self._popup_idx = max(0, self._popup_idx - 1)
+                self._invalidate()
+                return
             buf = self._input_buffer
             if not buf.text or buf.cursor_position == 0:
                 buf.history_backward()
 
         @kb.add("down")
         def _down(event: Any) -> None:
+            if self._popup_items:
+                self._popup_idx = min(len(self._popup_items) - 1, self._popup_idx + 1)
+                self._invalidate()
+                return
             self._input_buffer.history_forward()
 
         @kb.add("pageup")
@@ -451,13 +564,28 @@ class SplitTUI:
             self._scroll_offset = max(0, self._scroll_offset - 10)
             self._invalidate()
 
+        popup_ctrl = _PopupMenuControl(self)
+        popup_menu = ConditionalContainer(
+            Window(
+                content=popup_ctrl,
+                height=lambda: D.exact(
+                    min(len(self._popup_items), _PopupMenuControl.MAX_VISIBLE)
+                ),
+                always_hide_cursor=True,
+            ),
+            filter=Condition(lambda: bool(self._popup_items)),
+        )
+
         bottom_border = Window(height=1, char="─", style="class:separator")
 
         status_ctrl = FormattedTextControl(text=self._get_status_text, focusable=False)
         status_window = Window(content=status_ctrl, height=1, always_hide_cursor=True)
 
         layout = Layout(
-            HSplit([output_window, topic_line, separator, input_window, bottom_border, status_window]),
+            HSplit([
+                output_window, topic_line, popup_menu,
+                separator, input_window, bottom_border, status_window,
+            ]),
             focused_element=input_window,
         )
 
@@ -481,6 +609,67 @@ class SplitTUI:
 
     def set_on_submit(self, callback: Callable[[str], Awaitable[None]]) -> None:
         self._on_submit = callback
+
+    def set_commands(self, commands: list[tuple[str, str]]) -> None:
+        """Register available commands for the popup completion menu."""
+        self._all_commands = commands
+
+    def show_topic_popup(
+        self,
+        topics: list[str],
+        on_select: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Show an interactive topic picker above the input field."""
+        self._popup_all_topics = list(topics)
+        self._popup_mode = "topic"
+        self._popup_items = [(t, t) for t in topics]
+        self._popup_idx = 0
+        self._popup_on_select = on_select
+        self._input_buffer.reset()
+        self._invalidate()
+
+    def hide_popup(self) -> None:
+        """Hide the command/topic popup."""
+        self._popup_mode = "hidden"
+        self._popup_items = []
+        self._popup_idx = 0
+        self._popup_on_select = None
+        self._popup_all_topics = []
+        self._invalidate()
+
+    def _update_popup(self) -> None:
+        """Recompute popup items based on current buffer text (called on text change)."""
+        text = self._input_buffer.text
+        if self._popup_mode == "topic":
+            query = text.lower()
+            filtered = [(t, t) for t in self._popup_all_topics if query in t.lower()]
+            self._popup_items = filtered
+            self._popup_idx = min(self._popup_idx, max(0, len(filtered) - 1))
+            self._invalidate()
+            return
+        if not text.startswith("/"):
+            if self._popup_items:
+                self._popup_mode = "hidden"
+                self._popup_items = []
+                self._popup_idx = 0
+                self._invalidate()
+            return
+        query = text[1:].lower()
+        ranked: list[tuple[int, str, str]] = []
+        for cmd, desc in self._all_commands:
+            cmd_name = cmd[1:].lower()
+            if not query:
+                ranked.append((1, cmd, desc))
+            elif cmd_name == query:
+                ranked.append((0, cmd, desc))
+            elif cmd_name.startswith(query):
+                ranked.append((1, cmd, desc))
+        ranked.sort(key=lambda x: x[0])
+        new_items = [(cmd, desc) for _, cmd, desc in ranked]
+        self._popup_items = new_items
+        self._popup_idx = 0
+        self._popup_mode = "command" if new_items else "hidden"
+        self._invalidate()
 
     def update_context_usage(self, used: int, total: int) -> None:
         """Refresh the context-usage indicator (called after each agent turn)."""
