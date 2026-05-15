@@ -803,6 +803,14 @@ class SplitTUI:
 
     async def run_async(self) -> None:
         if self._app is not None:
+            # Pre-load FileHistory before first draw so the first Enter isn't slow.
+            # history_backward() triggers the lazy synchronous file read; reset()
+            # immediately restores the empty state (no visual artifact).
+            try:
+                self._input_buffer.history_backward()
+                self._input_buffer.reset()
+            except Exception:
+                pass
             await self._app.run_async()
 
     def exit(self) -> None:
