@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import time
+from datetime import datetime
 
 from rich.console import Console
 from rich.live import Live
@@ -98,7 +99,8 @@ class StreamRenderer:
             self._stop_spinner()
             c = _make_console()
             c.print()
-            c.print(f"[cyan]{__logo__} nanobot[/cyan]")
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
             self._live = Live(self._render(), console=c, auto_refresh=False)
             self._live.start()
         now = time.monotonic()

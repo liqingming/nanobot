@@ -139,11 +139,13 @@ def _print_agent_response(
     metadata: dict | None = None,
 ) -> None:
     """Render assistant response with consistent terminal styling."""
+    from datetime import datetime
     console = _make_console()
     content = response or ""
     body = _response_renderable(content, render_markdown, metadata)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     console.print()
-    console.print(f"[cyan]{__logo__} nanobot[/cyan]")
+    console.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
     console.print(body)
     console.print()
 
@@ -174,12 +176,14 @@ async def _print_interactive_response(
     metadata: dict | None = None,
 ) -> None:
     """Print async interactive replies with prompt_toolkit-safe Rich styling."""
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     def _write() -> None:
         content = response or ""
         ansi = _render_interactive_ansi(
             lambda c: (
                 c.print(),
-                c.print(f"[cyan]{__logo__} nanobot[/cyan]"),
+                c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]"),
                 c.print(_response_renderable(content, render_markdown, metadata)),
                 c.print(),
             )
