@@ -419,6 +419,15 @@ class SplitTUI:
             c.print(f"[dim]{spinner} thinking...[/dim]")
         return _rich_to_ansi(_fn)
 
+    def _render_tool_executing(self, hint: str = "") -> str:
+        ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        label = hint or "executing..."
+        def _fn(c: Console) -> None:
+            c.print()
+            c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
+            c.print(f"[dim]⚙ {label}[/dim]")
+        return _rich_to_ansi(_fn)
+
     async def _animate_thinking(self) -> None:
         import asyncio
         try:
@@ -759,8 +768,8 @@ class SplitTUI:
         self._invalidate()
 
     def add_progress(self, text: str) -> None:
-        """Append a tool-hint line to the live area (keeps thinking animation alive)."""
-        self._live_progress += _rich_to_ansi(lambda c: c.print(f"  [dim]↳ {text}[/dim]"))
+        """Show the current tool being executed (replaces stream_cache, no animation)."""
+        self._stream_cache = self._render_tool_executing(text)
         self._pin_to_bottom()
         self._invalidate()
 
@@ -784,19 +793,18 @@ class SplitTUI:
         self._thinking_task = asyncio.ensure_future(self._animate_thinking())
 
     def tool_phase_start(self) -> None:
-        """Switch to tool-execution phase: keep live area and animation running."""
+        """Switch to tool-execution phase: stop animation, show static executing indicator."""
         self._cancel_thinking()
         self._stream_buf = ""
         self._live_progress = ""
         self._thinking_frame = 0
-        # Keep _stream_ts so live area stays visible during tool execution
         if not self._stream_ts:
             self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._stream_cache = self._render_thinking()
+        self._stream_cache = self._render_tool_executing()
         self._stream_cache_key = 0
         self._pin_to_bottom()
         self._invalidate()
-        self._thinking_task = asyncio.ensure_future(self._animate_thinking())
+        # No thinking task: animation stops during tool execution
 
     def stream_delta(self, delta: str) -> None:
         """Append a streaming delta and refresh the output pane."""
