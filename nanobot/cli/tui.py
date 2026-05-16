@@ -531,7 +531,7 @@ class SplitTUI:
                 self.hide_popup()
                 # Save the full command (not the partial typed text) to history
                 self._input_buffer.set_document(Document(value, len(value)))
-                self._input_buffer.reset(append_to_history=True)
+                self._input_buffer.reset(append_to_history=False)
                 if value.strip() and self._on_submit:
                     asyncio.ensure_future(self._on_submit(value))
                 return
@@ -539,10 +539,10 @@ class SplitTUI:
             if text.strip() and self._on_submit:
                 if self._on_pre_submit:
                     self._on_pre_submit(text)
-                self._input_buffer.reset(append_to_history=True)
+                self._input_buffer.reset(append_to_history=not text.strip().startswith("/"))
                 asyncio.ensure_future(self._on_submit(text))
             else:
-                self._input_buffer.reset(append_to_history=True)
+                self._input_buffer.reset(append_to_history=False)
 
         @kb.add("tab")
         def _tab(event: Any) -> None:
