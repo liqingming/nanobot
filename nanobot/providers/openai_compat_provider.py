@@ -215,6 +215,10 @@ class OpenAICompatProvider(LLMProvider):
                 clean["tool_calls"] = normalized
             if "tool_call_id" in clean and clean["tool_call_id"]:
                 clean["tool_call_id"] = map_id(clean["tool_call_id"])
+            # Never send empty reasoning_content — it triggers an API error
+            # ("reasoning_content must be passed back") on Anthropic's compat endpoint.
+            if "reasoning_content" in clean and not clean["reasoning_content"]:
+                del clean["reasoning_content"]
         return sanitized
 
     # ------------------------------------------------------------------
@@ -498,7 +502,7 @@ class OpenAICompatProvider(LLMProvider):
                 text = cls._extract_text_content(delta.get("content"))
                 if text:
                     content_parts.append(text)
-                rc = delta.get("reasoning_content")
+                rc = delta.get("reasoning_content") or (delta.get("model_extra") or {}).get("reasoning_content")
                 if rc:
                     reasoning_parts.append(str(rc))
                 for idx, tc in enumerate(delta.get("tool_calls") or []):
@@ -515,11 +519,34 @@ class OpenAICompatProvider(LLMProvider):
             delta = choice.delta
             if delta and delta.content:
                 content_parts.append(delta.content)
-            rc = getattr(delta, "reasoning_content", None) if delta else None
+            rc = None
+            if delta:
+                rc = getattr(delta, "reasoning_content", None)
+                if not rc:
+                    rc = (getattr(delta, "model_extra", None) or {}).get("reasoning_content")
             if rc:
-                reasoning_parts.append(rc)
+                reasoning_parts.append(str(rc))
             for tc in (delta.tool_calls or []) if delta else []:
                 _accum_tc(tc, getattr(tc, "index", 0))
+
+        # Some providers deliver reasoning_content as a message field in the final chunk
+        # rather than as streaming delta events — fall back to that if deltas had nothing.
+        if not reasoning_parts:
+            for chunk in reversed(chunks):
+                chunk_map = cls._maybe_mapping(chunk)
+                if chunk_map is None:
+                    continue
+                for ch in chunk_map.get("choices") or []:
+                    ch_map = cls._maybe_mapping(ch) or {}
+                    msg_field = cls._maybe_mapping(ch_map.get("message")) or {}
+                    rc = (
+                        msg_field.get("reasoning_content")
+                        or (msg_field.get("model_extra") or {}).get("reasoning_content")
+                    )
+                    if rc:
+                        reasoning_parts.append(str(rc))
+                if reasoning_parts:
+                    break
 
         return LLMResponse(
             content="".join(content_parts) or None,
