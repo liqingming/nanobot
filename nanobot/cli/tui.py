@@ -84,6 +84,11 @@ class _OutputControl(FormattedTextControl):
         self._tui = tui
         super().__init__(**kwargs)
 
+    def create_content(self, width: int, height: int | None) -> Any:
+        if height is not None and height > 0:
+            self._tui._actual_output_height = height
+        return super().create_content(width, height)
+
     def mouse_handler(self, mouse_event: Any) -> Any:  # noqa: ANN401
         if mouse_event.event_type == MouseEventType.SCROLL_UP:
             self._tui._scroll_offset += 3
@@ -244,6 +249,7 @@ class SplitTUI:
         self._stream_cache: str = ""         # cached ANSI render of stream_buf
         self._stream_cache_key: int = 0      # len(stream_buf) when cache was built
         self._scroll_offset: int = 0         # lines from bottom; 0 = newest visible
+        self._actual_output_height: int = 0  # captured by _OutputControl.create_content()
         self._last_sep: bool = False         # True if last appended item was a separator
         self._thinking_frame: int = 0        # spinner frame index
         self._thinking_task: Any = None      # asyncio.Task for spinner animation
@@ -465,7 +471,7 @@ class SplitTUI:
 
         lines = parts.split("\n")
         total = len(lines)
-        h = _output_height()
+        h = self._actual_output_height or _output_height()
 
         # Clamp offset: can't scroll past the point where we'd show fewer than h lines
         max_offset = max(0, total - h)
