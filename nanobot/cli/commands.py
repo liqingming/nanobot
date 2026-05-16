@@ -939,7 +939,6 @@ def agent(
             bus_task = asyncio.create_task(agent_loop.run())
             is_processing = False
             pending_queue: list[str] = []
-            _last_prompt_tokens: int = 0   # prompt_tokens from previous turn (API lag)
 
             # Override signals so Ctrl+C / SIGTERM cleanly exit the TUI
             def _tui_signal(signum, frame):  # noqa: ARG001
@@ -955,7 +954,7 @@ def agent(
             async def _send_message(text: str) -> None:
                 nonlocal is_processing
                 is_processing = True
-                tui.stream_start(tokens_up=_last_prompt_tokens)
+                tui.stream_start()
                 tui.add_user_echo(text)
                 await bus.publish_inbound(InboundMessage(
                     channel=cli_channel,
@@ -966,16 +965,14 @@ def agent(
                 ))
 
             async def _turn_complete() -> None:
-                nonlocal is_processing, _last_prompt_tokens
+                nonlocal is_processing
                 is_processing = False
                 usage = agent_loop._last_usage
-                if usage:
-                    _last_prompt_tokens = usage.get("prompt_tokens", 0)
-                    if agent_loop.context_window_tokens:
-                        tui.update_context_usage(
-                            _last_prompt_tokens,
-                            agent_loop.context_window_tokens,
-                        )
+                if usage and agent_loop.context_window_tokens:
+                    tui.update_context_usage(
+                        usage.get("prompt_tokens", 0),
+                        agent_loop.context_window_tokens,
+                    )
                 if pending_queue:
                     await _send_message(pending_queue.pop(0))
 
@@ -1052,26 +1049,26 @@ def agent(
 
                         if msg.metadata.get("_stream_end"):
                             if msg.metadata.get("_resuming"):
-                                # Flush LLM stream, then switch to tool-execution phase
+                                # Intermediate flush: first half before tool call
                                 tui.flush_stream()
-                                tui.tool_phase_start()
+                                tui.stream_start()
                             continue
 
                         if msg.metadata.get("_streamed"):
-                            elapsed = tui._phase_elapsed
-                            usage = agent_loop._last_usage or {}
-                            tokens_down = usage.get("completion_tokens", 0)
                             content = tui.pop_stream() or msg.content or ""
                             if content.strip():
-                                tui.add_response(
-                                    content, dict(msg.metadata or {}),
-                                    elapsed=elapsed, tokens_down=tokens_down,
-                                )
+                                tui.add_response(content, dict(msg.metadata or {}))
                             await _turn_complete()
                             continue
 
                         if msg.metadata.get("_progress"):
-                            if msg.content:
+                            is_tool_hint = msg.metadata.get("_tool_hint", False)
+                            ch = agent_loop.channels_config
+                            if ch and is_tool_hint and not ch.send_tool_hints:
+                                pass
+                            elif ch and not is_tool_hint and not ch.send_progress:
+                                pass
+                            else:
                                 tui.add_progress(msg.content)
                             continue
 

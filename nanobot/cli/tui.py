@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from io import StringIO
@@ -251,13 +250,6 @@ class SplitTUI:
         self._ctx_used: int = 0              # last known prompt tokens
         self._ctx_total: int = 0             # context window size
         self._topic: str = ""               # current topic name (chat_id)
-        # Phase-based timing + token tracking
-        self._live_progress: str = ""        # tool-hint lines shown in live area
-        self._phase_start: float = 0.0       # monotonic time when current phase started
-        self._phase_elapsed: float = 0.0     # seconds elapsed in current phase
-        self._phase_mode: str = "idle"       # "idle" | "thinking" | "streaming" | "tool"
-        self._phase_tokens_up: int = 0       # ↑ input tokens (from previous turn)
-        self._phase_tokens_down: int = 0     # ↓ output tokens (current turn)
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._app: Application | None = None
         # Command / topic popup state
@@ -323,14 +315,7 @@ class SplitTUI:
 
     # ── Rendering helpers ──────────────────────────────────────────────────
 
-    def _render_response(
-        self,
-        content: str,
-        metadata: dict | None = None,
-        ts: str | None = None,
-        elapsed: float = 0.0,
-        tokens_down: int = 0,
-    ) -> str:
+    def _render_response(self, content: str, metadata: dict | None = None, ts: str | None = None) -> str:
         ts = ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         render_as_text = (metadata or {}).get("render_as") == "text"
 
@@ -341,20 +326,12 @@ class SplitTUI:
                 c.print(Markdown(content))
             else:
                 c.print(Text(content))
-            footer_parts = []
-            if elapsed >= 0.5:
-                footer_parts.append(f"⏱ {elapsed:.0f}s")
-            if tokens_down:
-                footer_parts.append(f"↓ {tokens_down:,}")
-            if footer_parts:
-                c.print(f"[dim]{'  '.join(footer_parts)}[/dim]")
             c.print()
 
         return _rich_to_ansi(_fn)
 
     def _render_stream_snapshot(self) -> str:
         ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        elapsed = self._phase_elapsed
 
         def _fn(c: Console) -> None:
             c.print()
@@ -363,19 +340,6 @@ class SplitTUI:
                 c.print(Markdown(self._stream_buf))
             else:
                 c.print(self._stream_buf or "")
-            if elapsed >= 0.5:
-                c.print(f"[dim]⏱ {elapsed:.0f}s[/dim]")
-
-        return _rich_to_ansi(_fn)
-
-    def _render_tool_phase(self) -> str:
-        ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        elapsed = self._phase_elapsed
-
-        def _fn(c: Console) -> None:
-            c.print()
-            c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
-            c.print(f"[dim]⚙ 工具调用中...  ⏱ {elapsed:.0f}s[/dim]")
 
         return _rich_to_ansi(_fn)
 
@@ -441,31 +405,19 @@ class SplitTUI:
     def _render_thinking(self) -> str:
         ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         spinner = self._SPINNER[self._thinking_frame % len(self._SPINNER)]
-        elapsed = self._phase_elapsed
-        tokens_up = self._phase_tokens_up
-
         def _fn(c: Console) -> None:
             c.print()
             c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
-            parts = [f"{spinner} thinking..."]
-            if elapsed >= 0.5:
-                parts.append(f"⏱ {elapsed:.0f}s")
-            if tokens_up:
-                parts.append(f"↑ {tokens_up:,}")
-            c.print(f"[dim]{'  '.join(parts)}[/dim]")
-
+            c.print(f"[dim]{spinner} thinking...[/dim]")
         return _rich_to_ansi(_fn)
 
     async def _animate_thinking(self) -> None:
+        import asyncio
         try:
             while True:
                 await asyncio.sleep(0.1)
                 self._thinking_frame += 1
-                self._phase_elapsed = time.monotonic() - self._phase_start
-                if self._phase_mode == "tool":
-                    self._stream_cache = self._render_tool_phase()
-                else:
-                    self._stream_cache = self._render_thinking()
+                self._stream_cache = self._render_thinking()
                 self._invalidate()
         except asyncio.CancelledError:
             pass
@@ -504,8 +456,6 @@ class SplitTUI:
         parts = "".join(self._output_lines)
         if self._stream_buf or self._stream_ts:
             parts += self._stream_cache
-            if self._live_progress:
-                parts += self._live_progress
         if not parts:
             parts = self._render_welcome()
 
@@ -773,12 +723,6 @@ class SplitTUI:
         self._scroll_offset = 0
         self._ctx_used = 0
         self._ctx_total = 0
-        self._live_progress = ""
-        self._phase_start = 0.0
-        self._phase_elapsed = 0.0
-        self._phase_mode = "idle"
-        self._phase_tokens_up = 0
-        self._phase_tokens_down = 0
         self._invalidate()
 
     def add_user_echo(self, text: str) -> None:
@@ -790,22 +734,15 @@ class SplitTUI:
         self._pin_to_bottom()
         self._invalidate()
 
-    def add_response(
-        self,
-        content: str,
-        metadata: dict | None = None,
-        ts: str | None = None,
-        elapsed: float = 0.0,
-        tokens_down: int = 0,
-    ) -> None:
+    def add_response(self, content: str, metadata: dict | None = None, ts: str | None = None) -> None:
         """Add a completed nanobot response block."""
-        self._append_block(self._render_response(content, metadata, ts, elapsed=elapsed, tokens_down=tokens_down))
+        self._append_block(self._render_response(content, metadata, ts))
         self._pin_to_bottom()
         self._invalidate()
 
     def add_progress(self, text: str) -> None:
-        """Append a tool-hint line to the live area (not permanent history)."""
-        self._live_progress += _rich_to_ansi(lambda c: c.print(f"  [dim]↳ {text}[/dim]"))
+        """Add a progress / tool-hint line."""
+        self._append_block(self._render_progress(text))
         self._pin_to_bottom()
         self._invalidate()
 
@@ -815,35 +752,14 @@ class SplitTUI:
         self._pin_to_bottom()
         self._invalidate()
 
-    def stream_start(self, tokens_up: int = 0) -> None:
-        """Mark the beginning of a new LLM call (thinking/streaming phase)."""
+    def stream_start(self) -> None:
+        """Mark the beginning of a new streaming response (captures timestamp)."""
+        import asyncio
         self._cancel_thinking()
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
         self._thinking_frame = 0
-        self._live_progress = ""
-        self._phase_mode = "thinking"
-        self._phase_start = time.monotonic()
-        self._phase_elapsed = 0.0
-        self._phase_tokens_up = tokens_up
-        self._phase_tokens_down = 0
         self._stream_cache = self._render_thinking()
-        self._stream_cache_key = 0
-        self._pin_to_bottom()
-        self._invalidate()
-        self._thinking_task = asyncio.ensure_future(self._animate_thinking())
-
-    def tool_phase_start(self) -> None:
-        """Switch to tool-execution phase: keep live area visible, reset timer."""
-        self._cancel_thinking()
-        self._phase_mode = "tool"
-        self._phase_start = time.monotonic()
-        self._phase_elapsed = 0.0
-        self._live_progress = ""
-        # Keep _stream_ts so live area remains visible; _stream_buf already cleared
-        if not self._stream_ts:
-            self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._stream_cache = self._render_tool_phase()
         self._stream_cache_key = 0
         self._pin_to_bottom()
         self._invalidate()
@@ -852,14 +768,7 @@ class SplitTUI:
     def stream_delta(self, delta: str) -> None:
         """Append a streaming delta and refresh the output pane."""
         self._cancel_thinking()
-        if self._phase_mode in ("thinking", "tool"):
-            # Transition into streaming phase; reset timer for this LLM call
-            self._phase_mode = "streaming"
-            self._phase_start = time.monotonic()
-            self._phase_elapsed = 0.0
-            self._live_progress = ""
         self._stream_buf += delta
-        self._phase_elapsed = time.monotonic() - self._phase_start
         key = len(self._stream_buf)
         if key != self._stream_cache_key:
             self._stream_cache = self._render_stream_snapshot()
@@ -870,17 +779,14 @@ class SplitTUI:
     def flush_stream(self, metadata: dict | None = None) -> None:
         """Finalize the current stream: render to history and clear buffer."""
         self._cancel_thinking()
-        elapsed = self._phase_elapsed
         if self._stream_buf.strip():
             self._append_block(
-                self._render_response(
-                    self._stream_buf, metadata, ts=self._stream_ts, elapsed=elapsed
-                )
+                self._render_response(self._stream_buf, metadata, ts=self._stream_ts)
             )
         self._stream_buf = ""
         self._stream_cache = ""
         self._stream_cache_key = 0
-        # _stream_ts intentionally kept so live area stays visible for tool phase
+        self._stream_ts = ""
         self._pin_to_bottom()
         self._invalidate()
 
@@ -891,9 +797,6 @@ class SplitTUI:
         self._stream_buf = ""
         self._stream_cache = ""
         self._stream_cache_key = 0
-        self._stream_ts = ""
-        self._live_progress = ""
-        self._phase_mode = "idle"
         return buf
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
