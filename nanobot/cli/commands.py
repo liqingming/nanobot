@@ -912,8 +912,9 @@ def agent(
         async def run_interactive():
             tui = SplitTUI(render_markdown=markdown, history_file=history_file, model=config.agents.defaults.model)
 
-            # Mutable topic state — chat_id changes when user switches topics
-            topic_state: dict[str, str] = {"chat_id": cli_chat_id}
+            # Mutable topic state — fresh session by default; user picks via startup popup
+            fresh_chat_id = datetime.now().strftime("topic_%Y%m%d_%H%M%S")
+            topic_state: dict[str, str] = {"chat_id": fresh_chat_id}
 
             def _load_topic(name: str) -> None:
                 """Load session history and context estimate for the given topic."""
@@ -933,8 +934,26 @@ def agent(
                 ("/exit", "退出 nanobot"),
             ])
 
-            # Restore prior conversation into the output pane
-            _load_topic(cli_chat_id)
+            # Show startup topic picker if existing sessions are available
+            async def _startup_picker() -> None:
+                await asyncio.sleep(0.05)
+                sessions_list = agent_loop.sessions.list_sessions()
+                prefix = f"{cli_channel}:"
+                topics = [
+                    s["key"][len(prefix):]
+                    for s in sessions_list
+                    if s["key"].startswith(prefix)
+                ]
+                if topics:
+                    options = ["[ 新建话题 ]"] + topics
+                    async def _on_startup_select(name: str) -> None:
+                        if name == "[ 新建话题 ]":
+                            tui.set_topic(fresh_chat_id)
+                        else:
+                            await _switch_topic(name)
+                    tui.show_topic_popup(options, _on_startup_select)
+
+            asyncio.create_task(_startup_picker())
 
             bus_task = asyncio.create_task(agent_loop.run())
             is_processing = False
