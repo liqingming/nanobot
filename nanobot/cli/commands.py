@@ -966,7 +966,10 @@ def agent(
                 else:
                     tui.stream_start()
                     tui.add_user_echo(text)
-                    await asyncio.sleep(0)
+                # Exceed prompt_toolkit's max_render_postpone_time (0.01s) so the
+                # thinking animation is guaranteed to reach the screen before the
+                # bus receives the message and the LLM starts responding.
+                await asyncio.sleep(0.015)
                 await bus.publish_inbound(InboundMessage(
                     channel=cli_channel,
                     sender_id="user",
