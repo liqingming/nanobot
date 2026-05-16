@@ -250,6 +250,7 @@ class SplitTUI:
         self._ctx_used: int = 0              # last known prompt tokens
         self._ctx_total: int = 0             # context window size
         self._topic: str = ""               # current topic name (chat_id)
+        self._live_progress: str = ""        # tool-hint lines shown in live area
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._app: Application | None = None
         # Command / topic popup state
@@ -456,6 +457,8 @@ class SplitTUI:
         parts = "".join(self._output_lines)
         if self._stream_buf or self._stream_ts:
             parts += self._stream_cache
+            if self._live_progress:
+                parts += self._live_progress
         if not parts:
             parts = self._render_welcome()
 
@@ -723,6 +726,7 @@ class SplitTUI:
         self._scroll_offset = 0
         self._ctx_used = 0
         self._ctx_total = 0
+        self._live_progress = ""
         self._invalidate()
 
     def add_user_echo(self, text: str) -> None:
@@ -741,8 +745,8 @@ class SplitTUI:
         self._invalidate()
 
     def add_progress(self, text: str) -> None:
-        """Add a progress / tool-hint line."""
-        self._append_block(self._render_progress(text))
+        """Append a tool-hint line to the live area (keeps thinking animation alive)."""
+        self._live_progress += _rich_to_ansi(lambda c: c.print(f"  [dim]↳ {text}[/dim]"))
         self._pin_to_bottom()
         self._invalidate()
 
@@ -754,11 +758,26 @@ class SplitTUI:
 
     def stream_start(self) -> None:
         """Mark the beginning of a new streaming response (captures timestamp)."""
-        import asyncio
         self._cancel_thinking()
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
+        self._live_progress = ""
         self._thinking_frame = 0
+        self._stream_cache = self._render_thinking()
+        self._stream_cache_key = 0
+        self._pin_to_bottom()
+        self._invalidate()
+        self._thinking_task = asyncio.ensure_future(self._animate_thinking())
+
+    def tool_phase_start(self) -> None:
+        """Switch to tool-execution phase: keep live area and animation running."""
+        self._cancel_thinking()
+        self._stream_buf = ""
+        self._live_progress = ""
+        self._thinking_frame = 0
+        # Keep _stream_ts so live area stays visible during tool execution
+        if not self._stream_ts:
+            self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_cache = self._render_thinking()
         self._stream_cache_key = 0
         self._pin_to_bottom()
@@ -786,7 +805,7 @@ class SplitTUI:
         self._stream_buf = ""
         self._stream_cache = ""
         self._stream_cache_key = 0
-        self._stream_ts = ""
+        # _stream_ts intentionally kept so live area stays visible for tool phase
         self._pin_to_bottom()
         self._invalidate()
 
@@ -797,6 +816,8 @@ class SplitTUI:
         self._stream_buf = ""
         self._stream_cache = ""
         self._stream_cache_key = 0
+        self._stream_ts = ""
+        self._live_progress = ""
         return buf
 
     # ── Lifecycle ──────────────────────────────────────────────────────────

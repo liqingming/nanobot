@@ -1049,9 +1049,9 @@ def agent(
 
                         if msg.metadata.get("_stream_end"):
                             if msg.metadata.get("_resuming"):
-                                # Intermediate flush: first half before tool call
+                                # Flush LLM chunk, then keep animation alive during tool exec
                                 tui.flush_stream()
-                                tui.stream_start()
+                                tui.tool_phase_start()
                             continue
 
                         if msg.metadata.get("_streamed"):
