@@ -252,6 +252,7 @@ class SplitTUI:
         self._topic: str = ""               # current topic name (chat_id)
         self._live_progress: str = ""        # tool-hint lines shown in live area
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
+        self._on_pre_submit: Callable[[str], None] | None = None
         self._app: Application | None = None
         # Command / topic popup state
         self._all_commands: list[tuple[str, str]] = []
@@ -416,10 +417,10 @@ class SplitTUI:
         import asyncio
         try:
             while True:
-                await asyncio.sleep(0.1)
                 self._thinking_frame += 1
                 self._stream_cache = self._render_thinking()
                 self._invalidate()
+                await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             pass
 
@@ -535,9 +536,13 @@ class SplitTUI:
                     asyncio.ensure_future(self._on_submit(value))
                 return
             text = self._input_buffer.text
-            self._input_buffer.reset(append_to_history=True)
             if text.strip() and self._on_submit:
+                if self._on_pre_submit:
+                    self._on_pre_submit(text)
+                self._input_buffer.reset(append_to_history=True)
                 asyncio.ensure_future(self._on_submit(text))
+            else:
+                self._input_buffer.reset(append_to_history=True)
 
         @kb.add("tab")
         def _tab(event: Any) -> None:
@@ -628,6 +633,9 @@ class SplitTUI:
 
     def set_on_submit(self, callback: Callable[[str], Awaitable[None]]) -> None:
         self._on_submit = callback
+
+    def set_on_pre_submit(self, callback: Callable[[str], None]) -> None:
+        self._on_pre_submit = callback
 
     def set_commands(self, commands: list[tuple[str, str]]) -> None:
         """Register available commands for the popup completion menu."""

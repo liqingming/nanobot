@@ -939,6 +939,7 @@ def agent(
             bus_task = asyncio.create_task(agent_loop.run())
             is_processing = False
             pending_queue: list[str] = []
+            _pre_submitted: list[bool] = [False]
 
             # Override signals so Ctrl+C / SIGTERM cleanly exit the TUI
             def _tui_signal(signum, frame):  # noqa: ARG001
@@ -951,11 +952,21 @@ def agent(
             if hasattr(signal, "SIGPIPE"):
                 signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
+            def _pre_submit(text: str) -> None:
+                if not is_processing:
+                    tui.stream_start()
+                    tui.add_user_echo(text)
+                    _pre_submitted[0] = True
+
             async def _send_message(text: str) -> None:
                 nonlocal is_processing
                 is_processing = True
-                tui.stream_start()
-                tui.add_user_echo(text)
+                if _pre_submitted[0]:
+                    _pre_submitted[0] = False
+                else:
+                    tui.stream_start()
+                    tui.add_user_echo(text)
+                    await asyncio.sleep(0)
                 await bus.publish_inbound(InboundMessage(
                     channel=cli_channel,
                     sender_id="user",
@@ -1034,9 +1045,11 @@ def agent(
                     pending_queue.append(user_input)
                     tui.add_system("Message queued — will send when nanobot finishes.")
                 else:
+                    await asyncio.sleep(0)
                     await _send_message(user_input)
 
             tui.set_on_submit(_on_submit)
+            tui.set_on_pre_submit(_pre_submit)
 
             async def _consume_outbound():
                 while True:
@@ -1062,13 +1075,7 @@ def agent(
                             continue
 
                         if msg.metadata.get("_progress"):
-                            is_tool_hint = msg.metadata.get("_tool_hint", False)
-                            ch = agent_loop.channels_config
-                            if ch and is_tool_hint and not ch.send_tool_hints:
-                                pass
-                            elif ch and not is_tool_hint and not ch.send_progress:
-                                pass
-                            else:
+                            if msg.content:
                                 tui.add_progress(msg.content)
                             continue
 
