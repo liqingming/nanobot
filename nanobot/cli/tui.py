@@ -792,6 +792,7 @@ class SplitTUI:
     def add_progress(self, text: str) -> None:
         """Show the current tool being executed (with rotation animation)."""
         self._tool_hint = text
+        self._stream_cache = self._render_tool_executing()
         if self._tool_task is None:
             self._tool_frame = 0
             self._tool_task = asyncio.ensure_future(self._animate_tool_executing())
@@ -838,6 +839,7 @@ class SplitTUI:
     def stream_delta(self, delta: str) -> None:
         """Append a streaming delta and refresh the output pane."""
         self._cancel_thinking()
+        self._cancel_tool_task()
         self._stream_buf += delta
         key = len(self._stream_buf)
         if key != self._stream_cache_key:
