@@ -1002,10 +1002,11 @@ def agent(
                 is_processing = False
                 usage = agent_loop._last_usage
                 if usage and agent_loop.context_window_tokens:
-                    tui.update_context_usage(
-                        usage.get("prompt_tokens", 0),
-                        agent_loop.context_window_tokens,
+                    ctx_used = (
+                        usage.get("prompt_tokens", 0)
+                        + usage.get("cache_read_input_tokens", 0)
                     )
+                    tui.update_context_usage(ctx_used, agent_loop.context_window_tokens)
                 if pending_queue:
                     await _send_message(pending_queue.pop(0))
 

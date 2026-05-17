@@ -219,6 +219,19 @@ class OpenAICompatProvider(LLMProvider):
             # ("reasoning_content must be passed back") on Anthropic's compat endpoint.
             if "reasoning_content" in clean and not clean["reasoning_content"]:
                 del clean["reasoning_content"]
+
+        # DeepSeek thinking mode requires ALL assistant messages to have reasoning_content
+        # if any of them do — a mix causes "reasoning_content must be passed back" errors.
+        # Fill missing ones with a single space (minimal truthy placeholder).
+        has_any_rc = any(
+            m.get("role") == "assistant" and m.get("reasoning_content")
+            for m in sanitized
+        )
+        if has_any_rc:
+            for m in sanitized:
+                if m.get("role") == "assistant" and not m.get("reasoning_content"):
+                    m["reasoning_content"] = " "
+
         return sanitized
 
     # ------------------------------------------------------------------

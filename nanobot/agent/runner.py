@@ -95,6 +95,8 @@ class AgentRunner:
             usage = {
                 "prompt_tokens": int(raw_usage.get("prompt_tokens", 0) or 0),
                 "completion_tokens": int(raw_usage.get("completion_tokens", 0) or 0),
+                "cache_read_input_tokens": int(raw_usage.get("cache_read_input_tokens", 0) or 0),
+                "cache_creation_input_tokens": int(raw_usage.get("cache_creation_input_tokens", 0) or 0),
             }
             context.response = response
             context.usage = usage
