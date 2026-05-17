@@ -23,6 +23,7 @@ keyboard-only (Up / Down arrows).
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -49,6 +50,60 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from nanobot import __logo__, __version__
+
+
+# ---------------------------------------------------------------------------
+# OSC 8 hyperlink helpers
+# ---------------------------------------------------------------------------
+
+# Splits ANSI strings into (escape_sequence | plain_text) tokens so we only
+# process plain-text spans and never corrupt existing escape codes.
+_ANSI_ESC_RE = re.compile(
+    r"(\033"
+    r"(?:"
+    r"\[[0-9;]*[A-Za-z]"               # CSI:  \033[...m  (colors, cursor, etc.)
+    r"|\][^\033\007]*(?:\033\\|\007)"  # OSC:  \033]...\033\  or  \033]...\007
+    r"|."                              # other: \033X
+    r"))"
+)
+_OSC8_LINK_RE = re.compile(
+    r"(https?://[^\s\033\"'`<>()\[\]]+"       # http/https URLs
+    r"|[A-Za-z]:[/\\][A-Za-z0-9._\-/\\]+)"   # Windows absolute paths (ASCII only)
+)
+_STRIP_TRAIL = ".,;:!?。，；：！？)"
+
+
+def _osc8_link(url: str, text: str) -> str:
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
+def _apply_osc8_links(s: str) -> str:
+    """Wrap URLs and Windows absolute paths with OSC 8 hyperlink sequences.
+
+    Terminals that support OSC 8 (e.g. Windows Terminal) show underline on
+    hover and open the link on click: file paths open with the default handler,
+    URLs open in the browser.
+    """
+    tokens = _ANSI_ESC_RE.split(s)
+    out: list[str] = []
+    for i, token in enumerate(tokens):
+        if i % 2 == 1:          # ANSI escape — keep verbatim
+            out.append(token)
+            continue
+        pos = 0
+        for m in _OSC8_LINK_RE.finditer(token):
+            out.append(token[pos:m.start()])
+            raw = m.group().rstrip(_STRIP_TRAIL)
+            trailing = m.group()[len(raw):]
+            if raw.startswith("http"):
+                out.append(_osc8_link(raw, raw))
+            else:               # Windows path → file:// URL
+                file_url = "file:///" + raw.replace("\\", "/")
+                out.append(_osc8_link(file_url, raw))
+            out.append(trailing)
+            pos = m.end()
+        out.append(token[pos:])
+    return "".join(out)
 
 
 def _ansi_width() -> int:
@@ -550,7 +605,7 @@ class SplitTUI:
 
         end = total - offset
         start = max(0, end - h)
-        return ANSI("\n".join(lines[start:end]))
+        return ANSI(_apply_osc8_links("\n".join(lines[start:end])))
 
     # ── Layout setup ───────────────────────────────────────────────────────
 

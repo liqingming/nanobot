@@ -1091,7 +1091,11 @@ def agent(
                             continue
 
                         if msg.metadata.get("_streamed"):
-                            content = tui.pop_stream() or msg.content or ""
+                            streamed = tui.pop_stream()
+                            if msg.metadata.get("_no_content"):
+                                content = streamed or ""
+                            else:
+                                content = streamed or msg.content or ""
                             if content.strip():
                                 tui.add_response(content, dict(msg.metadata or {}))
                             await _turn_complete()

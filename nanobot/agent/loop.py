@@ -290,6 +290,20 @@ class AgentLoop:
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
 
     @staticmethod
+    def _empty_after_tools(messages: list[dict]) -> bool:
+        """True when the LLM returned an empty non-tool message right after tool results."""
+        if len(messages) < 2:
+            return False
+        last = messages[-1]
+        prev = messages[-2]
+        return (
+            last.get("role") == "assistant"
+            and not last.get("content")
+            and not last.get("tool_calls")
+            and prev.get("role") == "tool"
+        )
+
+    @staticmethod
     def _strip_think(text: str | None) -> str | None:
         """Remove <think>…</think> blocks that some models embed in content."""
         if not text:
@@ -549,6 +563,24 @@ class AgentLoop:
             message_id=msg.metadata.get("message_id"),
         )
 
+        if final_content is None and self._empty_after_tools(all_msgs):
+            logger.info("LLM returned empty after tool results for {}:{}, retrying with nudge", msg.channel, msg.chat_id)
+            first_all_msgs = all_msgs
+            nudge = {"role": "user", "content": "请将你对上述内容的分析和总结写在回复正文里。"}
+            final_content, _, retry_all_msgs = await self._run_agent_loop(
+                first_all_msgs + [nudge],
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                channel=msg.channel, chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+            )
+            if final_content is not None:
+                # Stitch: first run messages + retry new messages, skipping the nudge.
+                # retry_all_msgs = first_all_msgs + [nudge] + retry_new_msgs
+                # retry_all_msgs[len(first_all_msgs) + 1:] = retry_new_msgs (nudge excluded)
+                all_msgs = first_all_msgs + retry_all_msgs[len(first_all_msgs) + 1:]
+
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
@@ -565,6 +597,8 @@ class AgentLoop:
         meta = dict(msg.metadata or {})
         if on_stream is not None:
             meta["_streamed"] = True
+            if final_content == "I've completed processing but have no response to give.":
+                meta["_no_content"] = True
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=meta,

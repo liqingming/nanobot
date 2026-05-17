@@ -163,7 +163,12 @@ class WriteFileTool(_FsTool):
 
     @property
     def description(self) -> str:
-        return "Write content to a file at the given path. Creates parent directories if needed."
+        return (
+            "Write text content to a file at the given path. Creates parent directories if needed. "
+            "The result is a TEXT FILE saved on disk — not an image or picture. "
+            "After writing, you MUST end your response with the exact absolute path returned by this tool, "
+            "e.g. '完整内容已保存至：<path>'."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
