@@ -39,7 +39,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.filters import Condition
-from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, Window
+from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, VSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.lexers import Lexer
@@ -52,7 +52,7 @@ from nanobot import __logo__, __version__
 
 
 def _ansi_width() -> int:
-    return max(40, shutil.get_terminal_size((80, 24)).columns - 2)
+    return max(40, shutil.get_terminal_size((80, 24)).columns - 3)
 
 
 def _output_height() -> int:
@@ -111,6 +111,45 @@ class _NoScrollBufferControl(BufferControl):
         ):
             return NotImplemented
         return super().mouse_handler(mouse_event)
+
+
+class _ScrollbarControl(UIControl):
+    """1-column vertical scrollbar for the output pane."""
+
+    def __init__(self, tui: "SplitTUI") -> None:
+        self._tui = tui
+
+    def create_content(self, width: int, height: int) -> UIContent:
+        total = self._tui._total_output_lines
+        viewport = self._tui._actual_output_height or max(1, height)
+        offset = self._tui._scroll_offset
+        max_offset = max(0, total - viewport)
+
+        if max_offset <= 0 or height <= 0:
+            # All content visible — blank scrollbar
+            def get_line_blank(i: int) -> list[tuple[str, str]]:
+                return [("fg:ansibrightblack", " ")]
+            return UIContent(get_line=get_line_blank, line_count=height, show_cursor=False)
+
+        # Thumb size proportional to viewport / total, minimum 1 row
+        thumb_size = max(1, round(height * viewport / total))
+        thumb_size = min(thumb_size, height)
+
+        # scroll_from_top: 0 = pinned to top, max_offset = pinned to bottom
+        scroll_from_top = max_offset - offset
+        track = height - thumb_size
+        thumb_top = round(scroll_from_top / max_offset * track) if max_offset > 0 else 0
+        thumb_top = max(0, min(thumb_top, height - thumb_size))
+
+        def get_line(i: int) -> list[tuple[str, str]]:
+            if thumb_top <= i < thumb_top + thumb_size:
+                return [("fg:ansiwhite", "█")]
+            return [("fg:ansibrightblack", "│")]
+
+        return UIContent(get_line=get_line, line_count=height, show_cursor=False)
+
+    def is_focusable(self) -> bool:
+        return False
 
 
 class _RightAlignedLabelControl(UIControl):
@@ -250,6 +289,7 @@ class SplitTUI:
         self._stream_cache_key: int = 0      # len(stream_buf) when cache was built
         self._scroll_offset: int = 0         # lines from bottom; 0 = newest visible
         self._actual_output_height: int = 0  # captured by _OutputControl.create_content()
+        self._total_output_lines: int = 0    # total logical lines, for scrollbar
         self._last_sep: bool = False         # True if last appended item was a separator
         self._thinking_frame: int = 0        # spinner frame index
         self._thinking_task: Any = None      # asyncio.Task for spinner animation
@@ -501,6 +541,7 @@ class SplitTUI:
 
         lines = parts.split("\n")
         total = len(lines)
+        self._total_output_lines = total
         h = self._actual_output_height or _output_height()
 
         # Clamp offset: can't scroll past the point where we'd show fewer than h lines
@@ -515,11 +556,19 @@ class SplitTUI:
 
     def _setup(self, history_file: str | None) -> None:
         output_ctrl = _OutputControl(self, text=self._get_output_text, focusable=False)
-        output_window = Window(
-            content=output_ctrl,
-            wrap_lines=False,       # Rich pre-wraps at _ansi_width(); no double-wrap
-            always_hide_cursor=True,
-        )
+        scrollbar_ctrl = _ScrollbarControl(self)
+        output_window = VSplit([
+            Window(
+                content=output_ctrl,
+                wrap_lines=False,       # Rich pre-wraps at _ansi_width(); no double-wrap
+                always_hide_cursor=True,
+            ),
+            Window(
+                content=scrollbar_ctrl,
+                width=1,
+                always_hide_cursor=True,
+            ),
+        ])
 
         topic_line = ConditionalContainer(
             Window(
