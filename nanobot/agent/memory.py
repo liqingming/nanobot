@@ -34,8 +34,17 @@ _SAVE_MEMORY_TOOL = [
                     },
                     "memory_update": {
                         "type": "string",
-                        "description": "Full updated long-term memory as markdown. Include all existing "
-                        "facts plus new ones. Return unchanged if nothing new.",
+                        "description": (
+                            "Full updated long-term memory as markdown. Include all existing facts plus new ones. "
+                            "CRITICAL DISTINCTION from history_entry: history_entry records past events; "
+                            "memory_update records CURRENT STATE — what an agent needs to know to continue "
+                            "working correctly. If memory_update already tracks an ongoing multi-step process "
+                            "(e.g. a learning sequence, a task with numbered steps), you MUST update its "
+                            "current progress to reflect what was completed in this conversation. "
+                            "Do NOT rely on history_entry alone to track current progress — "
+                            "that information will not be visible to the agent in future turns. "
+                            "Return unchanged only if no facts or current state has changed."
+                        ),
                     },
                 },
                 "required": ["history_entry", "memory_update"],
@@ -131,7 +140,13 @@ class MemoryStore:
 {self._format_messages(messages)}"""
 
         chat_messages = [
-            {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+            {"role": "system", "content": (
+                "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation. "
+                "Key rule: history_entry records WHAT HAPPENED (events, decisions, topics covered). "
+                "memory_update records CURRENT STATE (ongoing task progress, active context, what must be known to resume work). "
+                "If the conversation shows progress on a multi-step task already tracked in long-term memory, "
+                "update that progress in memory_update — history_entry alone is insufficient because it is not injected into future prompts."
+            )},
             {"role": "user", "content": prompt},
         ]
 
