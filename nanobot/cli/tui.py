@@ -253,6 +253,9 @@ class SplitTUI:
         self._last_sep: bool = False         # True if last appended item was a separator
         self._thinking_frame: int = 0        # spinner frame index
         self._thinking_task: Any = None      # asyncio.Task for spinner animation
+        self._tool_frame: int = 0            # spinner frame index for tool execution
+        self._tool_task: Any = None          # asyncio.Task for tool animation
+        self._tool_hint: str = ""            # current tool hint label
         self._ctx_used: int = 0              # last known prompt tokens
         self._ctx_total: int = 0             # context window size
         self._topic: str = ""               # current topic name (chat_id)
@@ -409,6 +412,7 @@ class SplitTUI:
         self._last_sep = False
 
     _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    _TOOL_SPINNER = ["◐", "◓", "◑", "◒"]
 
     def _render_thinking(self) -> str:
         ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -419,13 +423,14 @@ class SplitTUI:
             c.print(f"[dim]{spinner} thinking...[/dim]")
         return _rich_to_ansi(_fn)
 
-    def _render_tool_executing(self, hint: str = "") -> str:
+    def _render_tool_executing(self) -> str:
         ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        label = hint or "executing..."
+        label = self._tool_hint or "executing..."
+        spinner = self._TOOL_SPINNER[self._tool_frame % len(self._TOOL_SPINNER)]
         def _fn(c: Console) -> None:
             c.print()
             c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
-            c.print(f"[dim]⚙ {label}[/dim]")
+            c.print(f"[dim]{spinner} {label}[/dim]")
         return _rich_to_ansi(_fn)
 
     async def _animate_thinking(self) -> None:
@@ -443,6 +448,22 @@ class SplitTUI:
         if self._thinking_task is not None:
             self._thinking_task.cancel()
             self._thinking_task = None
+
+    def _cancel_tool_task(self) -> None:
+        if self._tool_task is not None:
+            self._tool_task.cancel()
+            self._tool_task = None
+
+    async def _animate_tool_executing(self) -> None:
+        import asyncio
+        try:
+            while True:
+                self._tool_frame += 1
+                self._stream_cache = self._render_tool_executing()
+                self._invalidate()
+                await asyncio.sleep(0.15)
+        except asyncio.CancelledError:
+            pass
 
     # ── FormattedTextControl callbacks ────────────────────────────────────
 
@@ -740,6 +761,7 @@ class SplitTUI:
     def reset_history(self) -> None:
         """Clear all output history (used when switching topics)."""
         self._cancel_thinking()
+        self._cancel_tool_task()
         self._output_lines.clear()
         self._stream_buf = ""
         self._stream_cache = ""
@@ -768,8 +790,11 @@ class SplitTUI:
         self._invalidate()
 
     def add_progress(self, text: str) -> None:
-        """Show the current tool being executed (replaces stream_cache, no animation)."""
-        self._stream_cache = self._render_tool_executing(text)
+        """Show the current tool being executed (with rotation animation)."""
+        self._tool_hint = text
+        if self._tool_task is None:
+            self._tool_frame = 0
+            self._tool_task = asyncio.ensure_future(self._animate_tool_executing())
         self._pin_to_bottom()
         self._invalidate()
 
@@ -782,6 +807,7 @@ class SplitTUI:
     def stream_start(self) -> None:
         """Mark the beginning of a new streaming response (captures timestamp)."""
         self._cancel_thinking()
+        self._cancel_tool_task()
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
         self._live_progress = ""
@@ -793,18 +819,21 @@ class SplitTUI:
         self._thinking_task = asyncio.ensure_future(self._animate_thinking())
 
     def tool_phase_start(self) -> None:
-        """Switch to tool-execution phase: stop animation, show static executing indicator."""
+        """Switch to tool-execution phase: stop thinking animation, start tool rotation."""
         self._cancel_thinking()
+        self._cancel_tool_task()
         self._stream_buf = ""
         self._live_progress = ""
         self._thinking_frame = 0
+        self._tool_frame = 0
+        self._tool_hint = ""
         if not self._stream_ts:
             self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_cache = self._render_tool_executing()
         self._stream_cache_key = 0
         self._pin_to_bottom()
         self._invalidate()
-        # No thinking task: animation stops during tool execution
+        self._tool_task = asyncio.ensure_future(self._animate_tool_executing())
 
     def stream_delta(self, delta: str) -> None:
         """Append a streaming delta and refresh the output pane."""
@@ -820,6 +849,7 @@ class SplitTUI:
     def flush_stream(self, metadata: dict | None = None) -> None:
         """Finalize the current stream: render to history and clear buffer."""
         self._cancel_thinking()
+        self._cancel_tool_task()
         if self._stream_buf.strip():
             self._append_block(
                 self._render_response(self._stream_buf, metadata, ts=self._stream_ts)
@@ -834,6 +864,7 @@ class SplitTUI:
     def pop_stream(self) -> str:
         """Return accumulated stream text and clear without adding to history."""
         self._cancel_thinking()
+        self._cancel_tool_task()
         buf = self._stream_buf
         self._stream_buf = ""
         self._stream_cache = ""
