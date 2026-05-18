@@ -43,7 +43,14 @@ _SAVE_MEMORY_TOOL = [
                             "current progress to reflect what was completed in this conversation. "
                             "Do NOT rely on history_entry alone to track current progress — "
                             "that information will not be visible to the agent in future turns. "
-                            "Return unchanged only if no facts or current state has changed."
+                            "Return unchanged only if no facts or current state has changed. "
+                            "PLAN TREE FORMAT: Active plans are tracked as '## [计划] NAME `[STATUS]`' sections. "
+                            "STATUS values: [⬜] pending, [🔄] in-progress, [✅ DATE] done, [❌] abandoned, [🔀 已替换] replaced. "
+                            "If backed by an external file, add '*文件*：`path`' line under the header. "
+                            "Tasks are indented bullet lists; sub-plans indent further as '子计划：NAME `[STATUS]`'. "
+                            "RULES: (1) Only update status markers and add completed items — never restructure the parent hierarchy. "
+                            "(2) Sub-plans must stay nested under their parent task, never promoted to top-level. "
+                            "(3) If a file-backed plan exists, follow its structure; do not derive a new order."
                         ),
                     },
                 },
@@ -145,7 +152,18 @@ class MemoryStore:
                 "Key rule: history_entry records WHAT HAPPENED (events, decisions, topics covered). "
                 "memory_update records CURRENT STATE (ongoing task progress, active context, what must be known to resume work). "
                 "If the conversation shows progress on a multi-step task already tracked in long-term memory, "
-                "update that progress in memory_update — history_entry alone is insufficient because it is not injected into future prompts."
+                "update that progress in memory_update — history_entry alone is insufficient because it is not injected into future prompts. "
+                "CRITICAL: If long-term memory references an external plan file (e.g. a .md guide or roadmap), "
+                "do NOT replace that plan's structure with a derived or reordered version. "
+                "Track progress using the original plan's layer/step structure. "
+                "Only add new knowledge points; never restructure or rename the existing plan hierarchy. "
+                "PLAN TREE FORMAT: Active plans are tracked as '## [计划] NAME `[STATUS]`' sections. "
+                "STATUS values: [⬜] pending, [🔄] in-progress, [✅ DATE] done, [❌] abandoned, [🔀 已替换] replaced. "
+                "If backed by an external file, add '*文件*：`path`' line under the header. "
+                "Tasks are indented bullet lists; sub-plans indent further as '子计划：NAME `[STATUS]`'. "
+                "When updating memory_update: (1) Only update status markers and add completed items — never restructure. "
+                "(2) Sub-plans must stay nested under their parent task, never promoted to top-level. "
+                "(3) If a file-backed plan exists, follow its structure exactly."
             )},
             {"role": "user", "content": prompt},
         ]

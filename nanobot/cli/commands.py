@@ -948,7 +948,11 @@ def agent(
                     options = ["[ 新建话题 ]"] + topics
                     async def _on_startup_select(name: str) -> None:
                         if name == "[ 新建话题 ]":
-                            tui.set_topic(fresh_chat_id)
+                            async def _confirm_new_topic(typed: str) -> None:
+                                new_name = typed or datetime.now().strftime("topic_%Y%m%d_%H%M%S")
+                                await _switch_topic(new_name)
+                                tui.add_system(f"已创建话题: {new_name}")
+                            tui.enter_new_topic_mode(_confirm_new_topic)
                         else:
                             await _switch_topic(name)
                     tui.show_topic_popup(options, _on_startup_select)
@@ -959,6 +963,7 @@ def agent(
             is_processing = False
             pending_queue: list[str] = []
             _pre_submitted: list[bool] = [False]
+            _turn_cancelled: list[bool] = [False]
 
             # Override signals so Ctrl+C / SIGTERM cleanly exit the TUI
             def _tui_signal(signum, frame):  # noqa: ARG001
@@ -971,6 +976,23 @@ def agent(
             if hasattr(signal, "SIGPIPE"):
                 signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
+            def _cancel_current() -> None:
+                nonlocal is_processing
+                if not is_processing:
+                    return
+                _turn_cancelled[0] = True
+                session_key = f"{cli_channel}:{topic_state['chat_id']}"
+                tasks = agent_loop._active_tasks.get(session_key, [])
+                for task in list(tasks):
+                    task.cancel()
+                tui.flush_stream()
+                is_processing = False
+                tui.set_is_processing(False)
+                pending_queue.clear()
+                tui.add_system("已取消当前请求。")
+
+            tui.set_on_cancel(_cancel_current)
+
             def _pre_submit(text: str) -> None:
                 if not is_processing:
                     tui.stream_start()
@@ -979,7 +1001,9 @@ def agent(
 
             async def _send_message(text: str) -> None:
                 nonlocal is_processing
+                _turn_cancelled[0] = False
                 is_processing = True
+                tui.set_is_processing(True)
                 if _pre_submitted[0]:
                     _pre_submitted[0] = False
                 else:
@@ -1000,6 +1024,7 @@ def agent(
             async def _turn_complete() -> None:
                 nonlocal is_processing
                 is_processing = False
+                tui.set_is_processing(False)
                 usage = agent_loop._last_usage
                 if usage and agent_loop.context_window_tokens:
                     ctx_used = (
@@ -1029,9 +1054,18 @@ def agent(
                         tui.add_system("请等待当前响应完成后再新建话题。")
                         return
                     parts = text.split(None, 1)
-                    name = parts[1].strip() if len(parts) > 1 else datetime.now().strftime("topic_%Y%m%d_%H%M%S")
-                    await _switch_topic(name)
-                    tui.add_system(f"已创建并切换到话题: {name}")
+                    if len(parts) > 1 and parts[1].strip():
+                        # /new <name> — name provided directly, no need for input mode
+                        name = parts[1].strip()
+                        await _switch_topic(name)
+                        tui.add_system(f"已创建并切换到话题: {name}")
+                    else:
+                        # /new with no args — enter topic-name input mode
+                        async def _confirm_new_topic_cmd(typed: str) -> None:
+                            name = typed or datetime.now().strftime("topic_%Y%m%d_%H%M%S")
+                            await _switch_topic(name)
+                            tui.add_system(f"已创建并切换到话题: {name}")
+                        tui.enter_new_topic_mode(_confirm_new_topic_cmd)
                     return
 
                 if text.startswith("/resume"):
@@ -1080,17 +1114,21 @@ def agent(
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
 
                         if msg.metadata.get("_stream_delta"):
-                            tui.stream_delta(msg.content)
+                            if not _turn_cancelled[0]:
+                                tui.stream_delta(msg.content)
                             continue
 
                         if msg.metadata.get("_stream_end"):
-                            if msg.metadata.get("_resuming"):
+                            if not _turn_cancelled[0] and msg.metadata.get("_resuming"):
                                 # Flush LLM chunk, then keep animation alive during tool exec
                                 tui.flush_stream()
                                 tui.tool_phase_start()
                             continue
 
                         if msg.metadata.get("_streamed"):
+                            if _turn_cancelled[0]:
+                                _turn_cancelled[0] = False
+                                continue
                             streamed = tui.pop_stream()
                             if msg.metadata.get("_no_content"):
                                 content = streamed or ""
@@ -1102,7 +1140,7 @@ def agent(
                             continue
 
                         if msg.metadata.get("_progress"):
-                            if msg.content:
+                            if msg.content and not _turn_cancelled[0]:
                                 tui.add_progress(msg.content)
                             continue
 

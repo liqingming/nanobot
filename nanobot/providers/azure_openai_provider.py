@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -153,10 +154,12 @@ class AzureOpenAIProvider(LLMProvider):
                         content=f"Azure OpenAI API Error {response.status_code}: {response.text}",
                         finish_reason="error",
                     )
-                
+
                 response_data = response.json()
                 return self._parse_response(response_data)
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return LLMResponse(
                 content=f"Error calling Azure OpenAI: {repr(e)}",
@@ -241,6 +244,8 @@ class AzureOpenAIProvider(LLMProvider):
                             finish_reason="error",
                         )
                     return await self._consume_stream(response, on_content_delta)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return LLMResponse(content=f"Error calling Azure OpenAI: {repr(e)}", finish_reason="error")
 

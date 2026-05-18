@@ -23,7 +23,6 @@ keyboard-only (Up / Down arrows).
 from __future__ import annotations
 
 import asyncio
-import re
 import shutil
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -50,60 +49,6 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from nanobot import __logo__, __version__
-
-
-# ---------------------------------------------------------------------------
-# OSC 8 hyperlink helpers
-# ---------------------------------------------------------------------------
-
-# Splits ANSI strings into (escape_sequence | plain_text) tokens so we only
-# process plain-text spans and never corrupt existing escape codes.
-_ANSI_ESC_RE = re.compile(
-    r"(\033"
-    r"(?:"
-    r"\[[0-9;]*[A-Za-z]"               # CSI:  \033[...m  (colors, cursor, etc.)
-    r"|\][^\033\007]*(?:\033\\|\007)"  # OSC:  \033]...\033\  or  \033]...\007
-    r"|."                              # other: \033X
-    r"))"
-)
-_OSC8_LINK_RE = re.compile(
-    r"(https?://[^\s\033\"'`<>()\[\]]+"       # http/https URLs
-    r"|[A-Za-z]:[/\\][A-Za-z0-9._\-/\\]+)"   # Windows absolute paths (ASCII only)
-)
-_STRIP_TRAIL = ".,;:!?。，；：！？)"
-
-
-def _osc8_link(url: str, text: str) -> str:
-    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
-
-
-def _apply_osc8_links(s: str) -> str:
-    """Wrap URLs and Windows absolute paths with OSC 8 hyperlink sequences.
-
-    Terminals that support OSC 8 (e.g. Windows Terminal) show underline on
-    hover and open the link on click: file paths open with the default handler,
-    URLs open in the browser.
-    """
-    tokens = _ANSI_ESC_RE.split(s)
-    out: list[str] = []
-    for i, token in enumerate(tokens):
-        if i % 2 == 1:          # ANSI escape — keep verbatim
-            out.append(token)
-            continue
-        pos = 0
-        for m in _OSC8_LINK_RE.finditer(token):
-            out.append(token[pos:m.start()])
-            raw = m.group().rstrip(_STRIP_TRAIL)
-            trailing = m.group()[len(raw):]
-            if raw.startswith("http"):
-                out.append(_osc8_link(raw, raw))
-            else:               # Windows path → file:// URL
-                file_url = "file:///" + raw.replace("\\", "/")
-                out.append(_osc8_link(file_url, raw))
-            out.append(trailing)
-            pos = m.end()
-        out.append(token[pos:])
-    return "".join(out)
 
 
 def _ansi_width() -> int:
@@ -240,13 +185,15 @@ class _CommandLexer(Lexer):
     def lex_document(self, document: Document):  # type: ignore[override]
         text = document.text
         cmds = {cmd for cmd, _ in self._tui._all_commands}
-        is_cmd = text in cmds
 
         def get_line(lineno: int) -> list[tuple[str, str]]:
             if lineno != 0:
                 return [("", "")]
-            if is_cmd:
+            if text in cmds:
                 return [("fg:#5c6bc0 bold", text)]
+            for cmd in cmds:
+                if text.startswith(cmd + " "):
+                    return [("fg:#5c6bc0 bold", cmd), ("fg:#7986cb", text[len(cmd):])]
             return [("", text)]
 
         return get_line
@@ -353,11 +300,16 @@ class SplitTUI:
         self._tool_hint: str = ""            # current tool hint label
         self._ctx_used: int = 0              # last known prompt tokens
         self._ctx_total: int = 0             # context window size
+        self._is_processing: bool = False    # True while agent is running
         self._topic: str = ""               # current topic name (chat_id)
         self._live_progress: str = ""        # tool-hint lines shown in live area
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._on_pre_submit: Callable[[str], None] | None = None
+        self._on_cancel: Callable[[], None] | None = None
         self._app: Application | None = None
+        # New-topic name input mode
+        self._input_mode: str = "chat"       # "chat" | "new_topic"
+        self._new_topic_cb: Callable[[str], Awaitable[None]] | None = None
         # Command / topic popup state
         self._all_commands: list[tuple[str, str]] = []
         self._popup_mode: str = "hidden"    # "hidden" | "command" | "topic"
@@ -468,6 +420,7 @@ class SplitTUI:
             c.print("  [bold]快捷键[/bold]")
             c.print("    [cyan]PageUp / PageDown[/cyan]   滚动历史记录")
             c.print("    [cyan]↑ / ↓[/cyan]              切换输入历史")
+            c.print("    [cyan]ESC[/cyan]                取消当前请求")
             c.print("    [cyan]Ctrl+C / Ctrl+D[/cyan]    退出")
             c.print()
             c.print("  [bold]命令[/bold]")
@@ -566,6 +519,15 @@ class SplitTUI:
     def _get_status_text(self) -> AnyFormattedText:
         w = shutil.get_terminal_size((80, 24)).columns
 
+        if self._is_processing:
+            esc_text = " ESC 打断 "
+            esc_part: list[tuple[str, str]] = [("fg:ansibrightblack", esc_text)]
+            esc_w = max(0, _wcswidth(esc_text))
+        else:
+            esc_text = ""
+            esc_part = []
+            esc_w = 0
+
         if self._ctx_total:
             pct = min(100, round(self._ctx_used * 100 / self._ctx_total))
             bar_width = 12
@@ -582,8 +544,9 @@ class SplitTUI:
             ctx_text = ""
             ctx_part = []
 
-        padding = max(0, w - len(ctx_text))
-        return [("", " " * padding)] + ctx_part
+        ctx_w = max(0, _wcswidth(ctx_text))
+        padding = max(0, w - esc_w - ctx_w)
+        return esc_part + [("", " " * padding)] + ctx_part
 
     def _get_output_text(self) -> AnyFormattedText:
         parts = "".join(self._output_lines)
@@ -605,7 +568,7 @@ class SplitTUI:
 
         end = total - offset
         start = max(0, end - h)
-        return ANSI(_apply_osc8_links("\n".join(lines[start:end])))
+        return ANSI("\n".join(lines[start:end]))
 
     # ── Layout setup ───────────────────────────────────────────────────────
 
@@ -650,7 +613,13 @@ class SplitTUI:
             height=D(min=1, max=4),
             wrap_lines=True,
             get_line_prefix=lambda lineno, wrap_count: (
-                HTML("<b fg='ansiblue'>You: </b>") if lineno == 0 and wrap_count == 0 else HTML("      ")
+                (
+                    HTML("<b fg='ansiyellow'>话题名: </b>")
+                    if self._input_mode == "new_topic"
+                    else HTML("<b fg='ansiblue'>You: </b>")
+                )
+                if lineno == 0 and wrap_count == 0
+                else HTML("        " if self._input_mode == "new_topic" else "      ")
             ),
         )
 
@@ -658,6 +627,13 @@ class SplitTUI:
 
         @kb.add("enter")
         def _submit(event: Any) -> None:
+            if self._input_mode == "new_topic":
+                name = self._input_buffer.text.strip()
+                cb = self._new_topic_cb
+                self._exit_new_topic_mode()
+                if cb:
+                    asyncio.ensure_future(cb(name))
+                return
             if self._popup_mode == "topic" and self._popup_items:
                 value, _ = self._popup_items[self._popup_idx]
                 cb = self._popup_on_select
@@ -692,8 +668,13 @@ class SplitTUI:
 
         @kb.add("escape")
         def _escape(event: Any) -> None:
+            if self._input_mode == "new_topic":
+                self._exit_new_topic_mode()
+                return
             if self._popup_items:
                 self.hide_popup()
+            elif self._on_cancel is not None:
+                self._on_cancel()
 
         @kb.add("c-c")
         def _ctrl_c(event: Any) -> None:
@@ -777,6 +758,22 @@ class SplitTUI:
     def set_on_pre_submit(self, callback: Callable[[str], None]) -> None:
         self._on_pre_submit = callback
 
+    def set_on_cancel(self, callback: Callable[[], None]) -> None:
+        self._on_cancel = callback
+
+    def enter_new_topic_mode(self, callback: Callable[[str], Awaitable[None]]) -> None:
+        """Switch input box to topic-name entry mode."""
+        self._input_mode = "new_topic"
+        self._new_topic_cb = callback
+        self._input_buffer.reset()
+        self._invalidate()
+
+    def _exit_new_topic_mode(self) -> None:
+        self._input_mode = "chat"
+        self._new_topic_cb = None
+        self._input_buffer.reset()
+        self._invalidate()
+
     def set_commands(self, commands: list[tuple[str, str]]) -> None:
         """Register available commands for the popup completion menu."""
         self._all_commands = commands
@@ -819,6 +816,8 @@ class SplitTUI:
 
     def _update_popup(self) -> None:
         """Recompute popup items based on current buffer text (called on text change)."""
+        if self._input_mode == "new_topic":
+            return
         text = self._input_buffer.text
         if self._popup_mode == "topic":
             query = text.lower()
@@ -849,6 +848,11 @@ class SplitTUI:
         self._popup_items = new_items
         self._popup_idx = 0
         self._popup_mode = "command" if new_items else "hidden"
+        self._invalidate()
+
+    def set_is_processing(self, value: bool) -> None:
+        """Toggle the ESC-to-cancel hint in the status bar."""
+        self._is_processing = value
         self._invalidate()
 
     def update_context_usage(self, used: int, total: int) -> None:

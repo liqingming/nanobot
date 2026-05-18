@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import secrets
 import string
@@ -426,12 +427,16 @@ class AnthropicProvider(LLMProvider):
         try:
             response = await self._client.messages.create(**kwargs)
             return self._parse_response(response)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             if self._is_temperature_deprecated_error(e):
                 kwargs.pop("temperature", None)
                 try:
                     response = await self._client.messages.create(**kwargs)
                     return self._parse_response(response)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e2:
                     return LLMResponse(content=f"Error calling LLM: {e2}", finish_reason="error")
             return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
@@ -458,6 +463,8 @@ class AnthropicProvider(LLMProvider):
                         await on_content_delta(text)
                 response = await stream.get_final_message()
             return self._parse_response(response)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             if self._is_temperature_deprecated_error(e):
                 kwargs.pop("temperature", None)
@@ -468,6 +475,8 @@ class AnthropicProvider(LLMProvider):
                                 await on_content_delta(text)
                         response = await stream.get_final_message()
                     return self._parse_response(response)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e2:
                     return LLMResponse(content=f"Error calling LLM: {e2}", finish_reason="error")
             return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")

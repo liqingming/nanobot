@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import secrets
@@ -605,6 +606,8 @@ class OpenAICompatProvider(LLMProvider):
         )
         try:
             return self._parse(await self._client.chat.completions.create(**kwargs))
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return self._handle_error(e)
 
@@ -635,6 +638,8 @@ class OpenAICompatProvider(LLMProvider):
                     if text:
                         await on_content_delta(text)
             return self._parse_chunks(chunks)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return self._handle_error(e)
 
