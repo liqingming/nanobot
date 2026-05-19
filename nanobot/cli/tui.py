@@ -35,8 +35,18 @@ from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import ANSI, HTML, AnyFormattedText
-from prompt_toolkit.history import FileHistory
+from prompt_toolkit.history import FileHistory as _FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+
+_HISTORY_SKIP = {"exit", "quit", "/exit", "/quit", ":q"}
+
+
+class _FilteredFileHistory(_FileHistory):
+    """FileHistory that silently drops exit-style commands."""
+
+    def store_string(self, string: str) -> None:
+        if string.strip().lower() not in _HISTORY_SKIP:
+            super().store_string(string)
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, VSplit, Window
@@ -600,7 +610,7 @@ class SplitTUI:
 
         buf_kwargs: dict[str, Any] = {"name": "nanobot_input", "multiline": False}
         if history_file:
-            buf_kwargs["history"] = FileHistory(history_file)
+            buf_kwargs["history"] = _FilteredFileHistory(history_file)
         self._input_buffer = Buffer(**buf_kwargs)
         self._input_buffer.on_text_changed += lambda _: self._update_popup()
 
@@ -862,9 +872,10 @@ class SplitTUI:
         self._invalidate()
 
     def set_topic(self, name: str) -> None:
-        """Update the displayed topic name in the status bar."""
+        """Update the displayed topic name in the status bar and terminal title."""
         self._topic = name
         self._invalidate()
+        print(f"\033]0;nanobot — {name}\007", end="", flush=True)
 
     def reset_history(self) -> None:
         """Clear all output history (used when switching topics)."""

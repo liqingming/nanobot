@@ -453,7 +453,7 @@ class OpenAICompatProvider(LLMProvider):
             usage=self._extract_usage(response),
             reasoning_content=(
                 getattr(msg, "reasoning_content", None)
-                or (msg.model_extra or {}).get("reasoning_content")
+                or (getattr(msg, "model_extra", None) or {}).get("reasoning_content")
                 or None
             ),
         )
