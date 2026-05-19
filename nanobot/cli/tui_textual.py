@@ -75,6 +75,7 @@ if _TEXTUAL_AVAILABLE:
             self._sel_end: int | None = None
             self._selecting: bool = False
             self._sel_moved: bool = False  # True once mouse moves during drag
+            self._user_ranges: list[tuple[int, int]] = []  # gray-bg row ranges
 
         # ── selection helpers ──────────────────────────────────────────────
 
@@ -152,6 +153,30 @@ if _TEXTUAL_AVAILABLE:
 
         # ── rendering ──────────────────────────────────────────────────────
 
+        def add_user_range(self, start: int, end: int) -> None:
+            self._user_ranges.append((start, end))
+            self._line_cache.clear()
+            self.refresh()
+
+        @staticmethod
+        def _force_bgcolor(strip: Strip, bgcolor: str) -> Strip:
+            from rich.segment import Segment as _Seg
+            new_segs = []
+            for t, s, c in strip._segments:
+                new_style = _Style(
+                    color=s.color if s else None,
+                    bgcolor=bgcolor,
+                    bold=s.bold if s else None,
+                    italic=s.italic if s else None,
+                    underline=s.underline if s else None,
+                    dim=s.dim if s else None,
+                    strike=s.strike if s else None,
+                    reverse=s.reverse if s else None,
+                    overline=s.overline if s else None,
+                )
+                new_segs.append(_Seg(t, new_style, c))
+            return Strip(new_segs, strip.cell_length)
+
         @staticmethod
         def _force_colors(strip: Strip, bgcolor: str, color: str) -> Strip:
             """Rebuild a Strip forcing specific bgcolor and color on every segment.
@@ -194,6 +219,8 @@ if _TEXTUAL_AVAILABLE:
                     strip = Strip.blank(width, self.rich_style)
             else:
                 strip = super().render_line(y)
+            if self._user_ranges and any(s <= content_row <= e for s, e in self._user_ranges):
+                strip = self._force_bgcolor(strip, "#2d2d2d")
             rows = self._sel_rows()
             if rows is not None and rows[0] <= content_row <= rows[1]:
                 strip = self._force_colors(strip, bgcolor="white", color="black")
@@ -482,6 +509,16 @@ if _TEXTUAL_AVAILABLE:
         # ── actions ────────────────────────────────────────────────────────
 
         def action_quit_app(self) -> None:
+            try:
+                out = self.query_one("#output", _OutputLog)
+                if out._sel_moved and out._sel_rows() is not None:
+                    text = out._extract_selected_text()
+                    if text.strip():
+                        out._copy_to_clipboard(text)
+                        out.set_timer(1.5, out._clear_selection)
+                        return
+            except Exception:
+                pass
             self.exit()
 
         def action_eof_app(self) -> None:
@@ -556,7 +593,7 @@ if _TEXTUAL_AVAILABLE:
                 icon = _SPINNER[self._thinking_frame % len(_SPINNER)]
                 try:
                     out = self.query_one("#output", _OutputLog)
-                    idx = self._tui._stream_header_line + 1
+                    idx = self._tui._stream_header_line + 2
                     if 0 <= idx < len(out.lines):
                         rt = Text(f"{icon} 思考中...", style="dim")
                         width = max(out.scrollable_content_region.width, out.min_width)
@@ -789,20 +826,32 @@ class TextualTUI(TUIBase):
         """Write a completed response block as Rich objects (no ANSI conversion)."""
         render_as_text = (metadata or {}).get("render_as") == "text"
         self._log_write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
+        self._log_write("")
         if self._render_md and not render_as_text and content.strip():
             self._log_write(Markdown(content))
         else:
             self._log_write(Text(content))
         self._log_write("")
-        self._last_sep = False
+        self._last_sep = True
 
     def _write_user(self, text: str, ts: str) -> None:
-        """Write a user message block as Rich markup strings (no ANSI conversion)."""
-        self._log_write(
-            f"[bold blue]You[/bold blue] [dim]{ts}[/dim]",
-            text,
-        )
-        self._last_sep = False
+        """Write a user message block; records line range for gray background."""
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            start = len(out.lines)
+        except Exception:
+            start = None
+        self._log_write(f"[bold blue]You[/bold blue] [dim]{ts}[/dim]")
+        self._log_write("")
+        self._log_write(text)
+        if start is not None:
+            try:
+                out = self._app.query_one("#output", _OutputLog)
+                out.add_user_range(start, len(out.lines) - 1)
+            except Exception:
+                pass
+        self._log_write("")  # trailing blank (outside gray bg)
+        self._last_sep = True
 
     # ── Popup helpers ──────────────────────────────────────────────────────
 
@@ -873,7 +922,7 @@ class TextualTUI(TUIBase):
 
     def _append_sep(self) -> None:
         if not self._last_sep:
-            self._log_write("[dim]" + "─" * 80 + "[/dim]")
+            self._log_write("")
             self._last_sep = True
 
     # ── TUIBase: lifecycle ─────────────────────────────────────────────────
@@ -932,7 +981,6 @@ class TextualTUI(TUIBase):
                     ts = _fmt_ts(msg.get("timestamp"))
                     self._append_sep()
                     self._write_user(text.strip(), ts)
-                    self._append_sep()
             elif role == "assistant":
                 text = _extract(content)
                 if text.strip():
@@ -943,7 +991,6 @@ class TextualTUI(TUIBase):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._append_sep()
         self._write_user(text, ts)
-        self._append_sep()
 
     def add_response(
         self,
@@ -973,6 +1020,7 @@ class TextualTUI(TUIBase):
             out = self._app.query_one("#output", _OutputLog)
             self._stream_header_line = len(out.lines)
             out.write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{self._stream_ts}[/dim]")
+            out.write("")
             out.write(Text("⠋ 思考中...", style="dim"))
         except Exception:
             self._stream_header_line = 0
@@ -996,7 +1044,7 @@ class TextualTUI(TUIBase):
             # scrolled up, skip the truncate so we don't clobber their viewport;
             # flush_stream will write the final content when streaming completes.
             if out.scroll_offset.y >= out.max_scroll_y:
-                out.truncate_to(self._stream_header_line + 1)
+                out.truncate_to(self._stream_header_line + 2)
                 out.write(Text(self._stream_buf))
         except Exception:
             pass
@@ -1010,13 +1058,13 @@ class TextualTUI(TUIBase):
             if self._stream_buf.strip():
                 render_as_text = (metadata or {}).get("render_as") == "text"
                 # Replace plain-text streaming content with final rendered version
-                out.truncate_to(self._stream_header_line + 1)
+                out.truncate_to(self._stream_header_line + 2)
                 if self._render_md and not render_as_text:
                     out.write(Markdown(self._stream_buf))
                 else:
                     out.write(Text(self._stream_buf))
                 out.write("")
-                self._last_sep = False
+                self._last_sep = True
             else:
                 # Nothing streamed — remove the header line too
                 out.truncate_to(self._stream_header_line)
