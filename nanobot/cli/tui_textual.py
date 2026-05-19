@@ -923,7 +923,13 @@ class TextualTUI(TUIBase):
     def set_topic(self, name: str) -> None:
         self._topic = name
         self._app.update_topic_bar(name)
-        self._app.title = f"nanobot — {name}"  # Textual writes OSC title sequence
+        # app.title only updates Textual's Header widget, not the terminal tab.
+        # Send OSC 0 directly via the driver to update the terminal/tab title.
+        try:
+            title = f"nanobot — {name}" if name else "nanobot"
+            self._app._driver.write(f"\033]0;{title}\007")
+        except Exception:
+            pass
 
     def set_is_processing(self, value: bool) -> None:
         self._is_processing = value
