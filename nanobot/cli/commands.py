@@ -902,7 +902,7 @@ def agent(
     else:
         # Interactive mode — split-pane TUI (output pane + persistent input line)
         from nanobot.bus.events import InboundMessage
-        from nanobot.cli.tui import SplitTUI
+        from nanobot.cli.tui_factory import create_tui
         from nanobot.config.paths import get_cli_history_path
 
         if ":" in session_id:
@@ -913,7 +913,12 @@ def agent(
         history_file = str(get_cli_history_path())
 
         async def run_interactive():
-            tui = SplitTUI(render_markdown=markdown, history_file=history_file, model=config.agents.defaults.model)
+            tui = create_tui(
+                render_markdown=markdown,
+                history_file=history_file,
+                model=config.agents.defaults.model,
+                backend=config.agents.defaults.tui_backend,
+            )
 
             # Mutable topic state — fresh session by default; user picks via startup popup
             fresh_chat_id = datetime.now().strftime("topic_%Y%m%d_%H%M%S")

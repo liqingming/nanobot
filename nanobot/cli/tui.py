@@ -59,6 +59,7 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from nanobot import __logo__, __version__
+from nanobot.cli.tui_base import TUIBase
 
 
 def _ansi_width() -> int:
@@ -276,14 +277,11 @@ class _PopupMenuControl(UIControl):
 # Main TUI class
 # ---------------------------------------------------------------------------
 
-class SplitTUI:
+class PromptTUI(TUIBase):
     """Full-screen split TUI: scrollable output pane + always-visible input line.
 
-    Usage::
-
-        tui = SplitTUI(render_markdown=True, history_file="~/.nanobot/history")
-        tui.set_on_submit(async_callback)
-        await tui.run_async()
+    Implements ``TUIBase`` using prompt_toolkit.  Instantiate via
+    ``tui_factory.create_tui()`` rather than directly.
     """
 
     def __init__(
@@ -1011,3 +1009,7 @@ class SplitTUI:
     def exit(self) -> None:
         if self._app is not None:
             self._app.exit()
+
+
+# Backward-compatibility alias — existing imports of SplitTUI keep working.
+SplitTUI = PromptTUI

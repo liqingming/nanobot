@@ -43,6 +43,7 @@ class AgentDefaults(Base):
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     enable_learning: bool = True  # self-learning: TurnSummary injection, memory consolidation, search_history tool
+    tui_backend: str = "textual"  # TUI backend for interactive mode: "textual" | "prompt_toolkit"
 
 
 class AgentsConfig(Base):
