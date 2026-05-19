@@ -604,7 +604,9 @@ if _TEXTUAL_AVAILABLE:
                     out = self.query_one("#output", _OutputLog)
                     idx = self._tui._stream_header_line + 2
                     if 0 <= idx < len(out.lines):
-                        rt = Text(f"{icon} 思考中...", style="dim")
+                        hint = self._tui._tool_hint
+                        label = hint if hint else "思考中..."
+                        rt = Text(f"{icon} {label}", style="dim")
                         width = max(out.scrollable_content_region.width, out.min_width)
                         console = out.app.console
                         segs = list(console.render(rt, console.options.update_width(width)))
@@ -1040,7 +1042,16 @@ class TextualTUI(TUIBase):
         if not self._stream_ts:
             self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._tool_hint = ""
-        self._app.start_spinner(tool=True)
+        # Write a placeholder at _stream_header_line + 2 so tool execution is
+        # visible in the message area; thinking spinner will animate this line,
+        # and stream_delta will overwrite it when the LLM resumes streaming.
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            out.truncate_to(self._stream_header_line + 2)
+            out.write(Text("⠋ 执行中...", style="dim"))
+        except Exception:
+            pass
+        self._app.start_thinking_spinner()
 
     def stream_delta(self, delta: str) -> None:
         self._app.stop_thinking_spinner()
@@ -1049,10 +1060,12 @@ class TextualTUI(TUIBase):
         self._stream_buf += delta
         try:
             out = self._app.query_one("#output", _OutputLog)
+            sc_y = out.scroll_offset.y
+            mx_y = out.max_scroll_y
             # Only update in-place when the user is at the bottom.  If they have
             # scrolled up, skip the truncate so we don't clobber their viewport;
             # flush_stream will write the final content when streaming completes.
-            if out.scroll_offset.y >= out.max_scroll_y:
+            if sc_y >= mx_y:
                 out.truncate_to(self._stream_header_line + 2)
                 out.write(Text(self._stream_buf))
         except Exception:
@@ -1075,8 +1088,10 @@ class TextualTUI(TUIBase):
                 out.write("")
                 self._last_sep = True
             else:
-                # Nothing streamed — remove the header line too
-                out.truncate_to(self._stream_header_line)
+                # Nothing streamed yet — only remove the thinking placeholder,
+                # keep header+blank so _stream_header_line stays valid for
+                # subsequent stream_delta calls when LLM streams after a tool call.
+                out.truncate_to(self._stream_header_line + 2)
         except Exception:
             if self._stream_buf.strip():
                 ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
