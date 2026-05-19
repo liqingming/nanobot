@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.cli.commands import _make_provider, app
+from nanobot.config.paths import get_workspace_cache_dir
 from nanobot.config.schema import Config
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
@@ -398,7 +399,7 @@ def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_
     assert result.exit_code == 0
     assert mock_agent_runtime["load_config"].call_args.args == (None,)
     assert mock_agent_runtime["sync_templates"].call_args.args == (
-        mock_agent_runtime["config"].workspace_path,
+        get_workspace_cache_dir(mock_agent_runtime["config"].workspace_path),
     )
     assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["workspace"] == (
         mock_agent_runtime["config"].workspace_path
@@ -492,7 +493,7 @@ def test_agent_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Pa
     result = runner.invoke(app, ["agent", "-m", "hello", "-c", str(config_file)])
 
     assert result.exit_code == 0
-    assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_workspace_cache_dir(config.workspace_path) / "cron" / "jobs.json"
 
 
 def test_agent_workspace_override_does_not_migrate_legacy_cron(
@@ -542,7 +543,7 @@ def test_agent_workspace_override_does_not_migrate_legacy_cron(
     )
 
     assert result.exit_code == 0
-    assert seen["cron_store"] == override / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_workspace_cache_dir(override) / "cron" / "jobs.json"
     assert legacy_file.exists()
     assert not (override / "cron" / "jobs.json").exists()
 
@@ -592,7 +593,7 @@ def test_agent_custom_config_workspace_does_not_migrate_legacy_cron(
     result = runner.invoke(app, ["agent", "-m", "hello", "-c", str(config_file)])
 
     assert result.exit_code == 0
-    assert seen["cron_store"] == custom_workspace / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_workspace_cache_dir(config.workspace_path) / "cron" / "jobs.json"
     assert legacy_file.exists()
     assert not (custom_workspace / "cron" / "jobs.json").exists()
 
@@ -604,7 +605,7 @@ def test_agent_overrides_workspace_path(mock_agent_runtime):
 
     assert result.exit_code == 0
     assert mock_agent_runtime["config"].agents.defaults.workspace == str(workspace_path)
-    assert mock_agent_runtime["sync_templates"].call_args.args == (workspace_path,)
+    assert mock_agent_runtime["sync_templates"].call_args.args == (get_workspace_cache_dir(workspace_path),)
     assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["workspace"] == workspace_path
 
 
@@ -621,7 +622,7 @@ def test_agent_workspace_override_wins_over_config_workspace(mock_agent_runtime,
     assert result.exit_code == 0
     assert mock_agent_runtime["load_config"].call_args.args == (config_path.resolve(),)
     assert mock_agent_runtime["config"].agents.defaults.workspace == str(workspace_path)
-    assert mock_agent_runtime["sync_templates"].call_args.args == (workspace_path,)
+    assert mock_agent_runtime["sync_templates"].call_args.args == (get_workspace_cache_dir(workspace_path),)
     assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["workspace"] == workspace_path
 
 

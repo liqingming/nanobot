@@ -559,6 +559,7 @@ def serve(
         mcp_servers=runtime_config.tools.mcp_servers,
         channels_config=runtime_config.channels,
         timezone=runtime_config.agents.defaults.timezone,
+        enable_learning=runtime_config.agents.defaults.enable_learning,
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -647,6 +648,7 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
+        enable_learning=config.agents.defaults.enable_learning,
     )
 
     # Set cron callback (needs agent)
@@ -863,6 +865,7 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
+        enable_learning=config.agents.defaults.enable_learning,
     )
 
     # Shared reference for progress callbacks
@@ -1166,6 +1169,7 @@ def agent(
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
                 await agent_loop.close_mcp()
+                print("\033]0;nanobot\007", end="", flush=True)
 
         asyncio.run(run_interactive())
 

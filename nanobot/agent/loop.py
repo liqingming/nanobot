@@ -15,12 +15,20 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
+from nanobot.agent.learning import (
+    PATTERN_THRESHOLD,
+    PatternStore,
+    TurnSummary,
+    _compress_tool_sequence,
+    detect_user_delta,
+)
 from nanobot.agent.memory import MemoryConsolidator
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunResult, AgentRunSpec, AgentRunner
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.memory_search import SearchHistoryTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -175,6 +183,7 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
         hooks: list[AgentHook] | None = None,
+        enable_learning: bool = True,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -190,6 +199,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.enable_learning = enable_learning
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
@@ -223,6 +233,14 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        # Learning context: turn-level metadata injected before the next user message.
+        self._last_turn_summary: dict[str, TurnSummary] = {}
+        self._prev_consolidated: dict[str, int] = {}
+        self._last_user_input: dict[str, str] = {}
+        # Cross-session pattern store (persisted to data_dir/memory/patterns.json).
+        self._pattern_store: PatternStore | None = (
+            PatternStore(_data) if self.enable_learning else None
+        )
         self.memory_consolidator = MemoryConsolidator(
             workspace=_data,
             provider=provider,
@@ -244,6 +262,8 @@ class AgentLoop:
         self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+        if self.enable_learning:
+            self.tools.register(SearchHistoryTool(data_dir=self.context.data_dir))
         if self.exec_config.enable:
             self.tools.register(ExecTool(
                 working_dir=str(self.workspace),
@@ -322,6 +342,84 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    # ── learning context helpers ────────────────────────────────────────
+
+    def _build_learning_ctx(self, session_key: str) -> str | None:
+        """Build TurnSummary block for injection before the next user message."""
+        if not self.enable_learning:
+            return None
+        ts = self._last_turn_summary.get(session_key)
+        if ts is None or not ts.is_significant:
+            return None
+        return ts.format_for_injection()
+
+    def _capture_turn_summary(
+        self, session_key: str, tools_used: list[str], session: Session,
+        current_message: str, result: AgentRunResult,
+    ) -> None:
+        """Build and store a TurnSummary from the just-completed turn."""
+
+        # Count tool errors.
+        error_count = sum(
+            1 for ev in (result.tool_events or [])
+            if ev.get("status") == "error"
+        )
+
+        # Compute pressure.
+        prompt_tokens = result.usage.get("prompt_tokens", 0)
+        cw = self.context_window_tokens
+        if cw > 0 and prompt_tokens > 0:
+            pct = prompt_tokens * 100 // cw
+            detail = f"{prompt_tokens // 1000}K/{cw // 1000}K"
+        else:
+            pct = 0
+            detail = ""
+
+        # Detect consolidation since last turn.
+        prev = self._prev_consolidated.get(session_key, 0)
+        curr = session.last_consolidated
+        self._prev_consolidated[session_key] = curr
+        consolidation_note = None
+        if curr > prev:
+            consolidation_note = f"merged {curr - prev} msgs into memory"
+
+        # Count tools (deduplicated list + total calls).
+        tools_list = list(dict.fromkeys(tools_used))  # preserve order, dedupe
+        tools_count = len(tools_used)
+
+        # Detect repeated tool pattern (order-preserving, cross-session).
+        repeated_pattern: tuple[str, ...] | None = None
+        repeated_count = 0
+        if tools_used and self._pattern_store is not None:
+            pattern_key = _compress_tool_sequence(tools_used)
+            count = self._pattern_store.increment(pattern_key)
+            if count >= PATTERN_THRESHOLD:
+                repeated_pattern = pattern_key
+                repeated_count = count
+
+        # Detect user_delta.
+        prev_input = self._last_user_input.get(session_key)
+        self._last_user_input[session_key] = current_message
+        user_delta = detect_user_delta(prev_input, current_message)
+
+        # Turn index from session messages count.
+        session_msgs = session.messages
+        turn_index = sum(1 for m in session_msgs if m.get("role") == "user")
+
+        self._last_turn_summary[session_key] = TurnSummary(
+            turn_index=turn_index,
+            pressure_pct=pct,
+            pressure_detail=detail,
+            tools_count=tools_count,
+            tools_list=tools_list,
+            error_count=error_count,
+            stop_reason=result.stop_reason,
+            consolidation_note=consolidation_note,
+            user_delta=user_delta,
+            repeated_pattern=repeated_pattern,
+            repeated_count=repeated_count,
+        )
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -332,7 +430,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
+    ) -> tuple[str | None, list[str], list[dict], AgentRunResult]:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
@@ -369,7 +467,7 @@ class AgentLoop:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages
+        return result.final_content, result.tools_used, result.messages, result
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -464,9 +562,11 @@ class AgentLoop:
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
         if self._background_tasks:
+            print(f"正在完成 {len(self._background_tasks)} 个后台任务（记忆整理等），请稍候…")
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
         if self._mcp_stack:
+            print("正在断开 MCP 连接…")
             try:
                 await self._mcp_stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
@@ -500,7 +600,8 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            if self.enable_learning:
+                await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
@@ -509,13 +610,14 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
+            final_content, _, all_msgs, _ = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
-            self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+            if self.enable_learning:
+                self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -531,7 +633,8 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        if self.enable_learning:
+            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -539,11 +642,13 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
+        learning_ctx = self._build_learning_ctx(key)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            learning_ctx=learning_ctx,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -554,7 +659,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, tools_used, all_msgs, run_result = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -562,12 +667,14 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
         )
+        if self.enable_learning:
+            self._capture_turn_summary(key, tools_used, session, msg.content, run_result)
 
         if final_content is None and self._empty_after_tools(all_msgs):
             logger.info("LLM returned empty after tool results for {}:{}, retrying with nudge", msg.channel, msg.chat_id)
             first_all_msgs = all_msgs
             nudge = {"role": "user", "content": "请将你对上述内容的分析和总结写在回复正文里。"}
-            final_content, _, retry_all_msgs = await self._run_agent_loop(
+            final_content, _, retry_all_msgs, _ = await self._run_agent_loop(
                 first_all_msgs + [nudge],
                 on_progress=on_progress or _bus_progress,
                 on_stream=on_stream,
@@ -586,7 +693,8 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
-        self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+        if self.enable_learning:
+            self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -628,7 +736,7 @@ class AgentLoop:
                 drop_runtime
                 and block.get("type") == "text"
                 and isinstance(block.get("text"), str)
-                and block["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                and ContextBuilder._RUNTIME_CONTEXT_TAG in block["text"]
             ):
                 continue
 
@@ -667,9 +775,11 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             elif role == "user":
-                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                    # Strip the runtime-context prefix, keep only the user text.
-                    parts = content.split("\n\n", 1)
+                if isinstance(content, str) and ContextBuilder._RUNTIME_CONTEXT_TAG in content:
+                    # Strip all metadata prefixes (TurnSummary + RuntimeContext).
+                    # RuntimeContext tag is always present; split there, then skip its lines.
+                    after_tag = content.split(ContextBuilder._RUNTIME_CONTEXT_TAG, 1)[1]
+                    parts = after_tag.split("\n\n", 1)
                     if len(parts) > 1 and parts[1].strip():
                         entry["content"] = parts[1]
                     else:
