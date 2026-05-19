@@ -57,6 +57,7 @@ if _TEXTUAL_AVAILABLE:
     import sys as _sys
     from rich.style import Style as _Style
     from textual.events import MouseDown, MouseMove, MouseUp, MouseScrollUp, MouseScrollDown
+    from textual.geometry import Size
     from textual.strip import Strip
 
     class _OutputLog(RichLog):
@@ -175,13 +176,27 @@ if _TEXTUAL_AVAILABLE:
             return Strip(new_segs, strip.cell_length)
 
         def render_line(self, y: int) -> Strip:
-            strip = super().render_line(y)
+            scroll_x, scroll_y = self.scroll_offset
+            n = len(self.lines)
+            width = self.scrollable_content_region.width
+            # Clamp scroll_y when truncate_to() reduced virtual_size but scroll
+            # position hasn't been updated yet — prevents blank lines during repaint.
+            if n > 0:
+                max_scroll = max(0, n - self.scrollable_content_region.height)
+                if scroll_y > max_scroll:
+                    scroll_y = max_scroll
+            content_row = scroll_y + y
+            if scroll_y != self.scroll_offset.y:
+                if content_row < n:
+                    strip = self._render_line(content_row, scroll_x, width)
+                    strip = strip.apply_style(self.rich_style)
+                else:
+                    strip = Strip.blank(width, self.rich_style)
+            else:
+                strip = super().render_line(y)
             rows = self._sel_rows()
-            if rows is not None:
-                _, scroll_y = self.scroll_offset
-                content_row = scroll_y + y
-                if rows[0] <= content_row <= rows[1]:
-                    strip = self._force_colors(strip, bgcolor="white", color="black")
+            if rows is not None and rows[0] <= content_row <= rows[1]:
+                strip = self._force_colors(strip, bgcolor="white", color="black")
             return strip
 
         # ── mouse events ───────────────────────────────────────────────────
@@ -242,6 +257,21 @@ if _TEXTUAL_AVAILABLE:
                     pass
                 self._clear_selection()
             event.stop()
+
+        def truncate_to(self, n: int) -> None:
+            """Remove all lines after index n, used to overwrite streaming content."""
+            if n >= len(self.lines):
+                return
+            self.lines = self.lines[:n]
+            self._widest_line_width = (
+                max(line.cell_length for line in self.lines) if self.lines else 0
+            )
+            self._line_cache.clear()
+            self.virtual_size = Size(self._widest_line_width, len(self.lines))
+            # Note: scroll_offset.y may briefly exceed new virtual height here.
+            # render_line() clamps it so no blank lines appear during the repaint
+            # triggered by virtual_size change (a reactive that fires immediately).
+            self.refresh()
 
         def on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
             event.stop()
@@ -397,6 +427,8 @@ if _TEXTUAL_AVAILABLE:
             self._tui = tui
             self._spinner_timer: Any = None
             self._spinner_frame = 0
+            self._thinking_timer: Any = None
+            self._thinking_frame = 0
 
         def compose(self) -> ComposeResult:
             yield _OutputLog(id="output", markup=True, highlight=False, wrap=True)
@@ -512,6 +544,45 @@ if _TEXTUAL_AVAILABLE:
         def stop_spinner(self) -> None:
             self._stop_spinner()
 
+        # ── thinking spinner (animates inside #output) ─────────────────────
+
+        def start_thinking_spinner(self) -> None:
+            self._stop_thinking_spinner()
+            self._thinking_frame = 0
+
+            def _tick() -> None:
+                from rich.segment import Segment as _Seg
+                self._thinking_frame += 1
+                icon = _SPINNER[self._thinking_frame % len(_SPINNER)]
+                try:
+                    out = self.query_one("#output", _OutputLog)
+                    idx = self._tui._stream_header_line + 1
+                    if 0 <= idx < len(out.lines):
+                        rt = Text(f"{icon} 思考中...", style="dim")
+                        width = max(out.scrollable_content_region.width, out.min_width)
+                        console = out.app.console
+                        segs = list(console.render(rt, console.options.update_width(width)))
+                        line_segs = list(_Seg.split_lines(segs))
+                        if line_segs:
+                            new_strip = Strip.from_lines(line_segs)[0].adjust_cell_length(width)
+                        else:
+                            new_strip = Strip.blank(width)
+                        out.lines[idx] = new_strip
+                        out._line_cache.clear()
+                        out.refresh()
+                except Exception:
+                    pass
+
+            self._thinking_timer = self.set_interval(0.1, _tick)
+
+        def _stop_thinking_spinner(self) -> None:
+            if self._thinking_timer is not None:
+                self._thinking_timer.stop()
+                self._thinking_timer = None
+
+        def stop_thinking_spinner(self) -> None:
+            self._stop_thinking_spinner()
+
         # ── live area helpers ──────────────────────────────────────────────
 
         def update_live(self, text: str) -> None:
@@ -623,6 +694,7 @@ class TextualTUI(TUIBase):
         # Streaming state
         self._stream_buf: str = ""
         self._stream_ts: str = ""
+        self._stream_header_line: int = 0  # output-log line index where stream header was written
         self._tool_hint: str = ""
         self._last_sep: bool = False
 
@@ -895,7 +967,16 @@ class TextualTUI(TUIBase):
     def stream_start(self) -> None:
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
-        self._app.start_spinner(tool=False)
+        # Write header + thinking placeholder directly into #output so the
+        # animation is inside the message area, not in the separate #live strip.
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            self._stream_header_line = len(out.lines)
+            out.write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{self._stream_ts}[/dim]")
+            out.write(Text("⠋ 思考中...", style="dim"))
+        except Exception:
+            self._stream_header_line = 0
+        self._app.start_thinking_spinner()
 
     def tool_phase_start(self) -> None:
         self._stream_buf = ""
@@ -905,22 +986,49 @@ class TextualTUI(TUIBase):
         self._app.start_spinner(tool=True)
 
     def stream_delta(self, delta: str) -> None:
+        self._app.stop_thinking_spinner()
         self._app.stop_spinner()
+        self._app.clear_live()
         self._stream_buf += delta
-        ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Use plain text during streaming; Markdown is rendered on flush_stream
-        live = f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]\n{self._stream_buf}"
-        self._app.update_live(live)
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            # Only update in-place when the user is at the bottom.  If they have
+            # scrolled up, skip the truncate so we don't clobber their viewport;
+            # flush_stream will write the final content when streaming completes.
+            if out.scroll_offset.y >= out.max_scroll_y:
+                out.truncate_to(self._stream_header_line + 1)
+                out.write(Text(self._stream_buf))
+        except Exception:
+            pass
 
     def flush_stream(self, metadata: dict | None = None) -> None:
+        self._app.stop_thinking_spinner()
         self._app.stop_spinner()
-        if self._stream_buf.strip():
-            ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.add_response(self._stream_buf, metadata, ts=ts)
-        self._stream_buf = ""
         self._app.clear_live()
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            if self._stream_buf.strip():
+                render_as_text = (metadata or {}).get("render_as") == "text"
+                # Replace plain-text streaming content with final rendered version
+                out.truncate_to(self._stream_header_line + 1)
+                if self._render_md and not render_as_text:
+                    out.write(Markdown(self._stream_buf))
+                else:
+                    out.write(Text(self._stream_buf))
+                out.write("")
+                self._last_sep = False
+            else:
+                # Nothing streamed — remove the header line too
+                out.truncate_to(self._stream_header_line)
+        except Exception:
+            if self._stream_buf.strip():
+                ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.add_response(self._stream_buf, metadata, ts=ts)
+        self._stream_buf = ""
+        self._stream_ts = ""
 
     def pop_stream(self) -> str:
+        self._app.stop_thinking_spinner()
         self._app.stop_spinner()
         buf = self._stream_buf
         self._stream_buf = ""

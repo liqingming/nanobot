@@ -1003,8 +1003,8 @@ def agent(
 
             def _pre_submit(text: str) -> None:
                 if not is_processing:
-                    tui.stream_start()
                     tui.add_user_echo(text)
+                    tui.stream_start()
                     _pre_submitted[0] = True
 
             async def _send_message(text: str) -> None:
@@ -1015,8 +1015,8 @@ def agent(
                 if _pre_submitted[0]:
                     _pre_submitted[0] = False
                 else:
-                    tui.stream_start()
                     tui.add_user_echo(text)
+                    tui.stream_start()
                 # Exceed prompt_toolkit's max_render_postpone_time (0.01s) so the
                 # thinking animation is guaranteed to reach the screen before the
                 # bus receives the message and the LLM starts responding.
