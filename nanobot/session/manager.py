@@ -20,9 +20,11 @@ class Session:
 
     Stores messages in JSONL format for easy reading and persistence.
 
-    Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to MEMORY.md/HISTORY.md
-    but does NOT modify the messages list or get_history() output.
+    Messages are normally append-only for LLM cache efficiency.
+    After a consolidation round completes, archived messages are physically
+    removed from the list and last_consolidated is reset to 0 so the session
+    file stays compact.  get_history() always returns only unconsolidated
+    messages, so the effective prompt window is unaffected.
     """
 
     key: str  # channel:chat_id

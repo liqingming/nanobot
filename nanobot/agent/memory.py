@@ -259,6 +259,10 @@ class MemoryConsolidator:
 
     _SAFETY_BUFFER = 1024  # extra headroom for tokenizer estimation drift
 
+    # Keep at most this many bytes of consolidated messages in the session file
+    # so old history remains browsable without the file growing without bound.
+    _MAX_HISTORY_BYTES = 1_000_000
+
     def __init__(
         self,
         workspace: Path,
@@ -392,8 +396,43 @@ class MemoryConsolidator:
                 if not await self.consolidate_messages(chunk):
                     return
                 session.last_consolidated = end_idx
+                self._compact_history(session)
                 self.sessions.save(session)
 
                 estimated, source = self.estimate_session_prompt_tokens(session)
                 if estimated <= 0:
                     return
+
+    def _compact_history(self, session: Session) -> None:
+        """Drop oldest *consolidated* messages so the session file stays under
+        _MAX_HISTORY_BYTES.  Unconsolidated messages are never touched because
+        they are still needed for the LLM prompt window."""
+        import json as _json
+
+        if session.last_consolidated == 0:
+            return
+
+        sizes = [
+            len(_json.dumps(m, ensure_ascii=False).encode())
+            for m in session.messages
+        ]
+        total = sum(sizes)
+        if total <= self._MAX_HISTORY_BYTES:
+            return
+
+        drop = 0
+        for i in range(session.last_consolidated):
+            if total <= self._MAX_HISTORY_BYTES:
+                break
+            total -= sizes[i]
+            drop = i + 1
+
+        if drop:
+            session.messages = session.messages[drop:]
+            session.last_consolidated -= drop
+            logger.debug(
+                "Compacted session {}: dropped {} old messages, {} remain",
+                session.key,
+                drop,
+                len(session.messages),
+            )
