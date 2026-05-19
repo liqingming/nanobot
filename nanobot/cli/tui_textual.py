@@ -52,14 +52,198 @@ _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
 
 
 if _TEXTUAL_AVAILABLE:
-    from textual.events import MouseScrollUp, MouseScrollDown
+    import subprocess
+    import sys as _sys
+    from rich.style import Style as _Style
+    from textual.events import MouseDown, MouseMove, MouseUp, MouseScrollUp, MouseScrollDown
+    from textual.strip import Strip
 
     class _OutputLog(RichLog):
-        """RichLog that never takes keyboard focus and owns its scroll events exclusively."""
+        """RichLog with line-range text selection and clipboard copy.
+
+        Mouse drag selects rows; releasing the mouse copies the selection to
+        the system clipboard via Windows ``clip`` (primary) or Textual's OSC-52
+        API (fallback).  Selected rows are highlighted with a dark-blue tint.
+        """
         can_focus = False
 
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._sel_start: int | None = None  # content-space row index
+            self._sel_end: int | None = None
+            self._selecting: bool = False
+            self._sel_moved: bool = False  # True once mouse moves during drag
+
+        # ── selection helpers ──────────────────────────────────────────────
+
+        def _sel_rows(self) -> tuple[int, int] | None:
+            if self._sel_start is None or self._sel_end is None:
+                return None
+            return min(self._sel_start, self._sel_end), max(self._sel_start, self._sel_end)
+
+        def _clear_selection(self) -> None:
+            self._sel_start = None
+            self._sel_end = None
+            self.refresh()
+
+        def _extract_selected_text(self) -> str:
+            rows = self._sel_rows()
+            if rows is None:
+                return ""
+            start, end = rows
+            parts: list[str] = []
+            for row in range(start, end + 1):
+                if row < len(self.lines):
+                    parts.append(self.lines[row].text.rstrip())
+            return "\n".join(parts)
+
+        def _copy_to_clipboard(self, text: str) -> None:
+            copied = False
+            if _sys.platform == "win32":
+                try:
+                    import ctypes
+                    CF_UNICODETEXT = 13
+                    GMEM_MOVEABLE = 0x0002
+                    k32 = ctypes.windll.kernel32
+                    u32 = ctypes.windll.user32
+                    # Must declare restype=c_void_p — default c_long truncates
+                    # 64-bit handles on 64-bit Python, causing memmove to crash.
+                    k32.GlobalAlloc.restype = ctypes.c_void_p
+                    k32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+                    k32.GlobalLock.restype = ctypes.c_void_p
+                    k32.GlobalLock.argtypes = [ctypes.c_void_p]
+                    k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+                    u32.OpenClipboard.restype = ctypes.c_bool
+                    u32.OpenClipboard.argtypes = [ctypes.c_void_p]
+                    u32.SetClipboardData.restype = ctypes.c_void_p
+                    u32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+                    encoded = text.encode("utf-16-le") + b"\x00\x00"
+                    handle = k32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+                    if not handle:
+                        raise OSError("GlobalAlloc failed")
+                    ptr = k32.GlobalLock(handle)
+                    if not ptr:
+                        raise OSError("GlobalLock failed")
+                    ctypes.memmove(ptr, encoded, len(encoded))
+                    k32.GlobalUnlock(handle)
+                    if not u32.OpenClipboard(None):
+                        raise OSError("OpenClipboard failed")
+                    try:
+                        u32.EmptyClipboard()
+                        u32.SetClipboardData(CF_UNICODETEXT, handle)
+                    finally:
+                        u32.CloseClipboard()
+                    copied = True
+                except Exception:
+                    pass
+            if not copied:
+                try:
+                    self.app.copy_to_clipboard(text)
+                    copied = True
+                except Exception:
+                    pass
+            try:
+                if copied:
+                    self.app.notify("已复制到剪贴板", timeout=1.5)
+            except Exception:
+                pass
+
+        # ── rendering ──────────────────────────────────────────────────────
+
+        @staticmethod
+        def _force_colors(strip: Strip, bgcolor: str, color: str) -> Strip:
+            """Rebuild a Strip forcing specific bgcolor and color on every segment.
+
+            ``apply_style`` won't work here because existing segment bgcolors
+            (e.g. #000000 from rich_style) take priority in Rich's style merge.
+            """
+            from rich.segment import Segment as _Seg
+            target = _Style(bgcolor=bgcolor, color=color)
+            new_segs = []
+            for text, style, ctrl in strip._segments:
+                new_style = _Style(
+                    color=target.color,
+                    bgcolor=target.bgcolor,
+                    bold=style.bold if style else None,
+                    italic=style.italic if style else None,
+                    underline=style.underline if style else None,
+                    dim=style.dim if style else None,
+                    strike=style.strike if style else None,
+                )
+                new_segs.append(_Seg(text, new_style, ctrl))
+            return Strip(new_segs, strip.cell_length)
+
+        def render_line(self, y: int) -> Strip:
+            strip = super().render_line(y)
+            rows = self._sel_rows()
+            if rows is not None:
+                _, scroll_y = self.scroll_offset
+                content_row = scroll_y + y
+                if rows[0] <= content_row <= rows[1]:
+                    strip = self._force_colors(strip, bgcolor="white", color="black")
+            return strip
+
+        # ── mouse events ───────────────────────────────────────────────────
+
+        def on_mouse_down(self, event: MouseDown) -> None:
+            if event.button != 1:  # left button only
+                return
+            try:
+                n = len(self.lines)
+                if n == 0:
+                    return
+                _, scroll_y = self.scroll_offset
+                row = max(0, min(scroll_y + event.y, n - 1))
+                self._sel_start = row
+                self._sel_end = row
+                self._selecting = True
+                self._sel_moved = False
+                self.capture_mouse()
+            except Exception:
+                pass
+            event.stop()
+
+        def on_mouse_move(self, event: MouseMove) -> None:
+            if not self._selecting:
+                return
+            try:
+                _, scroll_y = self.scroll_offset
+                row = max(0, min(scroll_y + event.y, len(self.lines) - 1))
+                self._sel_moved = True
+                if row != self._sel_end:
+                    self._sel_end = row
+                    self.refresh()
+            except Exception:
+                pass
+            event.stop()
+
+        def on_mouse_up(self, event: MouseUp) -> None:
+            if not self._selecting:
+                return
+            try:
+                _, scroll_y = self.scroll_offset
+                row = max(0, min(scroll_y + event.y, len(self.lines) - 1))
+                self._sel_end = row
+                self._selecting = False
+                self.release_mouse()
+                # Only copy when the user dragged (not a bare click)
+                text = self._extract_selected_text() if self._sel_moved else ""
+                if text.strip():
+                    self._copy_to_clipboard(text)
+                    self.set_timer(1.5, self._clear_selection)
+                else:
+                    self._clear_selection()
+            except Exception:
+                self._selecting = False
+                try:
+                    self.release_mouse()
+                except Exception:
+                    pass
+                self._clear_selection()
+            event.stop()
+
         def on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
-            event.stop()  # prevent App-level handler from double-firing
+            event.stop()
             self.scroll_relative(y=-3)
 
         def on_mouse_scroll_down(self, event: MouseScrollDown) -> None:
@@ -134,7 +318,7 @@ if _TEXTUAL_AVAILABLE:
     # -----------------------------------------------------------------------
 
     class _NanobotApp(App):  # type: ignore[misc]
-        ENABLE_MOUSE_SUPPORT = False  # let terminal handle native selection/scroll
+        ENABLE_MOUSE_SUPPORT = True  # needed for on_mouse_down/move/up selection events
 
         CSS = """
         Screen {
@@ -229,7 +413,7 @@ if _TEXTUAL_AVAILABLE:
             out.write("  [cyan]↑ / ↓[/cyan]              切换输入历史")
             out.write("  [cyan]ESC[/cyan]                取消当前请求")
             out.write("  [cyan]Ctrl+C / Ctrl+D[/cyan]    退出")
-            out.write("  [cyan]拖动选中 + 滚轮[/cyan]    复制多屏内容")
+            out.write("  [cyan]鼠标拖选[/cyan]            选中行后自动复制到剪贴板")
             out.write("")
 
         # ── input callbacks ────────────────────────────────────────────────
