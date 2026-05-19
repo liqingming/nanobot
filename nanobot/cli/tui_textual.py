@@ -36,6 +36,7 @@ from nanobot.cli.tui_base import TUIBase
 try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
+    from textual.containers import Horizontal
     from textual.events import Key
     from textual.widgets import Input, RichLog, Static
     _TEXTUAL_AVAILABLE = True
@@ -331,10 +332,17 @@ if _TEXTUAL_AVAILABLE:
             border: none;
             background: #000000;
         }
-        #topic-bar {
+        #sep-row {
             height: 1;
-            background: $panel;
-            text-align: right;
+            background: #000000;
+        }
+        #sep {
+            width: 1fr;
+            background: #000000;
+        }
+        #topic-bar {
+            width: auto;
+            background: #000000;
             padding: 0 1;
             display: none;
         }
@@ -345,31 +353,32 @@ if _TEXTUAL_AVAILABLE:
             height: auto;
             min-height: 1;
             padding: 0 1;
+            background: #000000;
             color: $text-muted;
         }
         #popup {
             height: auto;
             max-height: 10;
             display: none;
-            background: $panel;
+            background: #000000;
             border: round $primary;
             padding: 0 1;
         }
         #popup.visible {
             display: block;
         }
-        #sep {
-            height: 1;
-            color: $text-muted;
-        }
         #input {
             height: auto;
             border: none;
             padding: 0 1;
+            background: #000000;
+        }
+        Input {
+            background: #000000;
         }
         #status {
             height: 1;
-            background: $panel-darken-1;
+            background: #000000;
             color: $text-muted;
             padding: 0 1;
         }
@@ -391,10 +400,11 @@ if _TEXTUAL_AVAILABLE:
 
         def compose(self) -> ComposeResult:
             yield _OutputLog(id="output", markup=True, highlight=False, wrap=True)
-            yield Static("", id="topic-bar")
             yield Static("", id="live")
             yield Static("", id="popup")
-            yield Static("─" * 80, id="sep")
+            with Horizontal(id="sep-row"):
+                yield Static("[dim cyan]" + "─" * 80 + "[/dim cyan]", id="sep", markup=True)
+                yield Static("", id="topic-bar")
             yield _HistoryInput(self._tui, placeholder="You: ", id="input")
             yield Static("", id="status")
 
