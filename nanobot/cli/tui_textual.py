@@ -182,7 +182,7 @@ if _TEXTUAL_AVAILABLE:
             """Rebuild a Strip forcing specific bgcolor and color on every segment.
 
             ``apply_style`` won't work here because existing segment bgcolors
-            (e.g. #000000 from rich_style) take priority in Rich's style merge.
+            (e.g. #0c0c0c from rich_style) take priority in Rich's style merge.
             """
             from rich.segment import Segment as _Seg
             target = _Style(bgcolor=bgcolor, color=color)
@@ -381,25 +381,25 @@ if _TEXTUAL_AVAILABLE:
         CSS = """
         Screen {
             layout: vertical;
-            background: #000000;
+            background: #0c0c0c;
         }
         #output {
             height: 1fr;
             scrollbar-gutter: stable;
             border: none;
-            background: #000000;
+            background: #0c0c0c;
         }
         #sep-row {
             height: 1;
-            background: #000000;
+            background: #0c0c0c;
         }
         #sep {
             width: 1fr;
-            background: #000000;
+            background: #0c0c0c;
         }
         #topic-bar {
             width: auto;
-            background: #000000;
+            background: #0c0c0c;
             padding: 0 1;
             display: none;
         }
@@ -410,14 +410,14 @@ if _TEXTUAL_AVAILABLE:
             height: auto;
             min-height: 1;
             padding: 0 1;
-            background: #000000;
+            background: #0c0c0c;
             color: $text-muted;
         }
         #popup {
             height: auto;
             max-height: 10;
             display: none;
-            background: #000000;
+            background: #0c0c0c;
             border: round $primary;
             padding: 0 1;
         }
@@ -428,14 +428,14 @@ if _TEXTUAL_AVAILABLE:
             height: auto;
             border: none;
             padding: 0 1;
-            background: #000000;
+            background: #0c0c0c;
         }
         Input {
-            background: #000000;
+            background: #0c0c0c;
         }
         #status {
             height: 1;
-            background: #000000;
+            background: #0c0c0c;
             color: $text-muted;
             padding: 0 1;
         }
@@ -1082,6 +1082,13 @@ class TextualTUI(TUIBase):
         self._stream_buf = ""
         self._stream_ts = ""
         self._app.clear_live()
+        # Remove the streaming block (header + content) so add_response can
+        # write a clean final version without duplicating content.
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            out.truncate_to(self._stream_header_line)
+        except Exception:
+            pass
         return buf
 
     # ── TUIBase: state ─────────────────────────────────────────────────────
