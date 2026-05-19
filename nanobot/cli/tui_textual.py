@@ -470,6 +470,15 @@ if _TEXTUAL_AVAILABLE:
         def on_mount(self) -> None:
             self.query_one("#input").focus()
             self._write_welcome()
+            # After the first full render, re-focus + full layout refresh so
+            # Windows Terminal updates its IME candidate window position to the
+            # actual input cursor location instead of defaulting to top-left.
+            self.call_after_refresh(self._refocus_input)
+
+        def _refocus_input(self) -> None:
+            inp = self.query_one("#input", Input)
+            inp.focus()
+            self.refresh(layout=True)
 
         def _write_welcome(self) -> None:
             out = self.query_one("#output", _OutputLog)

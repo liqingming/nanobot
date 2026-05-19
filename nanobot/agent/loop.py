@@ -249,7 +249,6 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
-            max_completion_tokens=provider.generation.max_tokens,
         )
         self._register_default_tools()
         self.commands = CommandRouter()
