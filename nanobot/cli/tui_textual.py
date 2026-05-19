@@ -76,6 +76,8 @@ if _TEXTUAL_AVAILABLE:
             self._selecting: bool = False
             self._sel_moved: bool = False  # True once mouse moves during drag
             self._user_ranges: list[tuple[int, int]] = []  # gray-bg row ranges
+            self._collapsed: dict[int, list[Any]] = {}  # summary_line → hidden strips
+            self._expanded: dict[int, list[Any]] = {}   # expand_start → original strips (for re-collapse)
 
         # ── selection helpers ──────────────────────────────────────────────
 
@@ -269,12 +271,17 @@ if _TEXTUAL_AVAILABLE:
                 self._sel_end = row
                 self._selecting = False
                 self.release_mouse()
-                # Only copy when the user dragged (not a bare click)
-                text = self._extract_selected_text() if self._sel_moved else ""
-                if text.strip():
-                    self._copy_to_clipboard(text)
-                    self.set_timer(1.5, self._clear_selection)
+                if self._sel_moved:
+                    # Drag → copy selected text
+                    text = self._extract_selected_text()
+                    if text.strip():
+                        self._copy_to_clipboard(text)
+                        self.set_timer(1.5, self._clear_selection)
+                    else:
+                        self._clear_selection()
                 else:
+                    # Bare click → toggle collapsed/expanded block
+                    self.toggle_block(row)
                     self._clear_selection()
             except Exception:
                 self._selecting = False
@@ -289,6 +296,8 @@ if _TEXTUAL_AVAILABLE:
             """Remove all lines after index n, used to overwrite streaming content."""
             if n >= len(self.lines):
                 return
+            self._collapsed = {k: v for k, v in self._collapsed.items() if k < n}
+            self._expanded = {k: v for k, v in self._expanded.items() if k < n}
             self.lines = self.lines[:n]
             self._widest_line_width = (
                 max(line.cell_length for line in self.lines) if self.lines else 0
@@ -299,6 +308,64 @@ if _TEXTUAL_AVAILABLE:
             # render_line() clamps it so no blank lines appear during the repaint
             # triggered by virtual_size change (a reactive that fires immediately).
             self.refresh()
+
+        def _shift_block_keys(self, after: int, delta: int) -> None:
+            """Shift all block-tracking keys > after by delta (used after insert/remove)."""
+            self._collapsed = {(k + delta if k > after else k): v for k, v in self._collapsed.items()}
+            self._expanded = {(k + delta if k > after else k): v for k, v in self._expanded.items()}
+
+        def collapse_lines(self, start: int, end: int) -> None:
+            """Collapse lines [start, end) to a single clickable summary line."""
+            if end <= start + 1 or end > len(self.lines):
+                return
+            hidden = list(self.lines[start:end])
+            n = len(hidden)
+            preview = hidden[0].text.strip()[:60] if hidden else ""
+            suffix = "…" if len(preview) == 60 else ""
+            label = f"▶ {n} 行  (点击展开)  {preview}{suffix}"
+            rt = Text(label, style="dim italic")
+            width = max(self.scrollable_content_region.width, self.min_width)
+            console = self.app.console
+            from rich.segment import Segment as _Seg
+            segs = list(console.render(rt, console.options.update_width(width)))
+            line_segs = list(_Seg.split_lines(segs))
+            summary_strip = Strip.from_lines(line_segs)[0].adjust_cell_length(width) if line_segs else Strip.blank(width)
+            # Fold any _expanded records that fall entirely within [start, end)
+            self._expanded = {k: v for k, v in self._expanded.items() if not (start <= k < end)}
+            self.lines[start] = summary_strip
+            del self.lines[start + 1:end]
+            self._collapsed[start] = hidden
+            removed = (end - start) - 1  # net lines removed
+            self._shift_block_keys(start, -removed)
+            self._widest_line_width = max(line.cell_length for line in self.lines) if self.lines else 0
+            self._line_cache.clear()
+            self.virtual_size = Size(self._widest_line_width, len(self.lines))
+            self.refresh()
+
+        def expand_line(self, idx: int) -> None:
+            """Replace a collapsed summary line at idx with its full hidden content."""
+            if idx not in self._collapsed:
+                return
+            hidden = self._collapsed.pop(idx)
+            self._expanded[idx] = hidden
+            self.lines[idx:idx + 1] = hidden
+            shift = len(hidden) - 1
+            self._shift_block_keys(idx, shift)
+            self._widest_line_width = max(line.cell_length for line in self.lines) if self.lines else 0
+            self._line_cache.clear()
+            self.virtual_size = Size(self._widest_line_width, len(self.lines))
+            self.refresh()
+
+        def toggle_block(self, row: int) -> None:
+            """Expand a collapsed summary line, or re-collapse an expanded block."""
+            if row in self._collapsed:
+                self.expand_line(row)
+                return
+            for start, strips in list(self._expanded.items()):
+                if start <= row < start + len(strips):
+                    del self._expanded[start]
+                    self.collapse_lines(start, start + len(strips))
+                    return
 
         def on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
             event.stop()
@@ -602,7 +669,7 @@ if _TEXTUAL_AVAILABLE:
                 icon = _SPINNER[self._thinking_frame % len(_SPINNER)]
                 try:
                     out = self.query_one("#output", _OutputLog)
-                    idx = self._tui._stream_header_line + 2
+                    idx = self._tui._tool_placeholder_line
                     if 0 <= idx < len(out.lines):
                         hint = self._tui._tool_hint
                         label = hint if hint else "思考中..."
@@ -743,6 +810,8 @@ class TextualTUI(TUIBase):
         self._stream_buf: str = ""
         self._stream_ts: str = ""
         self._stream_header_line: int = 0  # output-log line index where stream header was written
+        self._tool_placeholder_line: int = 0  # output-log line index of the current thinking/executing placeholder
+        self._last_content_start: int = 0  # where the most recent intermediate content block started
         self._tool_hint: str = ""
         self._last_sep: bool = False
 
@@ -1032,22 +1101,32 @@ class TextualTUI(TUIBase):
             self._stream_header_line = len(out.lines)
             out.write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{self._stream_ts}[/dim]")
             out.write("")
+            self._tool_placeholder_line = len(out.lines)
+            self._last_content_start = self._tool_placeholder_line
             out.write(Text("⠋ 思考中...", style="dim"))
         except Exception:
             self._stream_header_line = 0
+            self._tool_placeholder_line = 0
+            self._last_content_start = 0
         self._app.start_thinking_spinner()
 
     def tool_phase_start(self) -> None:
         self._stream_buf = ""
         if not self._stream_ts:
             self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._tool_hint = ""
-        # Write a placeholder at _stream_header_line + 2 so tool execution is
-        # visible in the message area; thinking spinner will animate this line,
-        # and stream_delta will overwrite it when the LLM resumes streaming.
+        self._tool_hint = "执行中..."
+        # Append placeholder at the current end of output — do NOT truncate so
+        # any content flush_stream already rendered between tool calls is preserved.
+        # If the intermediate content block is large, collapse it to save space.
+        _COLLAPSE_THRESHOLD = 6
         try:
             out = self._app.query_one("#output", _OutputLog)
-            out.truncate_to(self._stream_header_line + 2)
+            content_end = len(out.lines)
+            if content_end - self._last_content_start > _COLLAPSE_THRESHOLD:
+                out.collapse_lines(self._last_content_start, content_end)
+                self._tool_placeholder_line = self._last_content_start + 1
+            else:
+                self._tool_placeholder_line = content_end
             out.write(Text("⠋ 执行中...", style="dim"))
         except Exception:
             pass
@@ -1066,7 +1145,7 @@ class TextualTUI(TUIBase):
             # scrolled up, skip the truncate so we don't clobber their viewport;
             # flush_stream will write the final content when streaming completes.
             if sc_y >= mx_y:
-                out.truncate_to(self._stream_header_line + 2)
+                out.truncate_to(self._tool_placeholder_line)
                 out.write(Text(self._stream_buf))
         except Exception:
             pass
@@ -1079,19 +1158,24 @@ class TextualTUI(TUIBase):
             out = self._app.query_one("#output", _OutputLog)
             if self._stream_buf.strip():
                 render_as_text = (metadata or {}).get("render_as") == "text"
-                # Replace plain-text streaming content with final rendered version
-                out.truncate_to(self._stream_header_line + 2)
+                # Save where this content block starts (for potential collapse in tool_phase_start)
+                self._last_content_start = self._tool_placeholder_line
+                # Replace streaming content (including any placeholder) with final rendered version
+                out.truncate_to(self._tool_placeholder_line)
                 if self._render_md and not render_as_text:
                     out.write(Markdown(self._stream_buf))
                 else:
                     out.write(Text(self._stream_buf))
                 out.write("")
+                # Track end so next tool_phase_start appends after this rendered content
+                self._tool_placeholder_line = len(out.lines)
                 self._last_sep = True
             else:
-                # Nothing streamed yet — only remove the thinking placeholder,
+                # Nothing streamed yet — remove the thinking/executing placeholder,
                 # keep header+blank so _stream_header_line stays valid for
                 # subsequent stream_delta calls when LLM streams after a tool call.
-                out.truncate_to(self._stream_header_line + 2)
+                out.truncate_to(self._tool_placeholder_line)
+                self._last_content_start = len(out.lines)
         except Exception:
             if self._stream_buf.strip():
                 ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
