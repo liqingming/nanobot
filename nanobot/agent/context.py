@@ -26,7 +26,11 @@ class ContextBuilder:
         self.memory = MemoryStore(data_dir)
         self.skills = SkillsLoader(data_dir)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        include_learning_rules: bool = False,
+    ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
@@ -52,6 +56,11 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
 {skills_summary}""")
+
+        if include_learning_rules:
+            lr_path = self.data_dir / "LEARNING_RULES.md"
+            if lr_path.exists():
+                parts.append(lr_path.read_text(encoding="utf-8"))
 
         return "\n\n---\n\n".join(parts)
 
@@ -100,6 +109,7 @@ Your workspace is at: {workspace_path}
 - Tools like 'read_file' and 'web_fetch' can return native image content. Read visual resources directly when needed instead of relying on text descriptions.
 - When you write a file (write_file tool), the result is a TEXT FILE saved on disk — never describe it as an "image" or "picture", even if the content contains diagrams or charts (e.g. Mermaid, ASCII art).
 - After writing a file, you MUST end your response with the exact absolute path from the tool result: "完整内容已保存至：`<absolute path>`". You may show a summary or excerpt before it, but the path line is mandatory.
+- **Empty-write guard**: Before calling write_file to overwrite an existing file, if the content to be written is empty or contains 0 useful lines (e.g., result of a filter that matched nothing), you MUST stop, report the zero-match result to the user, and ask for explicit confirmation before proceeding. Never silently overwrite a non-empty file with empty content.
 
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.
 IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST call the 'message' tool with the 'media' parameter. Do NOT use read_file to "send" a file — reading a file only shows its content to you, it does NOT deliver the file to the user. Example: message(content="Here is the file", media=["/path/to/file.png"])"""
@@ -135,20 +145,25 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         channel: str | None = None,
         chat_id: str | None = None,
         current_role: str = "user",
+        learning_ctx: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
         user_content = self._build_user_content(current_message, media)
 
-        # Merge runtime context and user content into a single user message
-        # to avoid consecutive same-role messages that some providers reject.
+        # Merge runtime context, optional turn summary, and user content into a single
+        # user message to avoid consecutive same-role messages that some providers reject.
+        prefix = f"{learning_ctx}\n\n{runtime_ctx}" if learning_ctx else runtime_ctx
         if isinstance(user_content, str):
-            merged = f"{runtime_ctx}\n\n{user_content}"
+            merged = f"{prefix}\n\n{user_content}"
         else:
-            merged = [{"type": "text", "text": runtime_ctx}] + user_content
+            merged = [{"type": "text", "text": prefix}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": self.build_system_prompt(
+                skill_names,
+                include_learning_rules=(learning_ctx is not None),
+            )},
             *history,
             {"role": current_role, "content": merged},
         ]
