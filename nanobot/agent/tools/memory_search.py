@@ -152,7 +152,7 @@ class SearchHistoryTool(Tool):
     _cache: dict[str, tuple[float, list[str], Any]] = {}
 
     def __init__(self, data_dir: Path) -> None:
-        self._history_file = data_dir / "memory" / "HISTORY.md"
+        self._memory_dir = data_dir / "memory"
 
     @property
     def name(self) -> str:
@@ -187,27 +187,48 @@ class SearchHistoryTool(Tool):
             "required": ["query"],
         }
 
+    def _get_all_history_files(self) -> list[Path]:
+        files = []
+        global_hist = self._memory_dir / "HISTORY.md"
+        if global_hist.exists():
+            files.append(global_hist)
+        topics_dir = self._memory_dir / "topics"
+        if topics_dir.exists():
+            for topic_dir in sorted(topics_dir.iterdir()):
+                if topic_dir.is_dir():
+                    h = topic_dir / "HISTORY.md"
+                    if h.exists():
+                        files.append(h)
+        return files
+
     def _load_index(self) -> tuple[list[str], Any] | tuple[None, None]:
-        """Return cached or freshly built BM25 index."""
+        """Return cached or freshly built BM25 index merging all history files."""
         from rank_bm25 import BM25Okapi
 
-        path = str(self._history_file)
-        if not self._history_file.exists():
+        history_files = self._get_all_history_files()
+        if not history_files:
             return None, None
 
-        mtime = self._history_file.stat().st_mtime
-        cached = self._cache.get(path)
-        if cached and cached[0] == mtime:
-            return cached[1], cached[2]
+        all_entries: list[str] = []
+        for hist_file in history_files:
+            path = str(hist_file)
+            mtime = hist_file.stat().st_mtime
+            cached = self._cache.get(path)
+            if cached and cached[0] == mtime:
+                file_entries = cached[1]
+            else:
+                text = hist_file.read_text(encoding="utf-8")
+                file_entries = _parse_entries(text)
+                if file_entries:
+                    file_index = BM25Okapi([_tokenize(e) for e in file_entries])
+                    self._cache[path] = (mtime, file_entries, file_index)
+            all_entries.extend(file_entries)
 
-        text = self._history_file.read_text(encoding="utf-8")
-        entries = _parse_entries(text)
-        if not entries:
+        if not all_entries:
             return None, None
 
-        index = BM25Okapi([_tokenize(e) for e in entries])
-        self._cache[path] = (mtime, entries, index)
-        return entries, index
+        combined_index = BM25Okapi([_tokenize(e) for e in all_entries])
+        return all_entries, combined_index
 
     async def execute(self, query: str, top_k: int = 5) -> str:
         top_k = min(max(1, top_k), 20)
