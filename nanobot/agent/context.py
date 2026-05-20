@@ -6,7 +6,7 @@ import platform
 from pathlib import Path
 from typing import Any
 
-from nanobot.utils.helpers import current_time_str
+from nanobot.utils.helpers import current_time_str, safe_filename
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
@@ -25,22 +25,35 @@ class ContextBuilder:
         self.timezone = timezone
         self.memory = MemoryStore(data_dir)
         self.skills = SkillsLoader(data_dir)
+        self._topic_stores: dict[str, MemoryStore] = {}
+
+    def _get_topic_store(self, session_key: str) -> MemoryStore:
+        if session_key not in self._topic_stores:
+            self._topic_stores[session_key] = MemoryStore(self.data_dir, session_key)
+        return self._topic_stores[session_key]
 
     def build_system_prompt(
         self,
         skill_names: list[str] | None = None,
         include_learning_rules: bool = False,
+        session_key: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity()]
+        parts = [self._get_identity(session_key)]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        global_mem = self.memory.read_long_term()
+        topic_mem = self._get_topic_store(session_key).read_long_term() if session_key else ""
+        mem_parts = []
+        if global_mem:
+            mem_parts.append(global_mem)
+        if topic_mem:
+            mem_parts.append(f"### Topic Memory\n{topic_mem}")
+        if mem_parts:
+            parts.append("# Memory\n\n" + "\n\n".join(mem_parts))
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -64,7 +77,7 @@ Skills with available="false" need dependencies installed first - you can try in
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self) -> str:
+    def _get_identity(self, session_key: str | None = None) -> str:
         """Get the core identity section."""
         workspace_path = str(self.workspace.expanduser().resolve())
         data_path = str(self.data_dir.expanduser().resolve())
@@ -84,6 +97,19 @@ Skills with available="false" need dependencies installed first - you can try in
 - Use file tools when they are simpler or more reliable than shell commands.
 """
 
+        if session_key is not None:
+            safe_key = safe_filename(session_key.replace(":", "_"))
+            memory_lines = (
+                f"- Global memory: {data_path}/memory/MEMORY.md (cross-topic facts, auto-injected)\n"
+                f"- Topic memory: {data_path}/memory/topics/{safe_key}/MEMORY.md (current topic facts, auto-injected; prefer writing here)\n"
+                f"- Topic history: {data_path}/memory/topics/{safe_key}/HISTORY.md (event log, handled by consolidation)"
+            )
+        else:
+            memory_lines = (
+                f"- Long-term memory: {data_path}/memory/MEMORY.md (write important facts here)\n"
+                f"- History log: {data_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM]."
+            )
+
         return f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant.
@@ -93,8 +119,7 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {data_path}/memory/MEMORY.md (write important facts here)
-- History log: {data_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+{memory_lines}
 - Custom skills: {data_path}/skills/{{skill-name}}/SKILL.md
 
 {platform_policy}
@@ -146,6 +171,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         chat_id: str | None = None,
         current_role: str = "user",
         learning_ctx: str | None = None,
+        session_key: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
@@ -163,6 +189,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             {"role": "system", "content": self.build_system_prompt(
                 skill_names,
                 include_learning_rules=(learning_ctx is not None),
+                session_key=session_key,
             )},
             *history,
             {"role": current_role, "content": merged},
