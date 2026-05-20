@@ -572,6 +572,12 @@ if _TEXTUAL_AVAILABLE:
             text = event.value
             event.input.clear()
             tui._history_pos = -1
+            if tui._input_mode == "new_topic":
+                cb = tui._new_topic_cb
+                tui._exit_new_topic_mode()
+                if cb:
+                    asyncio.ensure_future(cb(text.strip()))
+                return
             if text.strip():
                 tui._add_to_history(text)
             if tui._on_pre_submit and not tui._is_processing:
