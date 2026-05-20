@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain
+from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, safe_filename
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
@@ -93,8 +93,12 @@ class MemoryStore:
 
     _MAX_FAILURES_BEFORE_RAW_ARCHIVE = 3
 
-    def __init__(self, workspace: Path):
-        self.memory_dir = ensure_dir(workspace / "memory")
+    def __init__(self, workspace: Path, session_key: str | None = None):
+        if session_key is not None:
+            safe_key = safe_filename(session_key.replace(":", "_"))
+            self.memory_dir = ensure_dir(workspace / "memory" / "topics" / safe_key)
+        else:
+            self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
         self._consecutive_failures = 0
@@ -274,6 +278,7 @@ class MemoryConsolidator:
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
     ):
+        self.workspace = workspace
         self.store = MemoryStore(workspace)
         self.provider = provider
         self.model = model
@@ -283,14 +288,21 @@ class MemoryConsolidator:
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._topic_stores: dict[str, MemoryStore] = {}
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
 
-    async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
+    def _get_topic_store(self, session_key: str) -> MemoryStore:
+        if session_key not in self._topic_stores:
+            self._topic_stores[session_key] = MemoryStore(self.workspace, session_key)
+        return self._topic_stores[session_key]
+
+    async def consolidate_messages(self, messages: list[dict[str, object]], session_key: str | None = None) -> bool:
         """Archive a selected message chunk into persistent memory."""
-        return await self.store.consolidate(messages, self.provider, self.model)
+        store = self._get_topic_store(session_key) if session_key else self.store
+        return await store.consolidate(messages, self.provider, self.model)
 
     def pick_consolidation_boundary(
         self,
@@ -323,6 +335,7 @@ class MemoryConsolidator:
             current_message="[token-probe]",
             channel=channel,
             chat_id=chat_id,
+            session_key=session.key,
         )
         return estimate_prompt_tokens_chain(
             self.provider,
@@ -331,12 +344,19 @@ class MemoryConsolidator:
             self._get_tool_definitions(),
         )
 
-    async def archive_messages(self, messages: list[dict[str, object]]) -> bool:
+    async def archive_messages(self, messages: list[dict[str, object]], session_key: str | None = None) -> bool:
         """Archive messages with guaranteed persistence (retries until raw-dump fallback)."""
         if not messages:
             return True
-        for _ in range(self.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
-            if await self.consolidate_messages(messages):
+        topic_store = self._get_topic_store(session_key) if session_key else self.store
+        for _ in range(topic_store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
+            # Pass session_key only when present; keeps 1-arg call compatible with mocks in tests.
+            success = (
+                await self.consolidate_messages(messages, session_key)
+                if session_key
+                else await self.consolidate_messages(messages)
+            )
+            if success:
                 return True
         return True
 
@@ -393,7 +413,7 @@ class MemoryConsolidator:
                     source,
                     len(chunk),
                 )
-                if not await self.consolidate_messages(chunk):
+                if not await self.consolidate_messages(chunk, session_key=session.key):
                     return
                 session.last_consolidated = end_idx
                 self._compact_history(session)
