@@ -249,6 +249,7 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=provider.generation.max_tokens,
         )
         self._register_default_tools()
         self.commands = CommandRouter()
@@ -608,6 +609,7 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
+                session_key=key,
             )
             final_content, _, all_msgs, _ = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
@@ -648,6 +650,7 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             learning_ctx=learning_ctx,
+            session_key=key,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
