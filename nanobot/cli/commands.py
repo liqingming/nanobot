@@ -1138,10 +1138,12 @@ def agent(
                                 _turn_cancelled[0] = False
                                 continue
                             streamed = tui.pop_stream()
+                            intermediate = tui.flush_accumulator()
                             if msg.metadata.get("_no_content"):
-                                content = streamed or ""
+                                final = streamed or ""
                             else:
-                                content = streamed or msg.content or ""
+                                final = streamed or msg.content or ""
+                            content = "\n\n".join(p for p in [intermediate, final] if p.strip())
                             if content.strip():
                                 tui.add_response(content, dict(msg.metadata or {}))
                             await _turn_complete()

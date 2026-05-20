@@ -812,6 +812,7 @@ class TextualTUI(TUIBase):
         self._stream_header_line: int = 0  # output-log line index where stream header was written
         self._tool_placeholder_line: int = 0  # output-log line index of the current thinking/executing placeholder
         self._last_content_start: int = 0  # where the most recent intermediate content block started
+        self._flushed_parts: list[str] = []  # intermediate LLM text flushed between tool calls
         self._tool_hint: str = ""
         self._last_sep: bool = False
 
@@ -1083,7 +1084,29 @@ class TextualTUI(TUIBase):
 
     def add_progress(self, text: str) -> None:
         self._tool_hint = text
-        self._app.start_spinner(tool=True)
+        self._app.call_later(self._update_progress_line, text)
+
+    def _update_progress_line(self, text: str) -> None:
+        """Overwrite the executing placeholder line with the tool name (runs in Textual context)."""
+        try:
+            from rich.segment import Segment as _Seg
+            out = self._app.query_one("#output", _OutputLog)
+            idx = self._tool_placeholder_line
+            if 0 <= idx < len(out.lines):
+                rt = Text(f"⠋ {text}", style="dim")
+                width = max(out.scrollable_content_region.width, out.min_width)
+                console = out.app.console
+                segs = list(console.render(rt, console.options.update_width(width)))
+                line_segs = list(_Seg.split_lines(segs))
+                if line_segs:
+                    new_strip = Strip.from_lines(line_segs)[0].adjust_cell_length(width)
+                else:
+                    new_strip = Strip.blank(width)
+                out.lines[idx] = new_strip
+                out._line_cache.clear()
+                out.refresh()
+        except Exception:
+            pass
 
     def add_system(self, text: str) -> None:
         self._log_write(f"[dim]{text}[/dim]")
@@ -1094,6 +1117,7 @@ class TextualTUI(TUIBase):
     def stream_start(self) -> None:
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
+        self._flushed_parts = []
         # Write header + thinking placeholder directly into #output so the
         # animation is inside the message area, not in the separate #live strip.
         try:
@@ -1130,7 +1154,9 @@ class TextualTUI(TUIBase):
             out.write(Text("⠋ 执行中...", style="dim"))
         except Exception:
             pass
-        self._app.start_thinking_spinner()
+        # schedule via call_later so the timer task is created inside Textual's context
+        # (active_app ContextVar must be set, otherwise set_interval's task silently crashes)
+        self._app.call_later(self._app.start_thinking_spinner)
 
     def stream_delta(self, delta: str) -> None:
         self._app.stop_thinking_spinner()
@@ -1169,6 +1195,7 @@ class TextualTUI(TUIBase):
                 out.write("")
                 # Track end so next tool_phase_start appends after this rendered content
                 self._tool_placeholder_line = len(out.lines)
+                self._flushed_parts.append(self._stream_buf.strip())
                 self._last_sep = True
             else:
                 # Nothing streamed yet — remove the thinking/executing placeholder,
@@ -1198,6 +1225,12 @@ class TextualTUI(TUIBase):
         except Exception:
             pass
         return buf
+
+    def flush_accumulator(self) -> str:
+        """Return and clear all intermediate LLM text flushed between tool calls."""
+        parts = [p for p in self._flushed_parts if p]
+        self._flushed_parts = []
+        return "\n\n".join(parts)
 
     # ── TUIBase: state ─────────────────────────────────────────────────────
 

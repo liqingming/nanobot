@@ -71,6 +71,13 @@ class TUIBase(ABC):
     @abstractmethod
     def pop_stream(self) -> str: ...
 
+    def flush_accumulator(self) -> str:
+        """Return and clear intermediate LLM text flushed between tool calls.
+
+        Default returns empty string; TextualTUI overrides with real accumulation.
+        """
+        return ""
+
     # ── State updates ──────────────────────────────────────────────────────
 
     @abstractmethod
