@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 
 class TUIBase(ABC):
@@ -35,7 +36,13 @@ class TUIBase(ABC):
     # ── Content write API ──────────────────────────────────────────────────
 
     @abstractmethod
-    def load_session_history(self, messages: list[dict], max_messages: int = 200) -> None: ...
+    def load_session_history(
+        self,
+        messages: list[dict],
+        max_messages: int = 200,
+        tool_registry: Any = None,
+        workspace: Any = None,
+    ) -> None: ...
 
     @abstractmethod
     def add_user_echo(self, text: str) -> None: ...
@@ -77,6 +84,22 @@ class TUIBase(ABC):
         Default returns empty string; TextualTUI overrides with real accumulation.
         """
         return ""
+
+    def set_todos(self, todos: list[dict]) -> None:
+        """Update the active todo display (in_progress item + progress count).
+
+        Default is a no-op so backends that don't render todos can ignore it.
+        TextualTUI overrides to update the #todo-bar widget.
+        """
+        return None
+
+    def add_tool_result(self, summary: str) -> None:
+        """Append a short result summary to the most-recent tool placeholder
+        (e.g. turning "⠋ exec(cmd)" into "→ exec(cmd) → exit 0, 12 lines").
+
+        Default is a no-op so backends without per-tool tracing can ignore it.
+        """
+        return None
 
     # ── State updates ──────────────────────────────────────────────────────
 

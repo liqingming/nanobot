@@ -202,6 +202,37 @@ class LLMProvider(ABC):
         return "max_tokens" in err and ("invalid" in err or "valid range" in err or "exceed" in err)
 
     @staticmethod
+    def _extract_max_tokens_upper_bound(content: str | None) -> int:
+        """Parse error messages like `valid range of max_tokens is [1, 393216]`
+        and return the upper bound. Returns 8192 (safe default) if not found.
+        """
+        import re
+        if not content:
+            return 8192
+        # Match patterns like "[1, 393216]" or "[1,393216]" inside the message
+        match = re.search(r"\[\s*\d+\s*,\s*(\d+)\s*\]", content)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+        return 8192
+
+    def _downgrade_max_tokens(self, error_content: str | None) -> int:
+        """Permanently lower this provider's default max_tokens so subsequent
+        calls don't re-trigger the same error. Returns the new value used."""
+        new_value = self._extract_max_tokens_upper_bound(error_content)
+        if new_value < self.generation.max_tokens:
+            logger.warning(
+                "max_tokens={} rejected by API, downgrading provider default to {} for the rest of this session",
+                self.generation.max_tokens, new_value,
+            )
+            # GenerationSettings is frozen — replace the whole dataclass
+            from dataclasses import replace
+            self.generation = replace(self.generation, max_tokens=new_value)
+        return new_value
+
+    @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """Replace image_url blocks with text placeholder. Returns None if no images found."""
         found = False
@@ -302,8 +333,8 @@ class LLMProvider(ABC):
 
             if not self._is_transient_error(response.content):
                 if self._is_max_tokens_error(response.content):
-                    logger.warning("max_tokens value rejected by API, retrying with fallback=8192")
-                    return await self._safe_chat_stream(**{**kw, "max_tokens": 8192})
+                    new_max = self._downgrade_max_tokens(response.content)
+                    return await self._safe_chat_stream(**{**kw, "max_tokens": new_max})
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
@@ -356,8 +387,8 @@ class LLMProvider(ABC):
 
             if not self._is_transient_error(response.content):
                 if self._is_max_tokens_error(response.content):
-                    logger.warning("max_tokens value rejected by API, retrying with fallback=8192")
-                    return await self._safe_chat(**{**kw, "max_tokens": 8192})
+                    new_max = self._downgrade_max_tokens(response.content)
+                    return await self._safe_chat(**{**kw, "max_tokens": new_max})
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")

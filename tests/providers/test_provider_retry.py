@@ -211,3 +211,81 @@ async def test_image_fallback_without_meta_uses_default_placeholder() -> None:
         content = msg.get("content")
         if isinstance(content, list):
             assert any("[image omitted]" in (b.get("text") or "") for b in content)
+
+
+# ---------------------------------------------------------------------------
+# max_tokens downgrade tests
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_error_triggers_downgrade_and_retry() -> None:
+    """When provider rejects max_tokens as too large, fallback retries with the
+    parsed upper bound and permanently lowers generation.max_tokens."""
+    err_msg = (
+        'Error: {"error":{"message":"Invalid max_tokens value, the valid range '
+        'of max_tokens is [1, 393216]","type":"invalid_request_error"}}'
+    )
+    provider = ScriptedProvider([
+        LLMResponse(content=err_msg, finish_reason="error"),
+        LLMResponse(content="ok"),
+    ])
+    provider.generation = GenerationSettings(max_tokens=1_048_576)
+
+    response = await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert response.content == "ok"
+    assert provider.calls == 2
+    # Retry used the parsed upper bound
+    assert provider.last_kwargs["max_tokens"] == 393216
+    # generation.max_tokens permanently downgraded so subsequent calls use it
+    assert provider.generation.max_tokens == 393216
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_downgrade_falls_back_to_8192_when_no_range_in_error() -> None:
+    """If the error message doesn't contain a [min, max] range, use 8192 default."""
+    provider = ScriptedProvider([
+        LLMResponse(content="max_tokens invalid - too large", finish_reason="error"),
+        LLMResponse(content="ok"),
+    ])
+    provider.generation = GenerationSettings(max_tokens=999999)
+
+    response = await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert response.content == "ok"
+    assert provider.last_kwargs["max_tokens"] == 8192
+    assert provider.generation.max_tokens == 8192
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_downgrade_does_not_increase_value() -> None:
+    """If parsed upper bound is larger than current max_tokens, keep current."""
+    err_msg = "max_tokens invalid, valid range is [1, 999999]"
+    provider = ScriptedProvider([
+        LLMResponse(content=err_msg, finish_reason="error"),
+        LLMResponse(content="ok"),
+    ])
+    provider.generation = GenerationSettings(max_tokens=4096)
+
+    await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
+
+    # max_tokens shouldn't be upgraded to 999999
+    assert provider.generation.max_tokens == 4096
+
+
+def test_extract_max_tokens_upper_bound_parsing() -> None:
+    from nanobot.providers.base import LLMProvider
+    cases = [
+        ("the valid range of max_tokens is [1, 393216]", 393216),
+        ("range [0, 65536]", 65536),
+        ("range [1,128000]", 128000),
+        ("no range here", 8192),
+        (None, 8192),
+        ("", 8192),
+    ]
+    for content, expected in cases:
+        assert LLMProvider._extract_max_tokens_upper_bound(content) == expected, content

@@ -28,6 +28,13 @@ from rich.text import Text
 
 from nanobot import __logo__, __version__
 from nanobot.cli.tui_base import TUIBase
+from nanobot.cli.tui_keys import (
+    EnterAction,
+    PopupAction,
+    TUIState,
+    decide_enter_action,
+    decide_popup_key,
+)
 
 # ---------------------------------------------------------------------------
 # Textual imports — lazy-guarded so the module can be imported even when
@@ -398,45 +405,50 @@ if _TEXTUAL_AVAILABLE:
 
         async def _on_key(self, event: Key) -> None:
             tui = self._tui_ref
-            if event.key == "up":
-                if tui._popup_mode != "hidden" and tui._popup_items:
-                    tui._popup_idx = max(0, tui._popup_idx - 1)
-                    tui._refresh_popup()
-                else:
-                    text = tui._history_backward()
-                    if text is not None:
-                        self.value = text
-                        self.cursor_position = len(text)
+            if event.key not in ("up", "down", "tab"):
+                # Enter falls through to Input.Submitted; other keys use defaults.
+                return
+
+            selected = (
+                tui._popup_items[tui._popup_idx][0]
+                if tui._popup_items and 0 <= tui._popup_idx < len(tui._popup_items)
+                else None
+            )
+            state = TUIState(
+                input_mode=tui._input_mode,
+                popup_mode=tui._popup_mode,
+                popup_has_items=bool(tui._popup_items),
+                popup_selected_value=selected,
+                input_text=self.value,
+            )
+            decision = decide_popup_key(event.key, state)
+            action = decision.action
+
+            if action == PopupAction.CYCLE_UP:
+                tui._popup_idx = max(0, tui._popup_idx - 1)
+                tui._refresh_popup()
                 event.prevent_default()
-
-            elif event.key == "down":
-                if tui._popup_mode != "hidden" and tui._popup_items:
-                    tui._popup_idx = min(len(tui._popup_items) - 1, tui._popup_idx + 1)
-                    tui._refresh_popup()
-                else:
-                    text = tui._history_forward()
-                    self.value = text if text is not None else ""
-                    if text is not None:
-                        self.cursor_position = len(text)
+            elif action == PopupAction.CYCLE_DOWN:
+                tui._popup_idx = min(len(tui._popup_items) - 1, tui._popup_idx + 1)
+                tui._refresh_popup()
                 event.prevent_default()
-
-            elif event.key == "tab":
-                if tui._popup_mode == "command" and tui._popup_items:
-                    value, _ = tui._popup_items[tui._popup_idx]
-                    self.value = value
-                    self.cursor_position = len(value)
-                    event.prevent_default()
-
-            elif event.key == "enter":
-                if tui._popup_mode != "hidden" and tui._popup_items:
-                    tui._popup_enter_handled = True
-                    value, _ = tui._popup_items[tui._popup_idx]
-                    cb = tui._popup_on_select  # save before hide_popup() clears it
-                    tui.hide_popup()
-                    self.value = ""
-                    if cb:
-                        await cb(value)
-                    event.prevent_default()
+            elif action == PopupAction.COMPLETE:
+                self.value = decision.value
+                self.cursor_position = len(decision.value)
+                event.prevent_default()
+            elif action == PopupAction.HISTORY_BACK:
+                text = tui._history_backward()
+                if text is not None:
+                    self.value = text
+                    self.cursor_position = len(text)
+                event.prevent_default()
+            elif action == PopupAction.HISTORY_FORWARD:
+                text = tui._history_forward()
+                self.value = text if text is not None else ""
+                if text is not None:
+                    self.cursor_position = len(text)
+                event.prevent_default()
+            # PopupAction.IGNORE → don't call prevent_default, let the key flow normally
 
     # -----------------------------------------------------------------------
     # Textual App
@@ -506,6 +518,16 @@ if _TEXTUAL_AVAILABLE:
             color: $text-muted;
             padding: 0 1;
         }
+        #todo-bar {
+            height: 1;
+            background: #0c0c0c;
+            color: $text-muted;
+            padding: 0 1;
+            display: none;
+        }
+        #todo-bar.visible {
+            display: block;
+        }
         """
 
         BINDINGS = [
@@ -521,13 +543,38 @@ if _TEXTUAL_AVAILABLE:
             self._tui = tui
             self._spinner_timer: Any = None
             self._spinner_frame = 0
+            self._spinner_start_time: float = 0.0
             self._thinking_timer: Any = None
             self._thinking_frame = 0
+            self._thinking_start_time: float = 0.0
+
+        @staticmethod
+        def _elapsed_suffix(start_time: float) -> str:
+            """Render elapsed time since ``start_time`` as a spinner suffix.
+
+            Format:
+              * < 1s    → ""              (avoid flicker on quick ops)
+              * < 60s   → " (5s)"         (integer seconds)
+              * >= 60s  → " (1m30s)"      (compact minutes+seconds)
+
+            Uses ``time.monotonic`` which is immune to wall-clock adjustments,
+            so the suffix faithfully reflects real elapsed time.
+            """
+            import time
+            elapsed = time.monotonic() - start_time
+            if elapsed < 1.0:
+                return ""
+            if elapsed < 60:
+                return f" ({int(elapsed)}s)"
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            return f" ({minutes}m{seconds}s)"
 
         def compose(self) -> ComposeResult:
             yield _OutputLog(id="output", markup=True, highlight=False, wrap=True)
             yield Static("", id="live")
             yield Static("", id="popup")
+            yield Static("", id="todo-bar")
             with Horizontal(id="sep-row"):
                 yield Static("[dim cyan]" + "─" * 80 + "[/dim cyan]", id="sep", markup=True)
                 yield Static("", id="topic-bar")
@@ -565,25 +612,51 @@ if _TEXTUAL_AVAILABLE:
 
         def on_input_submitted(self, event: Input.Submitted) -> None:
             tui = self._tui
-            # Enter was consumed by popup selection in _HistoryInput._on_key
-            if tui._popup_enter_handled:
-                tui._popup_enter_handled = False
-                return
-            text = event.value
+            selected = (
+                tui._popup_items[tui._popup_idx][0]
+                if tui._popup_items and 0 <= tui._popup_idx < len(tui._popup_items)
+                else None
+            )
+            decision = decide_enter_action(TUIState(
+                input_mode=tui._input_mode,
+                popup_mode=tui._popup_mode,
+                popup_has_items=bool(tui._popup_items),
+                popup_selected_value=selected,
+                input_text=event.value,
+            ))
+            action, value = decision.action, decision.value
             event.input.clear()
             tui._history_pos = -1
-            if tui._input_mode == "new_topic":
+
+            if action == EnterAction.NEW_TOPIC:
                 cb = tui._new_topic_cb
                 tui._exit_new_topic_mode()
                 if cb:
-                    asyncio.ensure_future(cb(text.strip()))
+                    asyncio.ensure_future(cb(value))
                 return
-            if text.strip():
-                tui._add_to_history(text)
-            if tui._on_pre_submit and not tui._is_processing:
-                tui._on_pre_submit(text)
-            if tui._on_submit:
-                asyncio.ensure_future(tui._on_submit(text))
+            if action == EnterAction.TOPIC_SELECT:
+                cb = tui._popup_on_select
+                tui.hide_popup()
+                if cb:
+                    asyncio.ensure_future(cb(value))
+                return
+            if action == EnterAction.COMMAND_SUBMIT:
+                tui.hide_popup()
+                # Commands must NOT echo to output (no add_user_echo / pre_submit)
+                # and must NOT be saved to input history.
+                if tui._on_submit:
+                    asyncio.ensure_future(tui._on_submit(value))
+                return
+            if action == EnterAction.SUBMIT:
+                # Slash-prefixed typed text is also a command — skip history.
+                if not value.strip().startswith("/"):
+                    tui._add_to_history(value)
+                if tui._on_pre_submit and not tui._is_processing:
+                    tui._on_pre_submit(value)
+                if tui._on_submit:
+                    asyncio.ensure_future(tui._on_submit(value))
+                return
+            # NOOP: nothing to do
 
         def on_input_changed(self, event: Input.Changed) -> None:
             self._tui._on_input_changed(event.value)
@@ -631,9 +704,14 @@ if _TEXTUAL_AVAILABLE:
         # ── spinner ────────────────────────────────────────────────────────
 
         def start_spinner(self, tool: bool = False) -> None:
+            import time
             self._stop_spinner()
             self._spinner_frame = 0
             self._spinner_tool = tool
+            # tool spinner: per-tool clock (each tool starts fresh).
+            # thinking spinner: anchored to the turn start, so the elapsed
+            # counter doesn't reset between LLM segments / idle gaps.
+            self._spinner_start_time = time.monotonic()
 
             def _tick() -> None:
                 self._spinner_frame += 1
@@ -641,12 +719,17 @@ if _TEXTUAL_AVAILABLE:
                 frames = _TOOL_SPINNER if self._spinner_tool else _SPINNER
                 icon = frames[self._spinner_frame % len(frames)]
                 if self._spinner_tool:
+                    base = self._spinner_start_time
+                else:
+                    base = tui._turn_start_time or self._spinner_start_time
+                suffix = self._elapsed_suffix(base)
+                if self._spinner_tool:
                     label = tui._tool_hint or "executing..."
                     ts = tui._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    text = f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]\n[dim]{icon} {label}[/dim]"
+                    text = f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]\n[dim]{icon} {label}{suffix}[/dim]"
                 else:
                     ts = tui._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    text = f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]\n[dim]{icon} thinking...[/dim]"
+                    text = f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]\n[dim]{icon} thinking{suffix}...[/dim]"
                 try:
                     self.query_one("#live", Static).update(text)
                 except Exception:
@@ -666,20 +749,26 @@ if _TEXTUAL_AVAILABLE:
         # ── thinking spinner (animates inside #output) ─────────────────────
 
         def start_thinking_spinner(self) -> None:
+            import time
             self._stop_thinking_spinner()
             self._thinking_frame = 0
+            self._thinking_start_time = time.monotonic()
 
             def _tick() -> None:
                 from rich.segment import Segment as _Seg
                 self._thinking_frame += 1
                 icon = _SPINNER[self._thinking_frame % len(_SPINNER)]
+                # Use the turn-level anchor when present so the elapsed counter
+                # tracks the whole "thinking" duration, not just this spinner.
+                base = self._tui._turn_start_time or self._thinking_start_time
+                suffix = self._elapsed_suffix(base)
                 try:
                     out = self.query_one("#output", _OutputLog)
                     idx = self._tui._tool_placeholder_line
                     if 0 <= idx < len(out.lines):
                         hint = self._tui._tool_hint
                         label = hint if hint else "思考中..."
-                        rt = Text(f"{icon} {label}", style="dim")
+                        rt = Text(f"{icon} {label}{suffix}", style="dim")
                         width = max(out.scrollable_content_region.width, out.min_width)
                         console = out.app.console
                         segs = list(console.render(rt, console.options.update_width(width)))
@@ -752,6 +841,17 @@ if _TEXTUAL_AVAILABLE:
             except Exception:
                 pass
 
+        def update_todo_bar(self, text: str) -> None:
+            try:
+                bar = self.query_one("#todo-bar", Static)
+                bar.update(text)
+                if text:
+                    bar.add_class("visible")
+                else:
+                    bar.remove_class("visible")
+            except Exception:
+                pass
+
         # ── popup helpers ──────────────────────────────────────────────────
 
         def update_popup(self, lines: list[str], visible: bool) -> None:
@@ -793,6 +893,22 @@ class TextualTUI(TUIBase):
     Set ``NANOBOT_TUI=textual`` to activate via the factory.
     """
 
+    # ── Theme: shared color tokens across tool traces, todo bar, system msgs ──
+    #
+    # Keep these in sync conceptually so users see consistent semantics:
+    #   ACTIVE  = a task is currently running / in flight
+    #   SUCCESS = a task finished successfully
+    #   ERROR   = a task failed
+    #   MARKER  = static visual markers like →, ↳, ☐, • (low-emphasis structure)
+    #   HINT    = primary text inside a trace (tool name, todo content)
+    #   MUTED   = tertiary annotations (result summary, progress count)
+    THEME_ACTIVE = "yellow"
+    THEME_SUCCESS = "green"
+    THEME_ERROR = "red"
+    THEME_MARKER = "dim cyan"
+    THEME_HINT = "cyan"
+    THEME_MUTED = "dim"
+
     def __init__(
         self,
         render_markdown: bool = True,
@@ -821,6 +937,10 @@ class TextualTUI(TUIBase):
         self._flushed_parts: list[str] = []  # intermediate LLM text flushed between tool calls
         self._tool_hint: str = ""
         self._last_sep: bool = False
+        self._header_already_rendered: bool = False  # set by pop_stream so add_response skips a second header
+        self._idle_thinking_task: Any = None  # asyncio.Task scheduling the "still thinking" spinner
+        self._turn_start_time: float = 0.0  # monotonic timestamp when the current LLM turn started (stream_start)
+        self._tool_start_time: float = 0.0  # monotonic timestamp when the current tool started (add_progress)
 
         # Callbacks
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
@@ -842,7 +962,6 @@ class TextualTUI(TUIBase):
         self._popup_idx: int = 0
         self._popup_on_select: Callable[[str], Awaitable[None]] | None = None
         self._popup_all_topics: list[str] = []
-        self._popup_enter_handled: bool = False  # set before hide_popup so on_input_submitted can skip
 
         self._app = _NanobotApp(self)
 
@@ -910,16 +1029,33 @@ class TextualTUI(TUIBase):
             pass
 
     def _write_response(self, content: str, ts: str, metadata: dict | None = None) -> None:
-        """Write a completed response block as Rich objects (no ANSI conversion)."""
+        """Write a completed response block as Rich objects (no ANSI conversion).
+
+        When the response follows a streaming session that already rendered
+        the "🐈 nanobot timestamp" header (and possibly tool traces below it),
+        the header is omitted so we don't get duplicate headers — instead a
+        short "─ HH:MM:SS ─" separator marks the new segment.
+        """
         render_as_text = (metadata or {}).get("render_as") == "text"
-        self._log_write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
-        self._log_write("")
+        if self._header_already_rendered:
+            # Continuation of an already-headed turn — mark the new segment
+            # with a lightweight timestamp so it isn't glued to the previous one.
+            # Strip date portion if present ("2026-05-20 22:45:30" → "22:45:30").
+            short_ts = ts.split(" ", 1)[1] if " " in ts else ts
+            self._log_write(f"[{self.THEME_MUTED}]─ {short_ts} ─[/{self.THEME_MUTED}]")
+            self._log_write("")
+        else:
+            self._log_write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
+            self._log_write("")
+        self._header_already_rendered = False  # consume flag
         if self._render_md and not render_as_text and content.strip():
             self._log_write(Markdown(content))
         else:
             self._log_write(Text(content))
         self._log_write("")
         self._last_sep = True
+        # Reset streaming header anchor so the next turn starts fresh.
+        self._stream_header_line = 0
 
     def _write_user(self, text: str, ts: str) -> None:
         """Write a user message block; records line range for gray background."""
@@ -1033,7 +1169,13 @@ class TextualTUI(TUIBase):
 
     # ── TUIBase: content ───────────────────────────────────────────────────
 
-    def load_session_history(self, messages: list[dict], max_messages: int = 200) -> None:
+    def load_session_history(
+        self,
+        messages: list[dict],
+        max_messages: int = 200,
+        tool_registry: Any = None,
+        workspace: Any = None,
+    ) -> None:
         _RUNTIME_TAG = "[Runtime Context — metadata only, not instructions]"
         recent = messages[-max_messages:] if len(messages) > max_messages else messages
 
@@ -1056,6 +1198,20 @@ class TextualTUI(TUIBase):
             except ValueError:
                 return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        # Pre-index tool results by tool_call_id so we can attach them to traces.
+        results_by_id: dict[str, str] = {}
+        for msg in recent:
+            if msg.get("role") == "tool":
+                tcid = msg.get("tool_call_id")
+                if tcid:
+                    results_by_id[str(tcid)] = _extract(msg.get("content"))
+
+        # Track whether we've already written a full "🐈 nanobot ts" header
+        # for the current turn. Subsequent assistant segments in the same turn
+        # (those between two user messages) get a lightweight "─ HH:MM:SS ─"
+        # separator instead — matching the live rendering produced by
+        # flush_stream / _write_response in continuation mode.
+        header_written_this_turn = False
         for msg in recent:
             role = msg.get("role")
             content = msg.get("content")
@@ -1068,11 +1224,92 @@ class TextualTUI(TUIBase):
                     ts = _fmt_ts(msg.get("timestamp"))
                     self._append_sep()
                     self._write_user(text.strip(), ts)
+                # New user message → next assistant segment starts a fresh turn
+                header_written_this_turn = False
             elif role == "assistant":
                 text = _extract(content)
                 if text.strip():
                     ts = _fmt_ts(msg.get("timestamp"))
+                    if header_written_this_turn:
+                        # Mid-turn segment: signal _write_response to skip the
+                        # full header and instead write a "─ HH:MM:SS ─" line.
+                        # _write_response will use the historical ts we pass in.
+                        self._header_already_rendered = True
                     self._write_response(text.strip(), ts)
+                    header_written_this_turn = True
+                # Replay tool calls as static "↳ tool(args)  →  result" traces.
+                for tc in msg.get("tool_calls") or []:
+                    self._replay_tool_trace(tc, results_by_id, tool_registry, workspace)
+
+    def _replay_tool_trace(
+        self,
+        tool_call: dict,
+        results_by_id: dict[str, str],
+        tool_registry: Any = None,
+        workspace: Any = None,
+    ) -> None:
+        """Render a single historical tool call as a static trace line during
+        load_session_history. Mirrors the live look of _render_tool_trace.
+        """
+        from rich.text import Text as _RText
+        import json as _json
+
+        try:
+            fn = tool_call.get("function") or {}
+            name = fn.get("name") or tool_call.get("name") or "tool"
+            raw_args = fn.get("arguments")
+            args: dict = {}
+            if isinstance(raw_args, str):
+                try:
+                    parsed = _json.loads(raw_args)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                except Exception:
+                    pass
+            elif isinstance(raw_args, dict):
+                args = raw_args
+
+            # Build the hint using the same logic as live traces (including
+            # path relativization to the workspace).
+            from nanobot.agent.loop import format_tool_hint
+            tc_like = type("TC", (), {"name": name, "arguments": args})()
+            hint = format_tool_hint([tc_like], workspace=workspace)
+
+            # Pair with the tool result (if present) and try to produce the
+            # same structured summary the live UI shows. Falls back to a raw
+            # preview if no registry is available or the tool has no summarizer.
+            tcid = str(tool_call.get("id") or "")
+            result_text = results_by_id.get(tcid, "")
+            summary = ""
+            if result_text:
+                tool = tool_registry.get(name) if tool_registry is not None else None
+                if tool is not None:
+                    from nanobot.agent.tools.summaries import summarize_tool_result
+                    summary = summarize_tool_result(tool, args, result_text)
+                if not summary:
+                    preview = result_text.replace("\n", " ").strip()
+                    # Match extract_error_summary's 120-char budget so replayed
+                    # raw-preview summaries don't look weirdly short next to
+                    # the live structured summaries.
+                    if len(preview) > 120:
+                        preview = preview[:119] + "…"
+                    summary = preview
+
+            line = _RText()
+            line.append(self._TOOL_INDENT, style="")
+            line.append(f"{self._TOOL_MARKER} ", style=self.THEME_MARKER)
+            line.append(hint, style=self.THEME_HINT)
+            if summary:
+                tail_style = self.THEME_ERROR if summary.startswith("Error") else self.THEME_MUTED
+                line.append("  →  ", style=self.THEME_MUTED)
+                line.append(summary, style=tail_style)
+            try:
+                out = self._app.query_one("#output", _OutputLog)
+                out.write(line)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def add_user_echo(self, text: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1089,17 +1326,24 @@ class TextualTUI(TUIBase):
         self._write_response(content, ts, metadata)
 
     def add_progress(self, text: str) -> None:
+        import time
         self._tool_hint = text
+        # Mark tool start so add_tool_result can show "[+Ns]" elapsed.
+        self._tool_start_time = time.monotonic()
         self._app.call_later(self._update_progress_line, text)
 
     def _update_progress_line(self, text: str) -> None:
         """Overwrite the executing placeholder line with the tool name (runs in Textual context)."""
+        self._render_placeholder_line(f"⠋ {text}", "dim")
+
+    def _render_placeholder_line(self, content: str, style: str) -> None:
+        """Render `content` into the placeholder line at _tool_placeholder_line."""
         try:
             from rich.segment import Segment as _Seg
             out = self._app.query_one("#output", _OutputLog)
             idx = self._tool_placeholder_line
             if 0 <= idx < len(out.lines):
-                rt = Text(f"⠋ {text}", style="dim")
+                rt = Text(content, style=style)
                 width = max(out.scrollable_content_region.width, out.min_width)
                 console = out.app.console
                 segs = list(console.render(rt, console.options.update_width(width)))
@@ -1114,6 +1358,119 @@ class TextualTUI(TUIBase):
         except Exception:
             pass
 
+    # Visual style for petrified tool traces. 4-space indent separates them
+    # clearly from LLM text; cyan for the call, dim/red for the result tail.
+    _TOOL_INDENT = "    "
+    _TOOL_MARKER = "↳"
+
+    def _render_tool_trace(
+        self, hint: str, summary: str = "", elapsed: float | None = None,
+    ) -> None:
+        """Render the current placeholder as a static "↳ tool(args)" trace
+        plus optional " → summary" tail and " [+Ns]" elapsed badge.
+
+        Color: THEME_ERROR for Error summaries, THEME_MUTED otherwise.
+        Elapsed is only shown when ``>= 1s`` so quick tools don't get a
+        noisy "[+0s]" badge.
+        """
+        from rich.text import Text as _RText
+        line = _RText()
+        line.append(self._TOOL_INDENT, style="")
+        line.append(f"{self._TOOL_MARKER} ", style=self.THEME_MARKER)
+        line.append(hint, style=self.THEME_HINT)
+        if summary:
+            tail_style = self.THEME_ERROR if summary.startswith("Error") else self.THEME_MUTED
+            line.append("  →  ", style=self.THEME_MUTED)
+            line.append(summary, style=tail_style)
+        if elapsed is not None and elapsed >= 1:
+            line.append(f"  [+{int(elapsed)}s]", style=self.THEME_MUTED)
+        self._render_placeholder_text(line)
+
+    def _render_placeholder_text(self, rt) -> None:
+        """Like _render_placeholder_line but accepts a pre-built Text object."""
+        try:
+            from rich.segment import Segment as _Seg
+            out = self._app.query_one("#output", _OutputLog)
+            idx = self._tool_placeholder_line
+            if 0 <= idx < len(out.lines):
+                width = max(out.scrollable_content_region.width, out.min_width)
+                console = out.app.console
+                segs = list(console.render(rt, console.options.update_width(width)))
+                line_segs = list(_Seg.split_lines(segs))
+                if line_segs:
+                    new_strip = Strip.from_lines(line_segs)[0].adjust_cell_length(width)
+                else:
+                    new_strip = Strip.blank(width)
+                out.lines[idx] = new_strip
+                out._line_cache.clear()
+                out.refresh()
+        except Exception:
+            pass
+
+    def _petrify_tool_placeholder(self) -> None:
+        """Convert the current "⠋ tool_name" spinner line into a static
+        "↳ tool_name" trace (with elapsed badge), and advance the placeholder
+        cursor so subsequent streaming / tool_phase_start operations append
+        below it rather than overwriting the trace.
+
+        Called at every transition out of the tool-executing state: the start
+        of the next LLM streaming chunk (stream_delta) and the start of the
+        next tool phase (tool_phase_start). Idempotent — does nothing if no
+        tool hint is currently shown.
+        """
+        if not self._tool_hint:
+            return
+        import time
+        elapsed = (
+            time.monotonic() - self._tool_start_time
+            if self._tool_start_time else None
+        )
+        try:
+            self._render_tool_trace(self._tool_hint, "", elapsed)
+            self._tool_placeholder_line += 1
+            self._last_content_start = self._tool_placeholder_line
+        except Exception:
+            pass
+        self._tool_hint = ""
+
+    def add_tool_result(self, summary: str) -> None:
+        """Petrify the current spinner placeholder into a static trace, optionally
+        appending a result summary (e.g. '↳ exec(cmd)  →  exit 0, 12 lines').
+
+        Called once per tool batch — even when summary is empty (so tools that
+        don't define summarize_result still get their trace line frozen
+        immediately on completion, instead of relying on the next operation
+        to petrify them).
+
+        After petrifying, schedule an idle "thinking..." spinner so the gap
+        between tool completion and the next LLM action (which can be many
+        seconds of reasoning) doesn't look like the UI hung.
+        """
+        if not self._tool_hint:
+            return
+        # The tool spinner was animating on the placeholder; stop it before
+        # we rewrite that line as a static trace.
+        try:
+            self._app.stop_thinking_spinner()
+        except Exception:
+            pass
+        import time
+        elapsed = (
+            time.monotonic() - self._tool_start_time
+            if self._tool_start_time else None
+        )
+        try:
+            # summary may be "" — _render_tool_trace just skips the tail.
+            self._render_tool_trace(self._tool_hint, summary, elapsed)
+            self._tool_placeholder_line += 1
+            self._last_content_start = self._tool_placeholder_line
+        except Exception:
+            pass
+        self._tool_hint = ""
+        # If the LLM stays silent for >500ms after the tool finishes, show
+        # a "thinking..." spinner in #live so the user knows we're waiting.
+        self._schedule_idle_thinking()
+
     def add_system(self, text: str) -> None:
         self._log_write(f"[dim]{text}[/dim]")
         self._last_sep = False
@@ -1121,9 +1478,14 @@ class TextualTUI(TUIBase):
     # ── TUIBase: streaming ─────────────────────────────────────────────────
 
     def stream_start(self) -> None:
+        import time
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
         self._flushed_parts = []
+        # Anchor the "thinking time" displayed by spinners to the moment the
+        # turn began — not to each individual spinner restart. This keeps the
+        # elapsed counter continuous across idle gaps + tool calls.
+        self._turn_start_time = time.monotonic()
         # Write header + thinking placeholder directly into #output so the
         # animation is inside the message area, not in the separate #live strip.
         try:
@@ -1141,6 +1503,11 @@ class TextualTUI(TUIBase):
         self._app.start_thinking_spinner()
 
     def tool_phase_start(self) -> None:
+        self._cancel_idle_thinking()
+        # Petrify the previous tool's spinner line into a static "→ tool" trace
+        # before starting a new one, so chained tool calls stay visible.
+        self._petrify_tool_placeholder()
+
         self._stream_buf = ""
         if not self._stream_ts:
             self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1164,10 +1531,56 @@ class TextualTUI(TUIBase):
         # (active_app ContextVar must be set, otherwise set_interval's task silently crashes)
         self._app.call_later(self._app.start_thinking_spinner)
 
+    def _cancel_idle_thinking(self) -> None:
+        """Stop any pending idle-thinking spinner task."""
+        task = self._idle_thinking_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._idle_thinking_task = None
+        # Also stop any spinner that the idle task already started.
+        try:
+            self._app.stop_spinner()
+            self._app.clear_live()
+        except Exception:
+            pass
+
+    def _schedule_idle_thinking(self, delay: float = 0.5) -> None:
+        """Schedule a "still thinking..." spinner in #live after ``delay`` seconds
+        of no further stream_delta. Provides UX feedback during LLM reasoning
+        gaps where no tokens are being emitted (e.g. reasoning_content phase).
+
+        Cancelled by the next stream_delta, tool_phase_start, flush_stream, or
+        pop_stream — whichever comes first.
+        """
+        self._cancel_idle_thinking()
+
+        async def _wait_then_show() -> None:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            try:
+                # start_spinner draws into #live (not #output), so it doesn't
+                # disturb already-rendered streaming content or tool traces.
+                self._app.start_spinner(tool=False)
+            except Exception:
+                pass
+
+        try:
+            self._idle_thinking_task = asyncio.ensure_future(_wait_then_show())
+        except RuntimeError:
+            self._idle_thinking_task = None
+
     def stream_delta(self, delta: str) -> None:
+        self._cancel_idle_thinking()
         self._app.stop_thinking_spinner()
         self._app.stop_spinner()
         self._app.clear_live()
+        # First delta after a tool call: petrify the tool placeholder so the
+        # previous "⠋ tool_name" line becomes a static "→ tool_name" trace
+        # before this new text starts overwriting at _tool_placeholder_line.
+        if self._tool_hint:
+            self._petrify_tool_placeholder()
         self._stream_buf += delta
         try:
             out = self._app.query_one("#output", _OutputLog)
@@ -1181,8 +1594,12 @@ class TextualTUI(TUIBase):
                 out.write(Text(self._stream_buf))
         except Exception:
             pass
+        # If no further delta arrives in the next 500ms, show a "still thinking"
+        # spinner in #live so the user sees feedback during LLM reasoning gaps.
+        self._schedule_idle_thinking()
 
     def flush_stream(self, metadata: dict | None = None) -> None:
+        self._cancel_idle_thinking()
         self._app.stop_thinking_spinner()
         self._app.stop_spinner()
         self._app.clear_live()
@@ -1194,6 +1611,13 @@ class TextualTUI(TUIBase):
                 self._last_content_start = self._tool_placeholder_line
                 # Replace streaming content (including any placeholder) with final rendered version
                 out.truncate_to(self._tool_placeholder_line)
+                # For mid-turn segments (not the first one), prefix a lightweight
+                # timestamp separator so the user can tell distinct LLM segments
+                # apart instead of seeing one giant blob.
+                if self._flushed_parts:
+                    now_ts = datetime.now().strftime("%H:%M:%S")
+                    out.write(Text(f"─ {now_ts} ─", style=self.THEME_MUTED))
+                    out.write("")
                 if self._render_md and not render_as_text:
                     out.write(Markdown(self._stream_buf))
                 else:
@@ -1217,26 +1641,37 @@ class TextualTUI(TUIBase):
         self._stream_ts = ""
 
     def pop_stream(self) -> str:
+        self._cancel_idle_thinking()
         self._app.stop_thinking_spinner()
         self._app.stop_spinner()
         buf = self._stream_buf
         self._stream_buf = ""
+        ts_was = self._stream_ts
         self._stream_ts = ""
         self._app.clear_live()
-        # Remove the streaming block (header + content) so add_response can
-        # write a clean final version without duplicating content.
+        # Truncate only the *current* streaming chunk (from _tool_placeholder_line
+        # onward) — earlier tool traces and the header stay visible. Then mark
+        # that the header is already on screen so add_response doesn't write it
+        # again.
         try:
             out = self._app.query_one("#output", _OutputLog)
-            out.truncate_to(self._stream_header_line)
+            out.truncate_to(self._tool_placeholder_line)
         except Exception:
             pass
+        # If the streaming session was active, signal add_response to skip
+        # the header (we keep the original one written by stream_start).
+        self._header_already_rendered = bool(ts_was) or self._stream_header_line > 0
         return buf
 
     def flush_accumulator(self) -> str:
-        """Return and clear all intermediate LLM text flushed between tool calls."""
-        parts = [p for p in self._flushed_parts if p]
+        """Intermediate LLM text was already written to output by flush_stream
+        and is preserved by the new pop_stream (which only truncates the
+        current streaming chunk). So returning the accumulated parts here
+        would make add_response write them a second time. Return empty and
+        just drain the buffer.
+        """
         self._flushed_parts = []
-        return "\n\n".join(parts)
+        return ""
 
     # ── TUIBase: state ─────────────────────────────────────────────────────
 
@@ -1260,6 +1695,28 @@ class TextualTUI(TUIBase):
         self._ctx_total = total
         self._update_status()
 
+    def set_todos(self, todos: list[dict]) -> None:
+        if not todos:
+            self._app.update_todo_bar("")
+            return
+        total = len(todos)
+        done = sum(1 for t in todos if t.get("status") == "completed")
+        active = next((t for t in todos if t.get("status") == "in_progress"), None)
+        active_c, muted_c, success_c = self.THEME_ACTIVE, self.THEME_MUTED, self.THEME_SUCCESS
+        if active:
+            content = (active.get("content") or "").strip()
+            text = (
+                f"[{active_c}]⚡[/{active_c}] [{muted_c}]{content}[/{muted_c}]"
+                f" [{muted_c}]({done}/{total})[/{muted_c}]"
+            )
+        else:
+            remaining = total - done
+            if remaining > 0:
+                text = f"[{muted_c}]☐ {remaining} pending · {done}/{total} done[/{muted_c}]"
+            else:
+                text = f"[{success_c}]✓[/{success_c}] [{muted_c}]all {total} done[/{muted_c}]"
+        self._app.update_todo_bar(text)
+
     def reset_history(self) -> None:
         self._app.stop_spinner()
         self._app.clear_output()
@@ -1276,6 +1733,9 @@ class TextualTUI(TUIBase):
     def enter_new_topic_mode(self, callback: Callable[[str], Awaitable[None]]) -> None:
         self._input_mode = "new_topic"
         self._new_topic_cb = callback
+        # Clear any residual command/topic popup state so Enter routes to new_topic submit
+        if self._popup_mode != "hidden":
+            self.hide_popup()
         self._app.set_input_placeholder("话题名: ")
         self._app.set_input_value("")
 

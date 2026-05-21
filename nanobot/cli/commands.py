@@ -928,7 +928,12 @@ def agent(
                 """Load session history and context estimate for the given topic."""
                 s = agent_loop.sessions.get_or_create(f"{cli_channel}:{name}")
                 tui.set_topic(name)
-                tui.load_session_history(s.messages)
+                tui.load_session_history(
+                    s.messages,
+                    tool_registry=agent_loop.tools,
+                    workspace=agent_loop.workspace,
+                )
+                tui.set_todos(s.todos)
                 if agent_loop.context_window_tokens:
                     try:
                         ctx_est, _ = agent_loop.memory_consolidator.estimate_session_prompt_tokens(s)
@@ -939,6 +944,7 @@ def agent(
             tui.set_commands([
                 ("/new", "新建话题"),
                 ("/resume", "切换/恢复话题"),
+                ("/todos", "查看当前话题的 todo 列表"),
                 ("/exit", "退出 nanobot"),
             ])
 
@@ -1012,6 +1018,19 @@ def agent(
                 _turn_cancelled[0] = False
                 is_processing = True
                 tui.set_is_processing(True)
+                # If the previous task finished and all todos are completed,
+                # auto-clear them so the bar resets for the new task rather
+                # than carrying a stale "✓ all N done" badge across turns.
+                try:
+                    s = agent_loop.sessions.get_or_create(
+                        f"{cli_channel}:{topic_state['chat_id']}"
+                    )
+                    if s.todos and all(t.get("status") == "completed" for t in s.todos):
+                        s.todos = []
+                        agent_loop.sessions.save(s)
+                        tui.set_todos([])
+                except Exception:
+                    pass
                 if _pre_submitted[0]:
                     _pre_submitted[0] = False
                 else:
@@ -1040,6 +1059,13 @@ def agent(
                         + usage.get("cache_read_input_tokens", 0)
                     )
                     tui.update_context_usage(ctx_used, agent_loop.context_window_tokens)
+                # Refresh the todo bar (diff messages are pushed live by TodoWriteTool
+                # via the bus, not aggregated here).
+                try:
+                    s = agent_loop.sessions.get_or_create(f"{cli_channel}:{topic_state['chat_id']}")
+                    tui.set_todos(s.todos)
+                except Exception:
+                    pass
                 if pending_queue:
                     await _send_message(pending_queue.pop(0))
 
@@ -1074,6 +1100,27 @@ def agent(
                             await _switch_topic(name)
                             tui.add_system(f"已创建并切换到话题: {name}")
                         tui.enter_new_topic_mode(_confirm_new_topic_cmd)
+                    return
+
+                if text == "/todos" or text.startswith("/todos "):
+                    from nanobot.agent.tools.todo import format_todos
+                    arg = text[len("/todos"):].strip()
+                    s = agent_loop.sessions.get_or_create(
+                        f"{cli_channel}:{topic_state['chat_id']}"
+                    )
+                    if arg == "clear":
+                        s.todos = []
+                        agent_loop.sessions.save(s)
+                        tui.set_todos([])
+                        tui.add_system("已清空当前话题的 todo 列表。")
+                        return
+                    if not s.todos:
+                        tui.add_system("当前话题暂无 todo。")
+                        return
+                    total = len(s.todos)
+                    done = sum(1 for t in s.todos if t.get("status") == "completed")
+                    header = f"Todos ({done}/{total}):"
+                    tui.add_system(f"{header}\n{format_todos(s.todos)}")
                     return
 
                 if text.startswith("/resume"):
@@ -1151,7 +1198,25 @@ def agent(
 
                         if msg.metadata.get("_progress"):
                             if msg.content and not _turn_cancelled[0]:
-                                tui.add_progress(msg.content)
+                                if msg.metadata.get("_tool_result"):
+                                    tui.add_tool_result(msg.content)
+                                else:
+                                    tui.add_progress(msg.content)
+                            continue
+
+                        # Live system message (e.g. todo diff pushed by TodoWriteTool).
+                        # Must be displayed mid-turn, not aggregated into the final reply.
+                        if msg.metadata.get("_system_message"):
+                            if msg.content:
+                                tui.add_system(msg.content)
+                            # Also refresh the bar in case todos changed.
+                            try:
+                                s = agent_loop.sessions.get_or_create(
+                                    f"{cli_channel}:{topic_state['chat_id']}"
+                                )
+                                tui.set_todos(s.todos)
+                            except Exception:
+                                pass
                             continue
 
                         # Non-streaming response (or unsolicited push from cron etc.)

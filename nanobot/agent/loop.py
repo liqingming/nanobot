@@ -33,6 +33,7 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.todo import TodoWriteTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -43,6 +44,105 @@ from nanobot.session.manager import Session, SessionManager
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
     from nanobot.cron.service import CronService
+
+
+_HINT_KEY_PRIORITY: tuple[str, ...] = (
+    "path", "file_path", "filepath", "file",
+    "url", "command", "cmd",
+    "query", "q",
+    "symbol", "name", "topic", "content",
+)
+_HINT_PATH_KEYS: tuple[str, ...] = ("path", "file_path", "filepath", "file")
+
+
+def relativize_path(value: str, workspace: Any) -> str:
+    """If ``value`` is an absolute path inside ``workspace``, return its
+    workspace-relative form prefixed with ``./`` so users can tell at a
+    glance that it's relative; otherwise return it unchanged.
+
+    Best-effort — any exception falls back to the original string.
+    """
+    if not value or workspace is None:
+        return value
+    try:
+        from pathlib import Path
+        p = Path(value)
+        if not p.is_absolute():
+            return value
+        ws = Path(workspace).resolve()
+        try:
+            rel = p.resolve().relative_to(ws)
+        except ValueError:
+            return value
+        rel_str = str(rel)
+        if rel_str == ".":
+            return value
+        # Normalize Windows backslashes to forward slashes for the trace
+        # display so paths don't carry the noisy "./src\foo\bar.py" mix.
+        rel_str = rel_str.replace("\\", "/")
+        return f"./{rel_str}"
+    except Exception:
+        return value
+
+
+def _smart_truncate(text: str, max_len: int = 40) -> str:
+    """Shorten ``text`` to roughly ``max_len`` chars.
+
+    For path-like strings (containing ``/`` or ``\\``), preserves both the
+    leading segment and the trailing filename so users can still see what
+    file is being touched:
+
+        "./very/deep/nested/path/to/some_long_file.py"
+        → "./very/deep/n…/some_long_file.py"
+
+    For non-path strings, falls back to leading truncation.
+    """
+    if len(text) <= max_len:
+        return text
+    if "/" in text or "\\" in text:
+        # Reserve 1 char for "…"; split remainder ~40% head / 60% tail so
+        # the filename at the end stays visible.
+        tail_len = max(int((max_len - 1) * 0.6), 1)
+        head_len = max(max_len - 1 - tail_len, 1)
+        return text[:head_len] + "…" + text[-tail_len:]
+    return text[: max_len - 1] + "…"
+
+
+def format_tool_hint(tool_calls: list, *, workspace: Any = None) -> str:
+    """Build a concise "tool(arg)" hint string for a list of tool calls.
+
+    Picks the most identifying argument (path/url/query/...) per call using
+    ``_HINT_KEY_PRIORITY``. Path-like arguments are shortened to a
+    workspace-relative form when applicable.
+    """
+    def _fmt(tc) -> str:
+        args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
+        if not isinstance(args, dict):
+            return tc.name
+        val: str | None = None
+        chosen_key: str | None = None
+        for key in _HINT_KEY_PRIORITY:
+            candidate = args.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                val = candidate
+                chosen_key = key
+                break
+        if val is None:
+            val = next(
+                (v for v in args.values() if isinstance(v, str) and v.strip()),
+                None,
+            )
+        if not isinstance(val, str):
+            return tc.name
+        if chosen_key in _HINT_PATH_KEYS:
+            val = relativize_path(val, workspace)
+            # Normalize backslashes to forward slashes for visual consistency
+            # in the trace (also covers absolute Windows paths outside the
+            # workspace that relativize_path leaves untouched).
+            val = val.replace("\\", "/")
+        return f'{tc.name}("{_smart_truncate(val)}")'
+
+    return ", ".join(_fmt(tc) for tc in tool_calls)
 
 
 class _LoopHook(AgentHook):
@@ -105,6 +205,29 @@ class _LoopHook(AgentHook):
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
         self._loop._set_tool_context(self._channel, self._chat_id, self._message_id)
 
+    async def after_execute_tools(self, context: AgentHookContext) -> None:
+        if not self._on_progress:
+            return
+        # Build per-call summaries paired with their tool calls so the UI can
+        # turn the spinner placeholder into a "↳ tool(args) → result" trace.
+        # We always emit (even when no tool produced a summary) so the TUI
+        # petrifies the placeholder *now* — otherwise tools without a
+        # summarize_result (e.g. todo_write) would only get petrified when
+        # the next tool starts, and disappear entirely if the LLM ends
+        # the turn right after them.
+        from nanobot.agent.tools.summaries import summarize_tool_result
+        parts: list[str] = []
+        for tc, result in zip(context.tool_calls, context.tool_results):
+            tool = self._loop.tools.get(tc.name)
+            summary = summarize_tool_result(tool, tc.arguments, result)
+            if summary:
+                parts.append(summary)
+        joined = " · ".join(parts)  # may be empty — that's fine
+        try:
+            await self._on_progress(joined, tool_hint=True, tool_result=True)
+        except TypeError:
+            await self._on_progress(joined, tool_hint=True)
+
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         return self._loop._strip_think(content)
 
@@ -140,6 +263,10 @@ class _LoopHookChain(AgentHook):
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         await self._primary.before_execute_tools(context)
         await self._extras.before_execute_tools(context)
+
+    async def after_execute_tools(self, context: AgentHookContext) -> None:
+        await self._primary.after_execute_tools(context)
+        await self._extras.after_execute_tools(context)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         await self._primary.after_iteration(context)
@@ -275,6 +402,7 @@ class AgentLoop:
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(TodoWriteTool(sessions=self.sessions, bus=self.bus))
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
@@ -304,7 +432,7 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "todo_write"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
@@ -331,16 +459,23 @@ class AgentLoop:
         from nanobot.utils.helpers import strip_think
         return strip_think(text) or None
 
-    @staticmethod
-    def _tool_hint(tool_calls: list) -> str:
-        """Format tool calls as concise hint, e.g. 'web_search("query")'."""
-        def _fmt(tc):
-            args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
-            val = next(iter(args.values()), None) if isinstance(args, dict) else None
-            if not isinstance(val, str):
-                return tc.name
-            return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
-        return ", ".join(_fmt(tc) for tc in tool_calls)
+    # Argument keys that identify *what* a tool is acting on. Listed in
+    # priority order: when a tool call has multiple args, the hint shows the
+    # one most useful for the user (e.g. for write_file we want the path,
+    # not the file content). Fallback: first string value in the dict.
+    _HINT_KEY_PRIORITY = (
+        "path", "file_path", "filepath", "file",
+        "url", "command", "cmd",
+        "query", "q",
+        "symbol", "name", "topic", "content",
+    )
+    _HINT_PATH_KEYS = ("path", "file_path", "filepath", "file")
+
+    def _tool_hint(self, tool_calls: list) -> str:
+        """Format tool calls as concise hint, e.g. 'web_search("query")'.
+        Paths inside the workspace are shown relative; otherwise absolute.
+        """
+        return format_tool_hint(tool_calls, workspace=self.workspace)
 
     # ── learning context helpers ────────────────────────────────────────
 
@@ -610,6 +745,7 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
                 session_key=key,
+                todos=session.todos,
             )
             final_content, _, all_msgs, _ = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
@@ -651,12 +787,17 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
             learning_ctx=learning_ctx,
             session_key=key,
+            todos=session.todos,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+        async def _bus_progress(
+            content: str, *, tool_hint: bool = False, tool_result: bool = False,
+        ) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
+            if tool_result:
+                meta["_tool_result"] = True
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))

@@ -66,6 +66,16 @@ class Tool(ABC):
         """
         pass
 
+    def summarize_result(self, args: dict[str, Any], result: Any) -> str:
+        """Return a one-line summary of the tool's result, shown in the TUI
+        next to the tool trace (e.g. "exit 0, 12 lines").
+
+        Return ``""`` to skip — the UI will only show "↳ tool(args)" without
+        a result tail. Default returns ``""``; tools override to add value.
+        Implementations must never raise (UI uses best-effort dispatch).
+        """
+        return ""
+
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Apply safe schema-driven casts before validation."""
         schema = self.parameters or {}

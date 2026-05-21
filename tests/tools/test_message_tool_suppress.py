@@ -113,6 +113,9 @@ class TestMessageToolSuppressLogic:
         assert progress == [
             ("Visible", False),
             ('read_file("foo.txt")', True),
+            # After-tools hook also emits a result summary for read_file:
+            # result="ok" → "1 line, 2 chars"
+            ("1 line, 2 chars", True),
         ]
 
 

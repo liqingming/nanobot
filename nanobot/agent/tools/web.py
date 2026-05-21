@@ -214,6 +214,19 @@ class WebSearchTool(Tool):
             logger.warning("DuckDuckGo search failed: {}", e)
             return f"Error: DuckDuckGo search failed ({e})"
 
+    def summarize_result(self, args: dict[str, Any], result: Any) -> str:
+        from nanobot.agent.tools.summaries import extract_error_summary
+        if not isinstance(result, str):
+            return ""
+        if result.startswith("Error"):
+            return extract_error_summary(result)
+        if result.startswith("No results"):
+            return "no results"
+        # Count numbered list entries: "1. ", "2. ", etc.
+        import re as _re
+        n = len(_re.findall(r"^\d+\.\s", result, _re.MULTILINE))
+        return f"{n} result{'s' if n != 1 else ''}"
+
 
 class WebFetchTool(Tool):
     """Fetch and extract content from a URL."""
@@ -348,6 +361,36 @@ class WebFetchTool(Tool):
         except Exception as e:
             logger.error("WebFetch error for {}: {}", url, e)
             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
+
+    def summarize_result(self, args: dict[str, Any], result: Any) -> str:
+        from nanobot.agent.tools.summaries import extract_error_summary, line_count
+        if not isinstance(result, str):
+            return ""
+        # WebFetchTool returns a JSON string; extract status + text length.
+        try:
+            import json as _json
+            data = _json.loads(result)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            if "error" in data:
+                return extract_error_summary(str(data.get("error", "error")))
+            length = data.get("length")
+            status = data.get("status")
+            truncated = data.get("truncated")
+            parts = []
+            if status is not None:
+                parts.append(f"HTTP {status}")
+            if length is not None:
+                parts.append(f"{length} chars")
+            if truncated:
+                parts.append("truncated")
+            return ", ".join(parts) if parts else "fetched"
+        # Fallback for non-JSON content (older paths)
+        if result.startswith("Error"):
+            return extract_error_summary(result)
+        n = line_count(result)
+        return f"{n} line{'s' if n != 1 else ''}, {len(result)} chars"
 
     def _to_markdown(self, html_content: str) -> str:
         """Convert HTML to markdown."""

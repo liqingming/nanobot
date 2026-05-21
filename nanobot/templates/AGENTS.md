@@ -18,9 +18,39 @@ When the user explicitly specifies a target file path (e.g., "写入这个文件
 - Do NOT ask "需要写回原文件吗" — the user already told you where to write.
 - The user's intent is the final destination. Honor it immediately.
 
-## Multi-Step Plans (Plan Tree)
+## In-Session Tasks (`todo_write`)
 
-Any complex, phased task — learning plans, step-by-step refactors, feature rollouts, investigations, etc. — is tracked as a Plan Tree in MEMORY.md.
+会话内的多步任务用 `todo_write` 工具跟踪。该工具维护一个结构化 todo 列表，自动注入 system prompt 顶部，重启后从 session 文件恢复。
+
+### When to use `todo_write` vs Plan Tree
+
+| 场景 | 用 `todo_write` | 用 Plan Tree (MEMORY.md) |
+|------|----------------|-------------------------|
+| 持续时长 | 单次会话内（数小时） | 跨会话、跨天/周 |
+| 步骤数 | 3–20 步 | 任意（含子步骤） |
+| 暂停-恢复语义 | 不需要 | 需要（明确暂停某计划恢复另一个） |
+| 与外部权威文件对齐 | 不需要 | 可能（`> 来源:`） |
+| 子步骤嵌套 | 不支持 | 支持递归子步骤 |
+
+**经验法则**：默认用 `todo_write`；只有当任务跨会话、需暂停恢复、有外部来源结构、或有嵌套子步骤时才升级到 Plan Tree。两者可并存——长期 Plan Tree 下，每次执行某一大步骤时用 `todo_write` 拆出当前会话的小步骤。
+
+### `todo_write` 调用规则
+
+- **全量覆盖**：每次调用都要传完整 items 列表，不是增量。
+- **状态值**：`pending` / `in_progress` / `completed`。
+- **At most one `in_progress`**：同一时刻最多一个项处于 `in_progress`，代码强制校验。
+- **每完成一步立即更新**：不要批量。开始下一步前先把上一步标 `completed`、新一步标 `in_progress`。
+- **失败处理**：步骤失败时**不自动标 completed**，向用户报告失败原因，询问：重试 / 跳过 / 取消。
+- **清空**：传 `items=[]` 清空列表。
+
+### When to Create a Todo List
+
+**应建**：任务有 ≥3 个有序步骤 / 需跨多轮完成 / 用户明确要求"列出步骤"
+**不建**：一次性任务 / ≤2 步且当轮可完成 / 纯查询
+
+## Cross-Session Plans (Plan Tree)
+
+跨会话的长期、阶段性任务 — 学习计划、跨周重构、feature rollout、investigations — 用 Plan Tree 记到 MEMORY.md。当任务仅在单次会话内完成时，**优先用 `todo_write`**（见上节）。
 
 ### Format
 

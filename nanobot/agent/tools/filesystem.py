@@ -149,6 +149,15 @@ class ReadFileTool(_FsTool):
         except Exception as e:
             return f"Error reading file: {e}"
 
+    def summarize_result(self, args: dict[str, Any], result: Any) -> str:
+        from nanobot.agent.tools.summaries import extract_error_summary, line_count
+        if not isinstance(result, str):
+            return ""
+        if result.startswith("Error"):
+            return extract_error_summary(result)
+        n = line_count(result)
+        return f"{n} line{'s' if n != 1 else ''}, {len(result)} chars"
+
 
 # ---------------------------------------------------------------------------
 # write_file
@@ -196,6 +205,9 @@ class WriteFileTool(_FsTool):
         except Exception as e:
             return f"Error writing file: {e}"
 
+    def summarize_result(self, args: dict[str, Any], result: Any) -> str:
+        return _summarize_write_or_edit(args, result)
+
 
 # ---------------------------------------------------------------------------
 # edit_file
@@ -225,6 +237,21 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
     if candidates:
         return candidates[0], len(candidates)
     return None, 0
+
+
+def _summarize_write_or_edit(args: dict[str, Any], result: Any) -> str:
+    """Shared summarizer for WriteFileTool / EditFileTool — both report success
+    based on input content size (the tools' result string is just confirmation)."""
+    from nanobot.agent.tools.summaries import extract_error_summary, line_count
+    if not isinstance(result, str):
+        return ""
+    if result.startswith("Error"):
+        return extract_error_summary(result)
+    content = args.get("content") if isinstance(args, dict) else None
+    if isinstance(content, str):
+        lines = line_count(content)
+        return f"wrote {lines} line{'s' if lines != 1 else ''}, {len(content)} chars"
+    return "wrote"
 
 
 class EditFileTool(_FsTool):
@@ -299,6 +326,21 @@ class EditFileTool(_FsTool):
             return f"Error: {e}"
         except Exception as e:
             return f"Error editing file: {e}"
+
+    def summarize_result(self, args: dict[str, Any], result: Any) -> str:
+        from nanobot.agent.tools.summaries import extract_error_summary, line_count
+        if not isinstance(result, str):
+            return ""
+        if result.startswith("Error"):
+            return extract_error_summary(result)
+        # EditFileTool replaces old_text with new_string; report delta.
+        old = args.get("old_string", "") if isinstance(args, dict) else ""
+        new = args.get("new_string", "") if isinstance(args, dict) else ""
+        if isinstance(old, str) and isinstance(new, str):
+            delta = line_count(new) - line_count(old)
+            sign = "+" if delta > 0 else ""
+            return f"edited ({sign}{delta} line{'s' if abs(delta) != 1 else ''})"
+        return "edited"
 
     @staticmethod
     def _not_found_msg(old_text: str, content: str, path: str) -> str:
@@ -413,3 +455,13 @@ class ListDirTool(_FsTool):
             return f"Error: {e}"
         except Exception as e:
             return f"Error listing directory: {e}"
+
+    def summarize_result(self, args: dict[str, Any], result: Any) -> str:
+        from nanobot.agent.tools.summaries import extract_error_summary
+        if not isinstance(result, str):
+            return ""
+        if result.startswith("Error"):
+            return extract_error_summary(result)
+        # Each non-empty line = one entry (the "📁 / 📄 " prefix lines)
+        n = sum(1 for line in result.split("\n") if line.strip().startswith(("📁", "📄")))
+        return f"{n} entr{'ies' if n != 1 else 'y'}"

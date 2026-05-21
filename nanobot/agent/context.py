@@ -37,6 +37,7 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         include_learning_rules: bool = False,
         session_key: str | None = None,
+        todos: list[dict[str, Any]] | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity(session_key)]
@@ -54,6 +55,10 @@ class ContextBuilder:
             mem_parts.append(f"### Topic Memory\n{topic_mem}")
         if mem_parts:
             parts.append("# Memory\n\n" + "\n\n".join(mem_parts))
+
+        if todos:
+            from nanobot.agent.tools.todo import format_todos
+            parts.append("# Active Todos\n\n" + format_todos(todos))
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -172,6 +177,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         current_role: str = "user",
         learning_ctx: str | None = None,
         session_key: str | None = None,
+        todos: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
@@ -190,6 +196,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
                 skill_names,
                 include_learning_rules=(learning_ctx is not None),
                 session_key=session_key,
+                todos=todos,
             )},
             *history,
             {"role": current_role, "content": merged},

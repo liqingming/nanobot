@@ -60,6 +60,13 @@ from rich.text import Text
 
 from nanobot import __logo__, __version__
 from nanobot.cli.tui_base import TUIBase
+from nanobot.cli.tui_keys import (
+    EnterAction,
+    PopupAction,
+    TUIState,
+    decide_enter_action,
+    decide_popup_key,
+)
 
 
 def _ansi_width() -> int:
@@ -350,8 +357,20 @@ class PromptTUI(TUIBase):
             )
         return ""
 
-    def load_session_history(self, messages: list[dict], max_messages: int = 200) -> None:
-        """Render prior session messages into the output pane on startup."""
+    def load_session_history(
+        self,
+        messages: list[dict],
+        max_messages: int = 200,
+        tool_registry: Any = None,
+        workspace: Any = None,
+    ) -> None:
+        """Render prior session messages into the output pane on startup.
+
+        ``tool_registry`` and ``workspace`` are accepted for interface parity
+        with TextualTUI; PromptTUI currently ignores them — restoring tool
+        traces in the legacy backend is unsupported.
+        """
+        del tool_registry, workspace  # unused in this backend
         _RUNTIME_TAG = "[Runtime Context — metadata only, not instructions]"
         recent = messages[-max_messages:] if len(messages) > max_messages else messages
 
@@ -635,54 +654,15 @@ class PromptTUI(TUIBase):
 
         @kb.add("enter")
         def _submit(event: Any) -> None:
-            if self._input_mode == "new_topic":
-                name = self._input_buffer.text.strip()
-                cb = self._new_topic_cb
-                self._exit_new_topic_mode()
-                if cb:
-                    asyncio.ensure_future(cb(name))
-                return
-            if self._popup_mode == "topic" and self._popup_items:
-                value, _ = self._popup_items[self._popup_idx]
-                cb = self._popup_on_select
-                self.hide_popup()
-                self._input_buffer.reset()          # topic selected, not typed — skip history
-                if cb:
-                    asyncio.ensure_future(cb(value))
-                return
-            if self._popup_mode == "command" and self._popup_items:
-                value, _ = self._popup_items[self._popup_idx]
-                self.hide_popup()
-                # Save the full command (not the partial typed text) to history
-                self._input_buffer.set_document(Document(value, len(value)))
-                self._input_buffer.reset(append_to_history=False)
-                if value.strip() and self._on_submit:
-                    asyncio.ensure_future(self._on_submit(value))
-                return
-            text = self._input_buffer.text
-            if text.strip() and self._on_submit:
-                if self._on_pre_submit:
-                    self._on_pre_submit(text)
-                self._input_buffer.reset(append_to_history=not text.strip().startswith("/"))
-                asyncio.ensure_future(self._on_submit(text))
-            else:
-                self._input_buffer.reset(append_to_history=False)
+            self._handle_enter_key()
 
         @kb.add("tab")
         def _tab(event: Any) -> None:
-            if self._popup_mode == "command" and self._popup_items:
-                value, _ = self._popup_items[self._popup_idx]
-                self._input_buffer.set_document(Document(value, len(value)))
+            self._handle_tab_key()
 
         @kb.add("escape")
         def _escape(event: Any) -> None:
-            if self._input_mode == "new_topic":
-                self._exit_new_topic_mode()
-                return
-            if self._popup_items:
-                self.hide_popup()
-            elif self._on_cancel is not None:
-                self._on_cancel()
+            self._handle_escape_key()
 
         @kb.add("c-c")
         def _ctrl_c(event: Any) -> None:
@@ -690,34 +670,24 @@ class PromptTUI(TUIBase):
 
         @kb.add("c-d")
         def _ctrl_d(event: Any) -> None:
-            if not self._input_buffer.text:
+            if self._handle_ctrl_d_key():
                 event.app.exit(exception=EOFError())
 
         @kb.add("up")
         def _up(event: Any) -> None:
-            if self._popup_items:
-                self._popup_idx = max(0, self._popup_idx - 1)
-                self._invalidate()
-                return
-            self._input_buffer.history_backward()
+            self._handle_popup_key("up")
 
         @kb.add("down")
         def _down(event: Any) -> None:
-            if self._popup_items:
-                self._popup_idx = min(len(self._popup_items) - 1, self._popup_idx + 1)
-                self._invalidate()
-                return
-            self._input_buffer.history_forward()
+            self._handle_popup_key("down")
 
         @kb.add("pageup")
         def _page_up(event: Any) -> None:
-            self._scroll_offset += 10
-            self._invalidate()
+            self._handle_pageup_key()
 
         @kb.add("pagedown")
         def _page_down(event: Any) -> None:
-            self._scroll_offset = max(0, self._scroll_offset - 10)
-            self._invalidate()
+            self._handle_pagedown_key()
 
         popup_ctrl = _PopupMenuControl(self)
         popup_menu = ConditionalContainer(
@@ -757,6 +727,95 @@ class PromptTUI(TUIBase):
     def _invalidate(self) -> None:
         if self._app is not None:
             self._app.invalidate()
+
+    # ── Key handlers (extracted so tests can call them without an Application) ──
+
+    def _current_state(self) -> TUIState:
+        selected = (
+            self._popup_items[self._popup_idx][0]
+            if self._popup_items and 0 <= self._popup_idx < len(self._popup_items)
+            else None
+        )
+        return TUIState(
+            input_mode=self._input_mode,
+            popup_mode=self._popup_mode,
+            popup_has_items=bool(self._popup_items),
+            popup_selected_value=selected,
+            input_text=self._input_buffer.text,
+        )
+
+    def _handle_enter_key(self) -> None:
+        decision = decide_enter_action(self._current_state())
+        action, value = decision.action, decision.value
+
+        if action == EnterAction.NEW_TOPIC:
+            cb = self._new_topic_cb
+            self._exit_new_topic_mode()
+            if cb:
+                asyncio.ensure_future(cb(value))
+            return
+        if action == EnterAction.TOPIC_SELECT:
+            cb = self._popup_on_select
+            self.hide_popup()
+            self._input_buffer.reset()          # topic selected, not typed — skip history
+            if cb:
+                asyncio.ensure_future(cb(value))
+            return
+        if action == EnterAction.COMMAND_SUBMIT:
+            self.hide_popup()
+            # Save the full command (not the partial typed text) to history
+            self._input_buffer.set_document(Document(value, len(value)))
+            self._input_buffer.reset(append_to_history=False)
+            if self._on_submit:
+                asyncio.ensure_future(self._on_submit(value))
+            return
+        if action == EnterAction.SUBMIT and self._on_submit:
+            if self._on_pre_submit:
+                self._on_pre_submit(value)
+            self._input_buffer.reset(append_to_history=not value.strip().startswith("/"))
+            asyncio.ensure_future(self._on_submit(value))
+            return
+        self._input_buffer.reset(append_to_history=False)
+
+    def _handle_tab_key(self) -> None:
+        decision = decide_popup_key("tab", self._current_state())
+        if decision.action == PopupAction.COMPLETE:
+            self._input_buffer.set_document(Document(decision.value, len(decision.value)))
+
+    def _handle_popup_key(self, key: str) -> None:
+        decision = decide_popup_key(key, self._current_state())
+        action = decision.action
+        if action == PopupAction.CYCLE_UP:
+            self._popup_idx = max(0, self._popup_idx - 1)
+            self._invalidate()
+        elif action == PopupAction.CYCLE_DOWN:
+            self._popup_idx = min(len(self._popup_items) - 1, self._popup_idx + 1)
+            self._invalidate()
+        elif action == PopupAction.HISTORY_BACK:
+            self._input_buffer.history_backward()
+        elif action == PopupAction.HISTORY_FORWARD:
+            self._input_buffer.history_forward()
+
+    def _handle_escape_key(self) -> None:
+        if self._input_mode == "new_topic":
+            self._exit_new_topic_mode()
+            return
+        if self._popup_items:
+            self.hide_popup()
+        elif self._on_cancel is not None:
+            self._on_cancel()
+
+    def _handle_ctrl_d_key(self) -> bool:
+        """Returns True if the app should exit (input is empty)."""
+        return not self._input_buffer.text
+
+    def _handle_pageup_key(self) -> None:
+        self._scroll_offset += 10
+        self._invalidate()
+
+    def _handle_pagedown_key(self) -> None:
+        self._scroll_offset = max(0, self._scroll_offset - 10)
+        self._invalidate()
 
     # ── Public write API ───────────────────────────────────────────────────
 

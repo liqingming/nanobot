@@ -1,6 +1,7 @@
 """Shell execution tool."""
 
 import asyncio
+import locale
 import os
 import re
 import sys
@@ -10,6 +11,53 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
+
+
+def _decode_console_bytes(data: bytes) -> str:
+    """Decode subprocess stdout/stderr robustly across platforms.
+
+    Modern tooling tends to emit UTF-8, but on Windows many native programs
+    (cmd, python's stdout on a CJK system, etc.) emit data in the system's
+    legacy console codepage (cp936 / cp1252 / sjis, …). Trying UTF-8 first
+    and falling back to the OEM/locale encoding fixes the common case where
+    a Chinese Windows console returns GBK bytes and naive utf-8 decoding
+    produces mojibake.
+    """
+    if not data:
+        return ""
+    # Fast path: try strict UTF-8 first.
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    # On Windows, the legacy console codepage is the usual source of GBK/cp936.
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        for env_var in ("PYTHONIOENCODING",):
+            value = os.environ.get(env_var)
+            if value:
+                candidates.append(value.split(":", 1)[0])  # strip ":errors" suffix
+        try:
+            import ctypes
+            cp = ctypes.windll.kernel32.GetOEMCP()
+            candidates.append(f"cp{cp}")
+        except Exception:
+            pass
+        candidates.append("cp936")  # very common on Chinese Windows
+    # Fallback to the process locale's preferred encoding (Linux: utf-8;
+    # Windows when no console: cp1252 or similar).
+    candidates.append(locale.getpreferredencoding(False))
+    seen: set[str] = set()
+    for enc in candidates:
+        if not enc or enc.lower() in seen:
+            continue
+        seen.add(enc.lower())
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    # Last resort — never raise.
+    return data.decode("utf-8", errors="replace")
 
 
 class ExecTool(Tool):
@@ -124,10 +172,10 @@ class ExecTool(Tool):
             output_parts = []
 
             if stdout:
-                output_parts.append(stdout.decode("utf-8", errors="replace"))
+                output_parts.append(_decode_console_bytes(stdout))
 
             if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace")
+                stderr_text = _decode_console_bytes(stderr)
                 if stderr_text.strip():
                     output_parts.append(f"STDERR:\n{stderr_text}")
 
@@ -190,3 +238,23 @@ class ExecTool(Tool):
         posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
         home_paths = re.findall(r"(?:^|[\s|>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
         return win_paths + posix_paths + home_paths
+
+    def summarize_result(self, args: dict[str, Any], result: Any) -> str:
+        from nanobot.agent.tools.summaries import (
+            extract_error_summary, line_count, summarize_error_or,
+        )
+        if not isinstance(result, str):
+            return ""
+        if result.startswith("Error"):
+            return extract_error_summary(result)
+        lines = result.rstrip("\n").split("\n")
+        exit_marker: str | None = None
+        body = lines
+        for prefix in ("[exit code:", "exit code:", "[exit:"):
+            if lines and prefix in lines[-1].lower():
+                exit_marker = lines[-1].strip()
+                body = lines[:-1]
+                break
+        n = len(body)
+        suffix = f", {n} line{'s' if n != 1 else ''}" if n else ""
+        return (exit_marker or "done") + suffix
