@@ -236,6 +236,141 @@ async def test_command_submit_does_not_pollute_input_history() -> None:
 
 
 @pytest.mark.asyncio
+async def test_show_question_popup_collects_answer() -> None:
+    """End-to-end: question popup, user selects option, callback receives answer."""
+    tui = TextualTUI()
+    tui.set_commands([])
+    completed: list[dict | None] = []
+
+    async def on_complete(answers: dict | None) -> None:
+        completed.append(answers)
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        questions = [{
+            "question": "Pick a color?",
+            "options": [
+                {"label": "red", "description": "warm"},
+                {"label": "blue", "description": "cool"},
+            ],
+        }]
+        tui.show_question_popup(questions, on_complete)
+        await pilot.pause()
+        # popup should be visible with two items, idx=0 (red)
+        assert tui._popup_items
+        assert tui._popup_items[0][0] == "red"
+        # Enter to select the highlighted option
+        await pilot.press("enter")
+        await pilot.pause()
+        assert completed == [{"Pick a color?": "red"}]
+
+
+@pytest.mark.asyncio
+async def test_show_question_popup_cancellation_via_escape() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+    completed: list[dict | None] = []
+
+    async def on_complete(answers: dict | None) -> None:
+        completed.append(answers)
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        questions = [{
+            "question": "Pick?",
+            "options": [
+                {"label": "a", "description": ""},
+                {"label": "b", "description": ""},
+            ],
+        }]
+        tui.show_question_popup(questions, on_complete)
+        await pilot.pause()
+        # User presses ESC instead of selecting
+        await pilot.press("escape")
+        await pilot.pause()
+        # on_complete must have been called with None (cancellation signal)
+        assert completed == [None]
+
+
+@pytest.mark.asyncio
+async def test_show_question_popup_multiple_questions_sequential() -> None:
+    """Two questions: answer first, popup auto-shows second, then on_complete."""
+    tui = TextualTUI()
+    tui.set_commands([])
+    completed: list[dict | None] = []
+
+    async def on_complete(answers: dict | None) -> None:
+        completed.append(answers)
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        questions = [
+            {"question": "Q1?", "options": [{"label": "a1", "description": ""}, {"label": "b1", "description": ""}]},
+            {"question": "Q2?", "options": [{"label": "a2", "description": ""}, {"label": "b2", "description": ""}]},
+        ]
+        tui.show_question_popup(questions, on_complete)
+        await pilot.pause()
+        # First popup — pick first option ("a1")
+        await pilot.press("enter")
+        await pilot.pause()
+        # Second popup should appear automatically
+        assert tui._popup_items
+        assert tui._popup_items[0][0] == "a2"
+        await pilot.press("enter")
+        await pilot.pause()
+        # on_complete called with both answers
+        assert completed == [{"Q1?": "a1", "Q2?": "a2"}]
+
+
+@pytest.mark.asyncio
+async def test_idle_thinking_spinner_starts_after_stream_delta() -> None:
+    """After a stream_delta, if no further delta arrives within ~500ms,
+    the idle thinking spinner should start in #live without crashing on
+    shutdown (regression test for the active_app LookupError).
+    """
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.stream_start()
+        await pilot.pause()
+        tui.stream_delta("hello")
+        # Wait long enough for _schedule_idle_thinking's 500ms timer to fire
+        # and start_spinner's set_interval to create a Timer.
+        await pilot.pause(0.7)
+        # No assertion on visual state — the regression is "shutdown crashes
+        # because active_app is missing on the Timer's context". If app exits
+        # cleanly past this block, the bug is fixed.
+
+
+@pytest.mark.asyncio
+async def test_idle_thinking_after_tool_completes_does_not_crash() -> None:
+    """add_tool_result also schedules idle thinking — same regression path
+    must not surface LookupError on shutdown.
+    """
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.stream_start()
+        await pilot.pause()
+        tui.tool_phase_start()
+        await pilot.pause(0.1)
+        tui.add_progress("read_file(\"x\")")
+        await pilot.pause(0.1)
+        tui.add_tool_result("3 lines, 50 chars")
+        # The add_tool_result path schedules another idle_thinking — let it fire
+        await pilot.pause(0.7)
+
+
+@pytest.mark.asyncio
 async def test_normal_submit_does_not_pollute_history_for_slash_text() -> None:
     """Typing /xyz that doesn't match a command shouldn't go to history either."""
     tui = TextualTUI()

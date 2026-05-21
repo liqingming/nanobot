@@ -12,6 +12,33 @@ Activate by setting the environment variable::
     NANOBOT_TUI=textual nanobot agent
 
 or adding ``tui_backend: "textual"`` to your config (when supported).
+
+──────────────────────────────────────────────────────────────────────────
+Cross-context calling convention
+──────────────────────────────────────────────────────────────────────────
+
+Textual maintains the running app via a ``ContextVar`` named ``active_app``.
+Any task that internally creates a ``Timer`` (``set_interval`` /
+``set_timer`` / many widget methods) expects to read that ContextVar at
+tick time. If the task was started **outside** Textual (e.g. via
+``asyncio.create_task`` from our bus consumer or any tool callback),
+``active_app.get()`` raises ``LookupError`` later — typically surfacing
+as a noisy traceback on app shutdown.
+
+**Rule**: whenever a method on ``_NanobotApp`` that creates Textual Timers
+is called from non-Textual code, route the call through
+``_NanobotApp._safe_call(fn, *args)``. It schedules the call via
+``call_later`` (which enters Textual's context) and swallows exceptions so
+background tasks can't crash the loop.
+
+Affected APIs (must use _safe_call when called from non-Textual paths):
+  - ``start_thinking_spinner``
+  - ``start_spinner``
+  - ``_update_progress_line``
+
+Safe to call directly (already inside Textual's event handlers):
+  - ``stop_*`` / ``update_*`` / ``query_one`` / etc. — these don't create
+    Timers; they only read or mutate widget state.
 """
 from __future__ import annotations
 
@@ -548,6 +575,22 @@ if _TEXTUAL_AVAILABLE:
             self._thinking_frame = 0
             self._thinking_start_time: float = 0.0
 
+        def _safe_call(self, fn: Any, *args: Any) -> None:
+            """Schedule ``fn(*args)`` via ``call_later`` so it runs inside
+            Textual's active_app context, and swallow any exception so
+            background-task callers can't surface noisy tracebacks.
+
+            Use this whenever an asyncio Task / Thread / external callback
+            needs to invoke a method that internally creates Textual Timers
+            (e.g. ``start_spinner``, ``start_thinking_spinner``). Without
+            the context wrap, Timer's ``_tick`` will raise ``LookupError`` on
+            ``active_app.get()`` and pollute shutdown with tracebacks.
+            """
+            try:
+                self.call_later(lambda: fn(*args))
+            except Exception:
+                pass
+
         @staticmethod
         def _elapsed_suffix(start_time: float) -> str:
             """Render elapsed time since ``start_time`` as a spinner suffix.
@@ -683,6 +726,9 @@ if _TEXTUAL_AVAILABLE:
         def action_escape_app(self) -> None:
             tui = self._tui
             if tui._popup_mode != "hidden":
+                # If a question-popup sequence is in flight, ESC cancels the
+                # whole sequence (not just this one question).
+                tui._cancel_question_flow()
                 tui.hide_popup()
             elif tui._input_mode == "new_topic":
                 tui._exit_new_topic_mode()
@@ -723,13 +769,16 @@ if _TEXTUAL_AVAILABLE:
                 else:
                     base = tui._turn_start_time or self._spinner_start_time
                 suffix = self._elapsed_suffix(base)
+                # #live shows just the spinner line — the "🐈 nanobot ts"
+                # header already lives in #output, so duplicating it here
+                # is visual noise (especially right under the popup area).
+                # Use grey50 instead of plain "dim" so the live strip reads
+                # as clearly secondary to the main output.
                 if self._spinner_tool:
                     label = tui._tool_hint or "executing..."
-                    ts = tui._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    text = f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]\n[dim]{icon} {label}{suffix}[/dim]"
+                    text = f"[grey50]{icon} {label}{suffix}[/grey50]"
                 else:
-                    ts = tui._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    text = f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]\n[dim]{icon} thinking{suffix}...[/dim]"
+                    text = f"[grey50]{icon} thinking{suffix}...[/grey50]"
                 try:
                     self.query_one("#live", Static).update(text)
                 except Exception:
@@ -742,6 +791,12 @@ if _TEXTUAL_AVAILABLE:
             if self._spinner_timer is not None:
                 self._spinner_timer.stop()
                 self._spinner_timer = None
+            # Explicitly clear #live so the last spinner frame doesn't
+            # linger as a stale-looking static glyph after stop.
+            try:
+                self.query_one("#live", Static).update("")
+            except Exception:
+                pass
 
         def stop_spinner(self) -> None:
             self._stop_spinner()
@@ -941,6 +996,10 @@ class TextualTUI(TUIBase):
         self._idle_thinking_task: Any = None  # asyncio.Task scheduling the "still thinking" spinner
         self._turn_start_time: float = 0.0  # monotonic timestamp when the current LLM turn started (stream_start)
         self._tool_start_time: float = 0.0  # monotonic timestamp when the current tool started (add_progress)
+        # State for show_question_popup (sequential multi-question prompt)
+        self._question_queue: list[dict] = []
+        self._question_answers: dict[str, str] = {}
+        self._question_on_complete: Callable[[dict[str, str] | None], Awaitable[None]] | None = None
 
         # Callbacks
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
@@ -1330,7 +1389,7 @@ class TextualTUI(TUIBase):
         self._tool_hint = text
         # Mark tool start so add_tool_result can show "[+Ns]" elapsed.
         self._tool_start_time = time.monotonic()
-        self._app.call_later(self._update_progress_line, text)
+        self._app._safe_call(self._update_progress_line, text)
 
     def _update_progress_line(self, text: str) -> None:
         """Overwrite the executing placeholder line with the tool name (runs in Textual context)."""
@@ -1500,7 +1559,10 @@ class TextualTUI(TUIBase):
             self._stream_header_line = 0
             self._tool_placeholder_line = 0
             self._last_content_start = 0
-        self._app.start_thinking_spinner()
+        # Use _safe_call so the spinner timer task is created inside
+        # Textual's active_app context even if stream_start is invoked
+        # from a non-Textual code path.
+        self._app._safe_call(self._app.start_thinking_spinner)
 
     def tool_phase_start(self) -> None:
         self._cancel_idle_thinking()
@@ -1527,9 +1589,10 @@ class TextualTUI(TUIBase):
             out.write(Text("⠋ 执行中...", style="dim"))
         except Exception:
             pass
-        # schedule via call_later so the timer task is created inside Textual's context
-        # (active_app ContextVar must be set, otherwise set_interval's task silently crashes)
-        self._app.call_later(self._app.start_thinking_spinner)
+        # Schedule via _safe_call so the timer task is created inside
+        # Textual's context (active_app ContextVar must be set, otherwise
+        # set_interval's task silently crashes on shutdown).
+        self._app._safe_call(self._app.start_thinking_spinner)
 
     def _cancel_idle_thinking(self) -> None:
         """Stop any pending idle-thinking spinner task."""
@@ -1559,12 +1622,11 @@ class TextualTUI(TUIBase):
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 return
-            try:
-                # start_spinner draws into #live (not #output), so it doesn't
-                # disturb already-rendered streaming content or tool traces.
-                self._app.start_spinner(tool=False)
-            except Exception:
-                pass
+            # Schedule via _safe_call so the spinner's set_interval task is
+            # created inside Textual's active_app context. Without this, the
+            # Timer's _tick crashes on LookupError when calling active_app.get()
+            # and surfaces on app shutdown as a noisy traceback.
+            self._app._safe_call(self._app.start_spinner, False)
 
         try:
             self._idle_thinking_task = asyncio.ensure_future(_wait_then_show())
@@ -1755,6 +1817,74 @@ class TextualTUI(TUIBase):
         self._app.set_input_value("")
         self._refresh_popup()
 
+    def show_question_popup(
+        self,
+        questions: list[dict],
+        on_complete: Callable[[dict[str, str] | None], Awaitable[None]],
+    ) -> None:
+        """Ask a series of multiple-choice questions one at a time.
+
+        Each question is rendered as: a system message with the question text
+        and numbered options (with descriptions) in the output log, then a
+        single-select popup over just the option labels for keyboard pick.
+        Answers accumulate in a dict keyed by question text; ESC mid-flow
+        reports ``None`` so the caller knows the user bailed.
+        """
+        self._question_queue: list[dict] = list(questions or [])
+        self._question_answers: dict[str, str] = {}
+        self._question_on_complete = on_complete
+        self._show_next_question()
+
+    def _show_next_question(self) -> None:
+        if not self._question_queue:
+            cb = self._question_on_complete
+            answers = self._question_answers
+            self._question_on_complete = None
+            self._question_answers = {}
+            if cb:
+                asyncio.ensure_future(cb(answers))
+            return
+
+        q = self._question_queue[0]
+        question_text = str(q.get("question") or "(question)")
+        header = str(q.get("header") or "").strip()
+        options = q.get("options") or []
+        if not isinstance(options, list) or not options:
+            # Malformed question — skip and continue
+            self._question_queue.pop(0)
+            self._show_next_question()
+            return
+
+        header_str = f" [{header}]" if header else ""
+        self.add_system(f"❓{header_str} {question_text}")
+        for i, opt in enumerate(options, 1):
+            label = str(opt.get("label", "")) if isinstance(opt, dict) else str(opt)
+            desc = str(opt.get("description", "")) if isinstance(opt, dict) else ""
+            line = f"  {i}. {label}"
+            if desc:
+                line += f"  — {desc}"
+            self.add_system(line)
+
+        labels = [
+            str(opt.get("label", "")) if isinstance(opt, dict) else str(opt)
+            for opt in options
+        ]
+        self._popup_mode = "topic"  # reuse topic popup wiring for navigation
+        self._popup_items = [(lbl, lbl) for lbl in labels]
+        self._popup_idx = 0
+        self._popup_all_topics = list(labels)
+
+        async def _on_selected(value: str) -> None:
+            self._question_answers[question_text] = value
+            self.add_system(f"  ✓ {value}")
+            if self._question_queue:
+                self._question_queue.pop(0)
+            self._show_next_question()
+
+        self._popup_on_select = _on_selected
+        self._app.set_input_value("")
+        self._refresh_popup()
+
     def hide_popup(self) -> None:
         self._popup_mode = "hidden"
         self._popup_items = []
@@ -1762,3 +1892,24 @@ class TextualTUI(TUIBase):
         self._popup_on_select = None
         self._popup_all_topics = []
         self._app.update_popup([], False)
+
+    def _cancel_question_flow(self) -> None:
+        """Abort any in-flight show_question_popup sequence and notify the
+        callback with ``None`` so the awaiting LLM tool sees a cancellation.
+        Called by ESC; NOT by the normal select-then-advance flow which
+        consumes one question at a time on its own.
+        """
+        if self._question_on_complete is None:
+            return
+        cb = self._question_on_complete
+        self._question_on_complete = None
+        self._question_queue = []
+        self._question_answers = {}
+        try:
+            self.add_system("  ✗ cancelled")
+        except Exception:
+            pass
+        try:
+            asyncio.ensure_future(cb(None))
+        except Exception:
+            pass

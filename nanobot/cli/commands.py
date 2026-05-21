@@ -1204,6 +1204,30 @@ def agent(
                                     tui.add_progress(msg.content)
                             continue
 
+                        # Interactive question popup pushed by AskUserTool.
+                        # We dispatch the user's selection back to the tool's
+                        # awaiting Future via the module-level deliver_reply.
+                        if msg.metadata.get("_ask_user"):
+                            from nanobot.agent.tools.ask_user import deliver_reply
+                            correlation_id = str(msg.metadata.get("_ask_user_id") or "")
+                            questions = msg.metadata.get("_ask_user_questions") or []
+
+                            async def _on_question_complete(
+                                answers: dict[str, str] | None,
+                                _cid: str = correlation_id,
+                            ) -> None:
+                                if answers is None:
+                                    deliver_reply(_cid, None, cancelled=True)
+                                else:
+                                    deliver_reply(_cid, answers)
+
+                            try:
+                                tui.show_question_popup(questions, _on_question_complete)
+                            except Exception:
+                                # Don't leave the tool hanging — report failure
+                                deliver_reply(correlation_id, None, cancelled=True)
+                            continue
+
                         # Live system message (e.g. todo diff pushed by TodoWriteTool).
                         # Must be displayed mid-turn, not aggregated into the final reply.
                         if msg.metadata.get("_system_message"):

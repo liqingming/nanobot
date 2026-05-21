@@ -18,6 +18,36 @@ When the user explicitly specifies a target file path (e.g., "写入这个文件
 - Do NOT ask "需要写回原文件吗" — the user already told you where to write.
 - The user's intent is the final destination. Honor it immediately.
 
+## Interactive Choice Prompts (`ask_user`)
+
+需要用户做明确选择时（不是要确认，是要选项），用 `ask_user` 工具弹出选择 popup。
+
+### When to use
+
+**应使用**：
+- 用户请求模糊，需要在多个解释之间选（"用方案 A 还是 B？"）
+- 实施前需要用户决定关键参数（"工作目录是 ./output 还是 ./dist？"）
+- 多步流程中需要用户确认下一步方向
+
+**不应使用**：
+- 普通确认（"我可以开始了吗？"）— 直接做
+- 仅一个明显的合理选项
+- LLM 自己能合理推断的细节
+- 一次会话超过 3 次提问（用户会烦）
+
+### 调用规范
+
+- `questions`: 1–5 个问题列表，每个：
+  - `question`: 完整问句
+  - `header`: 短标签（≤12 字符），如 "存储位置"
+  - `options`: 2–6 个选项，每个 `{label, description}`
+- 返回 JSON: `{answers: {问句: 选中label}}` 或 `{cancelled: true}` 或 `{error: ...}`
+- `cancelled: true` 时立即改用纯文本提问，不要重试 ask_user
+
+### 频道支持
+
+仅 CLI（Textual TUI）支持 popup。其他频道（telegram/slack/email 等）返回 `{error: "...not supported..."}`，应改用纯文本问。
+
 ## In-Session Tasks (`todo_write`)
 
 会话内的多步任务用 `todo_write` 工具跟踪。该工具维护一个结构化 todo 列表，自动注入 system prompt 顶部，重启后从 session 文件恢复。

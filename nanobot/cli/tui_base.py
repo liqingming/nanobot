@@ -132,5 +132,19 @@ class TUIBase(ABC):
         on_select: Callable[[str], Awaitable[None]],
     ) -> None: ...
 
+    def show_question_popup(
+        self,
+        questions: list[dict],
+        on_complete: Callable[[dict[str, str] | None], Awaitable[None]],
+    ) -> None:
+        """Ask the user a series of multiple-choice questions and report all
+        answers (or ``None`` on cancellation) via ``on_complete``.
+
+        Default falls back to immediate cancellation so backends that don't
+        implement interactive popups still satisfy the contract.
+        """
+        import asyncio as _asyncio
+        _asyncio.ensure_future(on_complete(None))
+
     @abstractmethod
     def hide_popup(self) -> None: ...
