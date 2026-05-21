@@ -492,6 +492,11 @@ if _TEXTUAL_AVAILABLE:
         #output {
             height: 1fr;
             scrollbar-gutter: stable;
+            scrollbar-size-vertical: 1;
+            scrollbar-color: grey;
+            scrollbar-color-hover: grey;
+            scrollbar-color-active: grey;
+            scrollbar-background: #0c0c0c;
             border: none;
             background: #0c0c0c;
         }
@@ -822,8 +827,13 @@ if _TEXTUAL_AVAILABLE:
                     idx = self._tui._tool_placeholder_line
                     if 0 <= idx < len(out.lines):
                         hint = self._tui._tool_hint
-                        label = hint if hint else "思考中..."
-                        rt = Text(f"{icon} {label}{suffix}", style="dim")
+                        # Tool execution → 4-space indent + cyan (matches the
+                        # eventual "↳ tool" trace). Idle thinking → 2-space
+                        # indent + grey50 (subtler, marks waiting state).
+                        if hint:
+                            rt = Text(f"    {icon} {hint}{suffix}", style="cyan")
+                        else:
+                            rt = Text(f"  {icon} 思考中...{suffix}", style="grey50")
                         width = max(out.scrollable_content_region.width, out.min_width)
                         console = out.app.console
                         segs = list(console.render(rt, console.options.update_width(width)))
@@ -994,6 +1004,13 @@ class TextualTUI(TUIBase):
         self._last_sep: bool = False
         self._header_already_rendered: bool = False  # set by pop_stream so add_response skips a second header
         self._idle_thinking_task: Any = None  # asyncio.Task scheduling the "still thinking" spinner
+        self._idle_placeholder_visible: bool = False  # whether the idle thinking line is in #output
+        # When idle thinking is shown, _tool_placeholder_line is moved to its
+        # line so the spinner updates that line. This backup preserves the
+        # original (stream_delta / tool) anchor so cancel_idle can restore it
+        # — without restoration, pop_stream would truncate the wrong line and
+        # add_response would duplicate the streamed content.
+        self._tool_placeholder_line_backup: int | None = None
         self._turn_start_time: float = 0.0  # monotonic timestamp when the current LLM turn started (stream_start)
         self._tool_start_time: float = 0.0  # monotonic timestamp when the current tool started (add_progress)
         # State for show_question_popup (sequential multi-question prompt)
@@ -1554,7 +1571,9 @@ class TextualTUI(TUIBase):
             out.write("")
             self._tool_placeholder_line = len(out.lines)
             self._last_content_start = self._tool_placeholder_line
-            out.write(Text("⠋ 思考中...", style="dim"))
+            # Match the idle thinking style — _tick will overwrite this with
+            # the same format on each frame anyway.
+            out.write(Text("  ⠋ 思考中...", style="grey50"))
         except Exception:
             self._stream_header_line = 0
             self._tool_placeholder_line = 0
@@ -1586,7 +1605,9 @@ class TextualTUI(TUIBase):
                 self._tool_placeholder_line = self._last_content_start + 1
             else:
                 self._tool_placeholder_line = content_end
-            out.write(Text("⠋ 执行中...", style="dim"))
+            # 4-space indent + cyan matches the eventual "↳ tool" trace.
+            # _tick will overwrite with the tool hint once add_progress runs.
+            out.write(Text("    ⠋ 执行中...", style="cyan"))
         except Exception:
             pass
         # Schedule via _safe_call so the timer task is created inside
@@ -1595,17 +1616,34 @@ class TextualTUI(TUIBase):
         self._app._safe_call(self._app.start_thinking_spinner)
 
     def _cancel_idle_thinking(self) -> None:
-        """Stop any pending idle-thinking spinner task."""
+        """Stop any pending idle-thinking spinner task and remove the
+        placeholder line it wrote to #output (if any)."""
         task = self._idle_thinking_task
         if task is not None and not task.done():
             task.cancel()
         self._idle_thinking_task = None
-        # Also stop any spinner that the idle task already started.
+        # Stop the timer-driven spinner update.
         try:
-            self._app.stop_spinner()
-            self._app.clear_live()
+            self._app.stop_thinking_spinner()
         except Exception:
             pass
+        # Remove the idle thinking placeholder line so it doesn't linger
+        # before the next stream content / tool call writes at the same idx.
+        if self._idle_placeholder_visible:
+            self._idle_placeholder_visible = False
+            try:
+                out = self._app.query_one("#output", _OutputLog)
+                if 0 <= self._tool_placeholder_line <= len(out.lines):
+                    out.truncate_to(self._tool_placeholder_line)
+            except Exception:
+                pass
+            # Restore the original anchor so subsequent stream_delta /
+            # pop_stream operate on the right line (otherwise pop_stream
+            # would truncate the wrong line and add_response would write
+            # the stream content a second time → duplicated message).
+            if self._tool_placeholder_line_backup is not None:
+                self._tool_placeholder_line = self._tool_placeholder_line_backup
+                self._tool_placeholder_line_backup = None
 
     def _schedule_idle_thinking(self, delay: float = 0.5) -> None:
         """Schedule a "still thinking..." spinner in #live after ``delay`` seconds
@@ -1622,11 +1660,28 @@ class TextualTUI(TUIBase):
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 return
-            # Schedule via _safe_call so the spinner's set_interval task is
-            # created inside Textual's active_app context. Without this, the
-            # Timer's _tick crashes on LookupError when calling active_app.get()
-            # and surfaces on app shutdown as a noisy traceback.
-            self._app._safe_call(self._app.start_spinner, False)
+            # Show the idle thinking spinner inline at the end of #output
+            # so it stays visually attached to the most recent message
+            # (instead of jumping down to #live above the input).
+            try:
+                out = self._app.query_one("#output", _OutputLog)
+                # Back up the existing anchor so pop_stream / stream_delta can
+                # later truncate the right line (the stream content), not the
+                # idle thinking line we're about to add.
+                self._tool_placeholder_line_backup = self._tool_placeholder_line
+                self._tool_placeholder_line = len(out.lines)
+                self._last_content_start = self._tool_placeholder_line
+                # 2-space indent + grey50 distinguishes idle thinking from
+                # the 4-space cyan tool traces above it (so users don't
+                # mistake "still thinking" for a new tool call).
+                out.write(Text("  ⠋ 思考中...", style="grey50"))
+                self._idle_placeholder_visible = True
+            except Exception:
+                return
+            # _safe_call ensures start_thinking_spinner's set_interval task
+            # runs inside Textual's active_app context (otherwise the timer
+            # crashes on shutdown with LookupError).
+            self._app._safe_call(self._app.start_thinking_spinner)
 
         try:
             self._idle_thinking_task = asyncio.ensure_future(_wait_then_show())
