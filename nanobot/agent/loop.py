@@ -300,7 +300,7 @@ class AgentLoop:
         workspace: Path,
         data_dir: Path | None = None,
         model: str | None = None,
-        max_iterations: int = 100,
+        max_iterations: int = 1000,
         context_window_tokens: int = 65_536,
         web_search_config: WebSearchConfig | None = None,
         web_proxy: str | None = None,
