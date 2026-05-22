@@ -223,8 +223,9 @@ async def test_runner_returns_max_iterations_fallback():
 
     assert result.stop_reason == "max_iterations"
     assert result.final_content == (
-        "I reached the maximum number of tool call iterations (2) "
-        "without completing the task. You can try breaking the task into smaller steps."
+        "I've used up the max tool-call budget (2 per turn) before "
+        "finishing the task. The work so far is preserved — type `/continue` to "
+        "keep going from where I stopped, or break the request into smaller steps."
     )
 
 
@@ -272,8 +273,9 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
     final_content, _, _, _ = await loop._run_agent_loop([])
 
     assert final_content == (
-        "I reached the maximum number of tool call iterations (2) "
-        "without completing the task. You can try breaking the task into smaller steps."
+        "I've used up the max tool-call budget (2 per turn) before "
+        "finishing the task. The work so far is preserved — type `/continue` to "
+        "keep going from where I stopped, or break the request into smaller steps."
     )
 
 

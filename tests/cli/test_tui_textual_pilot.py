@@ -267,6 +267,113 @@ async def test_show_question_popup_collects_answer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_show_question_popup_appends_custom_input_row() -> None:
+    """popup_items must always have one extra entry (sentinel value, custom
+    display label) appended after the LLM-provided options."""
+    tui = TextualTUI()
+    tui.set_commands([])
+    completed: list[dict | None] = []
+
+    async def on_complete(answers: dict | None) -> None:
+        completed.append(answers)
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        questions = [{
+            "question": "Pick?",
+            "options": [
+                {"label": "a", "description": ""},
+                {"label": "b", "description": ""},
+            ],
+        }]
+        tui.show_question_popup(questions, on_complete)
+        await pilot.pause()
+        # 2 options + 1 custom row
+        assert len(tui._popup_items) == 3
+        assert tui._popup_items[-1][0] == tui._CUSTOM_INPUT_SENTINEL
+        assert "自定义" in tui._popup_items[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_show_question_popup_custom_input_routes_typed_text_as_answer() -> None:
+    """User picks the custom row → input mode → typed text becomes answer."""
+    tui = TextualTUI()
+    tui.set_commands([])
+    completed: list[dict | None] = []
+
+    async def on_complete(answers: dict | None) -> None:
+        completed.append(answers)
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        questions = [{
+            "question": "What approach?",
+            "options": [
+                {"label": "A", "description": ""},
+                {"label": "B", "description": ""},
+            ],
+        }]
+        tui.show_question_popup(questions, on_complete)
+        await pilot.pause()
+        # Navigate down past A, B to the custom row (idx 2)
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.pause()
+        assert tui._popup_items[tui._popup_idx][0] == tui._CUSTOM_INPUT_SENTINEL
+        # Enter selects → opens input mode for free text
+        await pilot.press("enter")
+        await pilot.pause()
+        assert tui._input_mode == "new_topic"
+        assert tui._popup_mode == "hidden"
+        # Type a custom answer + Enter
+        for ch in "C":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert completed == [{"What approach?": "C"}]
+
+
+@pytest.mark.asyncio
+async def test_show_question_popup_empty_custom_input_reshows_popup() -> None:
+    """Empty custom answer shouldn't kill the question — it re-prompts."""
+    tui = TextualTUI()
+    tui.set_commands([])
+    completed: list[dict | None] = []
+
+    async def on_complete(answers: dict | None) -> None:
+        completed.append(answers)
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        questions = [{
+            "question": "Pick?",
+            "options": [
+                {"label": "x", "description": ""},
+                {"label": "y", "description": ""},
+            ],
+        }]
+        tui.show_question_popup(questions, on_complete)
+        await pilot.pause()
+        # Move to custom row, Enter
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        # Just Enter (empty) — should not complete; popup should re-show
+        await pilot.press("enter")
+        await pilot.pause()
+        assert completed == []
+        assert tui._popup_mode == "topic"
+        # Now pick x
+        await pilot.press("enter")
+        await pilot.pause()
+        assert completed == [{"Pick?": "x"}]
+
+
+@pytest.mark.asyncio
 async def test_show_question_popup_cancellation_via_escape() -> None:
     tui = TextualTUI()
     tui.set_commands([])

@@ -962,6 +962,7 @@ def agent(
                 ("/new", "新建话题"),
                 ("/resume", "切换/恢复话题"),
                 ("/todos", "查看当前话题的 todo 列表"),
+                ("/continue", "继续上次因达到 iteration 上限中断的任务"),
                 ("/commit_memory", "把 pending consolidation 写入 MEMORY.md"),
                 ("/exit", "退出 nanobot"),
             ])
@@ -1118,6 +1119,18 @@ def agent(
                             await _switch_topic(name)
                             tui.add_system(f"已创建并切换到话题: {name}")
                         tui.enter_new_topic_mode(_confirm_new_topic_cmd)
+                    return
+
+                if text == "/continue":
+                    # Resume work after the previous turn hit the iteration
+                    # ceiling. Sends a synthetic "继续" user message so the
+                    # LLM picks up with full prior context (tools + history
+                    # already in session.messages).
+                    if is_processing:
+                        tui.add_system("当前还在处理消息，请稍后再 /continue。")
+                        return
+                    await asyncio.sleep(0)
+                    await _send_message("请继续上次中断的任务。")
                     return
 
                 if text == "/commit_memory" or text.startswith("/commit_memory "):

@@ -12,8 +12,9 @@ from nanobot.providers.base import LLMProvider, ToolCallRequest
 from nanobot.utils.helpers import build_assistant_message
 
 _DEFAULT_MAX_ITERATIONS_MESSAGE = (
-    "I reached the maximum number of tool call iterations ({max_iterations}) "
-    "without completing the task. You can try breaking the task into smaller steps."
+    "I've used up the max tool-call budget ({max_iterations} per turn) before "
+    "finishing the task. The work so far is preserved — type `/continue` to "
+    "keep going from where I stopped, or break the request into smaller steps."
 )
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 

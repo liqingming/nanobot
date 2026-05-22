@@ -1847,13 +1847,23 @@ class TextualTUI(TUIBase):
 
     # ── TUIBase: interactive modes ─────────────────────────────────────────
 
-    def enter_new_topic_mode(self, callback: Callable[[str], Awaitable[None]]) -> None:
+    def enter_new_topic_mode(
+        self,
+        callback: Callable[[str], Awaitable[None]],
+        placeholder: str = "话题名: ",
+    ) -> None:
+        """Generic free-text input mode.
+
+        Reuses the new_topic input wiring (Enter submits, ESC cancels) but
+        accepts a custom placeholder so callers like ``show_question_popup``
+        can repurpose it for "Custom answer:" without misleading users.
+        """
         self._input_mode = "new_topic"
         self._new_topic_cb = callback
         # Clear any residual command/topic popup state so Enter routes to new_topic submit
         if self._popup_mode != "hidden":
             self.hide_popup()
-        self._app.set_input_placeholder("话题名: ")
+        self._app.set_input_placeholder(placeholder)
         self._app.set_input_value("")
 
     def set_commands(self, commands: list[tuple[str, str]]) -> None:
@@ -1890,6 +1900,12 @@ class TextualTUI(TUIBase):
         self._question_on_complete = on_complete
         self._show_next_question()
 
+    # Sentinel selected-value that means "user wants to type their own
+    # answer instead of picking a listed option". The popup row's display
+    # label is "✎ 自定义..." (see _show_next_question); we route on the
+    # sentinel so a real option labelled "自定义..." still works correctly.
+    _CUSTOM_INPUT_SENTINEL = "\x00__ask_user_custom__\x00"
+
     def _show_next_question(self) -> None:
         if not self._question_queue:
             cb = self._question_on_complete
@@ -1919,17 +1935,44 @@ class TextualTUI(TUIBase):
             if desc:
                 line += f"  — {desc}"
             self.add_system(line)
+        # Append a "custom answer" row so the user is never stuck with only
+        # the LLM-provided options (mirrors Claude Code's "Other" fallback).
+        self.add_system(f"  {len(options) + 1}. ✎ 自定义...  — 输入你自己的方案/想法")
 
         labels = [
             str(opt.get("label", "")) if isinstance(opt, dict) else str(opt)
             for opt in options
         ]
+        # popup_items is (value, display_label); pair every listed option with
+        # itself, plus one extra entry whose *value* is the sentinel but whose
+        # *display* shows "✎ 自定义...". Selection routes on value, so even if
+        # the LLM also offers a real "自定义" option it stays distinct.
+        popup_items = [(lbl, lbl) for lbl in labels]
+        popup_items.append((self._CUSTOM_INPUT_SENTINEL, "✎ 自定义..."))
         self._popup_mode = "topic"  # reuse topic popup wiring for navigation
-        self._popup_items = [(lbl, lbl) for lbl in labels]
+        self._popup_items = popup_items
         self._popup_idx = 0
-        self._popup_all_topics = list(labels)
+        self._popup_all_topics = [lbl for _, lbl in popup_items]
 
         async def _on_selected(value: str) -> None:
+            if value == self._CUSTOM_INPUT_SENTINEL:
+                # Open a free-text input box; the typed text becomes the answer
+                async def _on_custom_text(typed: str) -> None:
+                    answer = (typed or "").strip()
+                    if not answer:
+                        # Empty input — treat like cancellation of THIS question;
+                        # re-show the popup so user can pick a listed option
+                        # instead of bailing the whole sequence.
+                        self.add_system("  (空输入，重新选择)")
+                        self._show_next_question()
+                        return
+                    self._question_answers[question_text] = answer
+                    self.add_system(f"  ✓ 自定义: {answer}")
+                    if self._question_queue:
+                        self._question_queue.pop(0)
+                    self._show_next_question()
+                self.enter_new_topic_mode(_on_custom_text, placeholder="自定义答案: ")
+                return
             self._question_answers[question_text] = value
             self.add_system(f"  ✓ {value}")
             if self._question_queue:
