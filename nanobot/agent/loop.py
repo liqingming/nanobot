@@ -312,6 +312,7 @@ class AgentLoop:
         timezone: str | None = None,
         hooks: list[AgentHook] | None = None,
         enable_learning: bool = True,
+        pending_promote_threshold_chars: int = 10_000,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -378,6 +379,7 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
+            pending_promote_threshold_chars=pending_promote_threshold_chars,
         )
         self._register_default_tools()
         self.commands = CommandRouter()
@@ -748,6 +750,7 @@ class AgentLoop:
                 current_role=current_role,
                 session_key=key,
                 todos=session.todos,
+                pending_summary=session.pending_consolidation_summary,
             )
             final_content, _, all_msgs, _ = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
@@ -790,6 +793,7 @@ class AgentLoop:
             learning_ctx=learning_ctx,
             session_key=key,
             todos=session.todos,
+            pending_summary=session.pending_consolidation_summary,
         )
 
         async def _bus_progress(

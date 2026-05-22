@@ -866,6 +866,7 @@ def agent(
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
         enable_learning=config.agents.defaults.enable_learning,
+        pending_promote_threshold_chars=config.agents.defaults.pending_promote_threshold_chars,
     )
 
     # Shared reference for progress callbacks
@@ -927,6 +928,22 @@ def agent(
             def _load_topic(name: str) -> None:
                 """Load session history and context estimate for the given topic."""
                 s = agent_loop.sessions.get_or_create(f"{cli_channel}:{name}")
+                # Honor config flag: optionally flush any leftover pending
+                # consolidation summary into MEMORY.md on (re)load. Default
+                # off keeps the prompt cache warm across restarts.
+                if (
+                    config.agents.defaults.promote_pending_on_restart
+                    and s.pending_consolidation_summary
+                ):
+                    chars = len(s.pending_consolidation_summary)
+                    try:
+                        agent_loop.memory_consolidator.promote_pending_summary(s.key)
+                        tui.add_system(
+                            f"已自动 promote 上次的 pending consolidation "
+                            f"({chars} chars) 到 MEMORY.md"
+                        )
+                    except Exception:
+                        pass
                 tui.set_topic(name)
                 tui.load_session_history(
                     s.messages,
@@ -945,6 +962,7 @@ def agent(
                 ("/new", "新建话题"),
                 ("/resume", "切换/恢复话题"),
                 ("/todos", "查看当前话题的 todo 列表"),
+                ("/commit_memory", "把 pending consolidation 写入 MEMORY.md"),
                 ("/exit", "退出 nanobot"),
             ])
 
@@ -1100,6 +1118,29 @@ def agent(
                             await _switch_topic(name)
                             tui.add_system(f"已创建并切换到话题: {name}")
                         tui.enter_new_topic_mode(_confirm_new_topic_cmd)
+                    return
+
+                if text == "/commit_memory" or text.startswith("/commit_memory "):
+                    # /commit_memory       → promote pending → MEMORY.md
+                    # /commit_memory show  → preview pending content (no write)
+                    arg = text[len("/commit_memory"):].strip()
+                    key = f"{cli_channel}:{topic_state['chat_id']}"
+                    s = agent_loop.sessions.get_or_create(key)
+                    if not s.pending_consolidation_summary:
+                        tui.add_system("当前话题暂无 pending consolidation summary。")
+                        return
+                    chars = len(s.pending_consolidation_summary)
+                    if arg == "show":
+                        tui.add_system(
+                            f"Pending consolidation summary ({chars} chars):\n\n"
+                            f"{s.pending_consolidation_summary}"
+                        )
+                        return
+                    agent_loop.memory_consolidator.promote_pending_summary(key)
+                    tui.add_system(
+                        f"已将 pending summary ({chars} chars) 写入 MEMORY.md "
+                        "(下次 LLM 调用 system prompt 会重建，cache 会失效一次)。"
+                    )
                     return
 
                 if text == "/todos" or text.startswith("/todos "):

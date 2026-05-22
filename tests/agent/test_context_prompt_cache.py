@@ -71,3 +71,53 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Channel: cli" in user_content
     assert "Chat ID: direct" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_pending_summary_injected_as_system_reminder(tmp_path) -> None:
+    """When a pending consolidation summary is buffered, build_messages
+    injects it as a <system-reminder> inside the user message — without
+    touching system prompt (so the prompt cache stays warm)."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    msgs_with = builder.build_messages(
+        history=[],
+        current_message="hi",
+        channel="cli",
+        chat_id="direct",
+        session_key="cli:direct",
+        pending_summary="### Progress\n- Step 1 done\n- Step 2 in progress",
+    )
+    msgs_without = builder.build_messages(
+        history=[],
+        current_message="hi",
+        channel="cli",
+        chat_id="direct",
+        session_key="cli:direct",
+        pending_summary=None,
+    )
+
+    # System prompts are byte-identical (the summary did NOT enter it).
+    assert msgs_with[0]["content"] == msgs_without[0]["content"]
+
+    # The summary ended up wrapped in <system-reminder> inside the user msg.
+    user_content_with = msgs_with[-1]["content"]
+    assert "<system-reminder>" in user_content_with
+    assert "Step 1 done" in user_content_with
+    assert "Step 2 in progress" in user_content_with
+
+
+def test_empty_pending_summary_does_not_inject_reminder(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    msgs = builder.build_messages(
+        history=[],
+        current_message="hi",
+        channel="cli",
+        chat_id="direct",
+        session_key="cli:direct",
+        pending_summary="   ",  # whitespace only
+    )
+    user_content = msgs[-1]["content"]
+    assert "<system-reminder>" not in str(user_content)

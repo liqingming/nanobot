@@ -34,6 +34,12 @@ class Session:
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
     todos: list[dict[str, Any]] = field(default_factory=list)  # active task list managed via TodoWriteTool
+    # Latest consolidation summary that hasn't been "promoted" to MEMORY.md
+    # yet. Injected as a <system-reminder> before the next user message so
+    # the LLM sees updated context without our touching system prompt
+    # mid-turn (keeps the prompt cache warm). Promoted into MEMORY.md at
+    # the start of the next user-initiated turn.
+    pending_consolidation_summary: str | None = None
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -100,6 +106,7 @@ class Session:
         self.messages = []
         self.last_consolidated = 0
         self.todos = []
+        self.pending_consolidation_summary = None
         self.updated_at = datetime.now()
 
     def retain_recent_legal_suffix(self, max_messages: int) -> None:
@@ -193,6 +200,7 @@ class SessionManager:
             created_at = None
             last_consolidated = 0
             todos: list[dict[str, Any]] = []
+            pending_consolidation_summary: str | None = None
 
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -207,6 +215,7 @@ class SessionManager:
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
                         todos = data.get("todos", [])
+                        pending_consolidation_summary = data.get("pending_consolidation_summary")
                     else:
                         messages.append(data)
 
@@ -217,6 +226,7 @@ class SessionManager:
                 metadata=metadata,
                 last_consolidated=last_consolidated,
                 todos=todos,
+                pending_consolidation_summary=pending_consolidation_summary,
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -235,6 +245,7 @@ class SessionManager:
                 "metadata": session.metadata,
                 "last_consolidated": session.last_consolidated,
                 "todos": session.todos,
+                "pending_consolidation_summary": session.pending_consolidation_summary,
             }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             for msg in session.messages:

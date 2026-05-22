@@ -476,3 +476,50 @@ class TestMemoryConsolidationTypeHandling:
         provider.chat_with_retry = AsyncMock(return_value=no_tool)
         assert await store.consolidate(messages, provider, "m") is False
         assert store._consecutive_failures == 1
+
+
+class TestPendingCallback:
+    @pytest.mark.asyncio
+    async def test_pending_callback_intercepts_memory_update(self, tmp_path: Path) -> None:
+        """When pending_callback is provided, MEMORY.md is NOT written and
+        the update is handed to the callback instead — used to keep system
+        prompt cache warm across consolidations."""
+        store = MemoryStore(tmp_path)
+        ok_resp = _make_tool_response(
+            history_entry="[2026-01-01] something happened",
+            memory_update="# Memory\n## Progress\nStep 1 done.",
+        )
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(return_value=ok_resp)
+
+        captured: list[str] = []
+        ok = await store.consolidate(
+            _make_messages(5), provider, "m",
+            pending_callback=captured.append,
+        )
+
+        assert ok is True
+        assert captured == ["# Memory\n## Progress\nStep 1 done."]
+        # MEMORY.md should NOT have been written — that's the whole point
+        assert not store.memory_file.exists()
+        # HISTORY.md still gets the entry (it's a separate append-only file
+        # that doesn't enter the system prompt)
+        assert store.history_file.exists()
+        assert "something happened" in store.history_file.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_no_callback_uses_legacy_write_path(self, tmp_path: Path) -> None:
+        """Without pending_callback, MEMORY.md is written as before."""
+        store = MemoryStore(tmp_path)
+        ok_resp = _make_tool_response(
+            history_entry="[2026-01-01] x",
+            memory_update="# Memory\nstate",
+        )
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(return_value=ok_resp)
+
+        ok = await store.consolidate(_make_messages(5), provider, "m")
+
+        assert ok is True
+        assert store.memory_file.exists()
+        assert store.memory_file.read_text(encoding="utf-8") == "# Memory\nstate"

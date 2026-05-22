@@ -178,18 +178,38 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         learning_ctx: str | None = None,
         session_key: str | None = None,
         todos: list[dict[str, Any]] | None = None,
+        pending_summary: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
         user_content = self._build_user_content(current_message, media)
 
+        # If a pending consolidation summary is buffered (deferred from a
+        # previous turn or earlier in this turn to keep the system prompt
+        # cache-warm), inject it as a system-reminder right before the user
+        # content so the LLM gets the updated context without us re-rendering
+        # the (cached) system prompt.
+        reminder = ""
+        if pending_summary and pending_summary.strip():
+            reminder = (
+                "<system-reminder>\n"
+                "Updated long-term memory (consolidated from earlier in this "
+                "conversation; not yet promoted to MEMORY.md):\n\n"
+                f"{pending_summary.strip()}\n"
+                "</system-reminder>"
+            )
+
         # Merge runtime context, optional turn summary, and user content into a single
         # user message to avoid consecutive same-role messages that some providers reject.
-        prefix = f"{learning_ctx}\n\n{runtime_ctx}" if learning_ctx else runtime_ctx
+        prefix_parts = [p for p in (learning_ctx, runtime_ctx, reminder) if p]
+        prefix = "\n\n".join(prefix_parts) if prefix_parts else ""
         if isinstance(user_content, str):
-            merged = f"{prefix}\n\n{user_content}"
+            merged = f"{prefix}\n\n{user_content}" if prefix else user_content
         else:
-            merged = [{"type": "text", "text": prefix}] + user_content
+            merged = (
+                [{"type": "text", "text": prefix}] + user_content
+                if prefix else user_content
+            )
 
         return [
             {"role": "system", "content": self.build_system_prompt(

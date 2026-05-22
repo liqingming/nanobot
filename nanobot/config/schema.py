@@ -44,6 +44,16 @@ class AgentDefaults(Base):
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     enable_learning: bool = True  # self-learning: TurnSummary injection, memory consolidation, search_history tool
     tui_backend: str = "textual"  # TUI backend for interactive mode: "textual" | "prompt_toolkit"
+    # When True, on startup auto-promote any session's pending consolidation
+    # summary into MEMORY.md (rebuilds system prompt → first turn after
+    # restart has a cache miss). Default False keeps cache warm across
+    # restarts but means MEMORY.md may stay stale until manually promoted
+    # via /commit_memory.
+    promote_pending_on_restart: bool = False
+    # Auto-promote the pending consolidation summary to MEMORY.md when it
+    # grows beyond this many characters (≈ chars/4 tokens). Keeps the
+    # injected <system-reminder> from bloating each user message.
+    pending_promote_threshold_chars: int = 10_000
 
 
 class AgentsConfig(Base):

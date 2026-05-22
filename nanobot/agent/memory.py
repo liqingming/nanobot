@@ -136,8 +136,20 @@ class MemoryStore:
         messages: list[dict],
         provider: LLMProvider,
         model: str,
+        pending_callback: Callable[[str], None] | None = None,
     ) -> bool:
-        """Consolidate the provided message chunk into MEMORY.md + HISTORY.md."""
+        """Consolidate the provided message chunk into MEMORY.md + HISTORY.md.
+
+        ``pending_callback`` lets the caller intercept the ``memory_update``
+        string and decide *not* to write it to MEMORY.md right now. This is
+        used to keep the system prompt stable during a turn — the caller
+        stores the update in ``session.pending_consolidation_summary`` and
+        promotes it to MEMORY.md at the start of the next user-initiated
+        turn (when a new system prompt is built anyway).
+
+        When ``pending_callback`` is None (default), the legacy path is
+        used: ``write_long_term(update)`` flushes immediately.
+        """
         if not messages:
             return True
 
@@ -226,7 +238,12 @@ class MemoryStore:
             self.append_history(entry)
             update = _ensure_text(update)
             if update != current_memory:
-                self.write_long_term(update)
+                if pending_callback is not None:
+                    # Defer the write — caller will hold the update in pending
+                    # state and promote it at a cache-friendly moment.
+                    pending_callback(update)
+                else:
+                    self.write_long_term(update)
 
             self._consecutive_failures = 0
             logger.info("Memory consolidation done for {} messages", len(messages))
@@ -277,6 +294,7 @@ class MemoryConsolidator:
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
+        pending_promote_threshold_chars: int = 10_000,
     ):
         self.workspace = workspace
         self.store = MemoryStore(workspace)
@@ -285,6 +303,7 @@ class MemoryConsolidator:
         self.sessions = sessions
         self.context_window_tokens = context_window_tokens
         self.max_completion_tokens = max_completion_tokens
+        self.pending_promote_threshold_chars = pending_promote_threshold_chars
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
@@ -300,9 +319,72 @@ class MemoryConsolidator:
         return self._topic_stores[session_key]
 
     async def consolidate_messages(self, messages: list[dict[str, object]], session_key: str | None = None) -> bool:
-        """Archive a selected message chunk into persistent memory."""
+        """Archive a selected message chunk into persistent memory.
+
+        When ``session_key`` is provided, the memory_update is buffered in
+        ``session.pending_consolidation_summary`` instead of being written
+        to MEMORY.md immediately. This keeps the LLM's system prompt stable
+        for the rest of the current turn (prompt cache stays warm).
+
+        Auto-promote safety valve: once buffered pending exceeds
+        ``pending_promote_threshold_chars`` (default 10k ≈ 2.5k tokens),
+        flush it to MEMORY.md immediately. Otherwise user messages would
+        carry an unbounded <system-reminder> payload.
+        """
         store = self._get_topic_store(session_key) if session_key else self.store
-        return await store.consolidate(messages, self.provider, self.model)
+
+        if session_key is None:
+            return await store.consolidate(messages, self.provider, self.model)
+
+        session = self.sessions.get_or_create(session_key)
+
+        def _buffer_to_session(update: str) -> None:
+            session.pending_consolidation_summary = update
+
+        ok = await store.consolidate(
+            messages, self.provider, self.model,
+            pending_callback=_buffer_to_session,
+        )
+        if ok and session.pending_consolidation_summary is not None:
+            # Persist so reload/restart sees the pending state.
+            self.sessions.save(session)
+            # If pending grew past the threshold, force-promote now so the
+            # next user message doesn't carry a huge system-reminder.
+            if len(session.pending_consolidation_summary) > self.pending_promote_threshold_chars:
+                logger.info(
+                    "Pending consolidation summary exceeds {} chars, "
+                    "auto-promoting to MEMORY.md for {}",
+                    self.pending_promote_threshold_chars, session_key,
+                )
+                self.promote_pending_summary(session_key)
+        return ok
+
+    def promote_pending_summary(self, session_key: str) -> None:
+        """Flush a session's pending consolidation summary to its topic
+        MEMORY.md and clear the pending state. Idempotent — does nothing if
+        there's no pending summary.
+
+        Called by:
+          * auto-promote (size threshold exceeded in consolidate_messages)
+          * /commit_memory user command
+          * AgentLoop startup when promote_pending_on_restart is enabled
+        """
+        session = self.sessions.get_or_create(session_key)
+        pending = session.pending_consolidation_summary
+        if not pending:
+            return
+        store = self._get_topic_store(session_key)
+        chars = len(pending)
+        try:
+            store.write_long_term(pending)
+            logger.info(
+                "promoted pending consolidation summary for {}: "
+                "{} chars written to MEMORY.md ({})",
+                session_key, chars, store.memory_file,
+            )
+        finally:
+            session.pending_consolidation_summary = None
+            self.sessions.save(session)
 
     def pick_consolidation_boundary(
         self,
@@ -376,12 +458,18 @@ class MemoryConsolidator:
             estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
-            if estimated < budget:
+            # Trigger threshold is budget * 1.2 (not raw budget) — gives a 20%
+            # headroom so we don't consolidate the moment we touch the limit.
+            # Less frequent consolidations = fewer system-prompt churns, which
+            # matters more once pending-summary message-injection is in place.
+            trigger = int(budget * 1.2)
+            if estimated < trigger:
                 logger.debug(
-                    "Token consolidation idle {}: {}/{} via {}",
+                    "Token consolidation idle {}: {}/{} (trigger={}) via {}",
                     session.key,
                     estimated,
                     self.context_window_tokens,
+                    trigger,
                     source,
                 )
                 return
