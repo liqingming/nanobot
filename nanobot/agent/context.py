@@ -70,8 +70,19 @@ class ContextBuilder:
         if skills_summary:
             parts.append(f"""# Skills
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
-Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
+The following skills extend your capabilities. Each skill is a pre-written task playbook (steps, idioms, gotchas).
+
+## When to use a skill
+Before starting a substantial task, scan this <skills> list and match the request to any skill's <description>. If even one skill looks relevant, load it FIRST — skills exist precisely because the bare model misses important steps the skill author already worked out. A small loading cost beats redoing work.
+
+## How to load
+Call `load_skill(name="...")` with the <name> from the list (NOT a path). The tool returns the skill body wrapped in `<skill>` tags.
+
+## After loading
+Treat the loaded <skill> content as authoritative instructions for that task. Follow its steps in order. Do not improvise around explicit guidance — when the skill conflicts with your default approach, the skill wins.
+
+## Unavailable skills
+Entries with `available="false"` need dependencies installed first (see `<requires>`). You can try `apt`/`brew`/`pip` install via the exec tool if appropriate.
 
 {skills_summary}""")
 
@@ -166,6 +177,68 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
 
         return "\n\n".join(parts) if parts else ""
 
+    # Tokens shorter than this are skipped during skill-match scoring
+    # (avoids matching on noise words like "to", "an", "in"). 4 is the
+    # common cutoff for short English/Chinese filler words.
+    _SKILL_MATCH_MIN_TOKEN_LEN = 4
+    # Cap on how many skills to suggest in one reminder so it stays a hint,
+    # not a wall of text. The LLM can always inspect the full <skills> list.
+    _SKILL_MATCH_MAX_SUGGESTIONS = 3
+
+    def _build_skill_match_reminder(self, user_message: str) -> str:
+        """If any installed skill's description has notable keyword overlap
+        with the user's message, return a ``<system-reminder>`` suggesting
+        ``load_skill(name)`` for it. Returns empty when nothing matches —
+        the LLM should not get a noisy nudge on every turn.
+
+        Matching is plain lowercase substring containment of description
+        tokens (length ≥ ``_SKILL_MATCH_MIN_TOKEN_LEN``) against the user
+        message. Cheap and false-positive-tolerant; the system-reminder
+        wording emphasizes "consider" so the LLM can dismiss bad matches.
+        """
+        if not user_message or not user_message.strip():
+            return ""
+        try:
+            skills = self.skills.list_skills(filter_unavailable=True)
+        except Exception:
+            return ""
+        if not skills:
+            return ""
+        msg_lower = user_message.lower()
+        suggestions: list[tuple[str, str, int]] = []
+        for s in skills:
+            name = s.get("name", "")
+            desc = self.skills._get_skill_description(name) or ""
+            if not name or not desc:
+                continue
+            # Tokenize description into >= min-len words; count how many
+            # appear as substrings of the user message. More overlap → higher
+            # confidence the skill is relevant.
+            tokens = {
+                t.strip(".,;:()[]{}\"'<>/").lower()
+                for t in desc.split()
+                if len(t) >= self._SKILL_MATCH_MIN_TOKEN_LEN
+            }
+            hits = sum(1 for t in tokens if t and t in msg_lower)
+            if hits > 0:
+                suggestions.append((name, desc.strip(), hits))
+        if not suggestions:
+            return ""
+        suggestions.sort(key=lambda x: x[2], reverse=True)
+        top = suggestions[: self._SKILL_MATCH_MAX_SUGGESTIONS]
+        bullets = "\n".join(
+            f"  - {name}: {desc} (call `load_skill(name=\"{name}\")`)"
+            for name, desc, _ in top
+        )
+        return (
+            "<system-reminder>\n"
+            "Your latest message may match these installed skills. "
+            "Consider loading one BEFORE proceeding so you don't miss "
+            "steps the skill author already worked out:\n\n"
+            f"{bullets}\n"
+            "</system-reminder>"
+        )
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -199,9 +272,15 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
                 "</system-reminder>"
             )
 
+        # Soft hint: scan available skills against the current user message
+        # and, if any look relevant, suggest load_skill via system-reminder.
+        # Decision stays with the LLM (it can ignore if the match was loose);
+        # this just nudges so a relevant skill doesn't get overlooked.
+        skill_hint = self._build_skill_match_reminder(current_message)
+
         # Merge runtime context, optional turn summary, and user content into a single
         # user message to avoid consecutive same-role messages that some providers reject.
-        prefix_parts = [p for p in (learning_ctx, runtime_ctx, reminder) if p]
+        prefix_parts = [p for p in (learning_ctx, runtime_ctx, reminder, skill_hint) if p]
         prefix = "\n\n".join(prefix_parts) if prefix_parts else ""
         if isinstance(user_content, str):
             merged = f"{prefix}\n\n{user_content}" if prefix else user_content

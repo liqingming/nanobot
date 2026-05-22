@@ -213,3 +213,114 @@ def test_tool_base_summarize_result_default() -> None:
         tool = TodoWriteTool(sessions=sessions)
         # TodoWriteTool doesn't define summarize_result → uses base default
         assert tool.summarize_result({}, "anything") == ""
+
+
+# ── LoadSkillTool: dedicated skill loader with section-count summary ───
+
+
+def _make_loader_with_skill(tmp_path: Path, name: str, body: str):
+    from nanobot.agent.skills import SkillsLoader
+    skill_dir = tmp_path / "skills" / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
+    return SkillsLoader(tmp_path)
+
+
+def test_load_skill_returns_wrapped_skill_content(tmp_path: Path) -> None:
+    import asyncio
+    from nanobot.agent.tools.skill import LoadSkillTool
+    loader = _make_loader_with_skill(tmp_path, "foo", "# foo\n## A\nbody")
+    tool = LoadSkillTool(loader=loader)
+    out = asyncio.run(tool.execute(name="foo"))
+    assert out.startswith('<skill name="foo">')
+    assert out.endswith("</skill>")
+    assert "# foo" in out and "## A" in out
+
+
+def test_load_skill_summary_counts_sections(tmp_path: Path) -> None:
+    import asyncio
+    from nanobot.agent.tools.skill import LoadSkillTool
+    body = "# foo\n## Overview\n...\n## Usage\n...\n## Examples\n...\n"
+    loader = _make_loader_with_skill(tmp_path, "foo", body)
+    tool = LoadSkillTool(loader=loader)
+    out = asyncio.run(tool.execute(name="foo"))
+    assert tool.summarize_result({"name": "foo"}, out) == "loaded: 3 sections"
+
+
+def test_load_skill_unknown_lists_available(tmp_path: Path) -> None:
+    import asyncio
+    from nanobot.agent.tools.skill import LoadSkillTool
+    loader = _make_loader_with_skill(tmp_path, "alpha", "# alpha\n")
+    tool = LoadSkillTool(loader=loader)
+    out = asyncio.run(tool.execute(name="nope"))
+    assert "Error" in out and "alpha" in out
+
+
+def test_load_skill_empty_name_returns_error(tmp_path: Path) -> None:
+    import asyncio
+    from nanobot.agent.tools.skill import LoadSkillTool
+    loader = _make_loader_with_skill(tmp_path, "x", "# x\n")
+    tool = LoadSkillTool(loader=loader)
+    out = asyncio.run(tool.execute(name=""))
+    assert "Error" in out
+
+
+def test_load_skill_no_sections_falls_back_to_line_count(tmp_path: Path) -> None:
+    import asyncio
+    from nanobot.agent.tools.skill import LoadSkillTool
+    body = "Just plain text\nwith no headers\nat all\n"
+    loader = _make_loader_with_skill(tmp_path, "plain", body)
+    tool = LoadSkillTool(loader=loader)
+    out = asyncio.run(tool.execute(name="plain"))
+    summary = tool.summarize_result({"name": "plain"}, out)
+    assert summary.startswith("loaded:") and "line" in summary
+
+
+def test_read_file_summary_no_longer_specializes_skill_md(tmp_path: Path) -> None:
+    """ReadFileTool reverts to plain N lines / M chars — LoadSkillTool
+    owns the skill-flavoured summary now."""
+    from nanobot.agent.tools.filesystem import ReadFileTool
+    tool = ReadFileTool(workspace=tmp_path)
+    out = tool.summarize_result(
+        {"path": "skills/foo/SKILL.md"},
+        "## A\n## B\nbody\n",
+    )
+    assert "loaded:" not in out
+    assert "line" in out and "chars" in out
+
+
+# ── frontmatter version extraction in LoadSkillTool summary ─────────────
+
+
+def test_load_skill_summary_includes_version_from_frontmatter(tmp_path: Path) -> None:
+    import asyncio
+    from nanobot.agent.tools.skill import LoadSkillTool
+    body = "---\nversion: 1.2\nauthor: x\n---\n# foo\n## A\n## B\n"
+    loader = _make_loader_with_skill(tmp_path, "foo", body)
+    tool = LoadSkillTool(loader=loader)
+    out = asyncio.run(tool.execute(name="foo"))
+    summary = tool.summarize_result({"name": "foo"}, out)
+    assert summary == "loaded: v1.2, 2 sections"
+
+
+def test_load_skill_summary_no_version_when_no_frontmatter(tmp_path: Path) -> None:
+    import asyncio
+    from nanobot.agent.tools.skill import LoadSkillTool
+    body = "# foo\n## A\n## B\n"
+    loader = _make_loader_with_skill(tmp_path, "foo", body)
+    tool = LoadSkillTool(loader=loader)
+    out = asyncio.run(tool.execute(name="foo"))
+    summary = tool.summarize_result({"name": "foo"}, out)
+    assert summary == "loaded: 2 sections"
+    assert "v" not in summary or "version" not in summary
+
+
+def test_load_skill_summary_handles_quoted_version(tmp_path: Path) -> None:
+    import asyncio
+    from nanobot.agent.tools.skill import LoadSkillTool
+    body = '---\nversion: "2.0.1"\n---\n# x\n## A\n'
+    loader = _make_loader_with_skill(tmp_path, "x", body)
+    tool = LoadSkillTool(loader=loader)
+    out = asyncio.run(tool.execute(name="x"))
+    summary = tool.summarize_result({"name": "x"}, out)
+    assert "v2.0.1" in summary

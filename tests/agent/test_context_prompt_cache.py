@@ -121,3 +121,107 @@ def test_empty_pending_summary_does_not_inject_reminder(tmp_path) -> None:
     )
     user_content = msgs[-1]["content"]
     assert "<system-reminder>" not in str(user_content)
+
+
+# ── soft-hint skill auto-suggest in build_messages ──────────────────────
+
+
+def _make_workspace_with_skill(tmp_path, name: str, description: str) -> Path:
+    """Create a workspace with one workspace skill stub for tests."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    skill_dir = workspace / "skills" / name
+    skill_dir.mkdir(parents=True)
+    skill_md = f"""---
+description: {description}
+---
+# {name}
+## Steps
+1. do x
+"""
+    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    return workspace
+
+
+def test_skill_match_reminder_appears_when_keywords_overlap(tmp_path) -> None:
+    workspace = _make_workspace_with_skill(
+        tmp_path, "dataset_explore", "Explore tabular datasets and CSV files"
+    )
+    builder = ContextBuilder(workspace)
+    msgs = builder.build_messages(
+        history=[],
+        current_message="help me explore this CSV dataset",
+        channel="cli",
+        chat_id="direct",
+        session_key="cli:direct",
+    )
+    user_content = msgs[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "<system-reminder>" in user_content
+    assert "load_skill" in user_content
+    assert "dataset_explore" in user_content
+
+
+def test_skill_match_reminder_absent_when_no_keyword_overlap(tmp_path) -> None:
+    """A specific workspace skill should NOT be suggested when its
+    description keywords don't appear in the user message — even if some
+    other (builtin) skill happens to match a different word."""
+    workspace = _make_workspace_with_skill(
+        tmp_path, "video_edit", "Edit zzzz qqqq xxxz yyyzqx"  # nonsense tokens
+    )
+    builder = ContextBuilder(workspace)
+    msgs = builder.build_messages(
+        history=[],
+        current_message="please help me with file io",
+        channel="cli",
+        chat_id="direct",
+        session_key="cli:direct",
+    )
+    user_content = msgs[-1]["content"]
+    assert isinstance(user_content, str)
+    # The custom skill's name must not appear — none of its nonsense tokens
+    # are in the user message. (Builtin skills may or may not match other
+    # words; that's not what we're testing.)
+    assert "video_edit" not in user_content
+
+
+def test_skill_match_reminder_skips_short_tokens(tmp_path) -> None:
+    """Tokens shorter than _SKILL_MATCH_MIN_TOKEN_LEN must not trigger.
+    Otherwise common words like 'to', 'an', 'in' would always match."""
+    workspace = _make_workspace_with_skill(
+        tmp_path, "spam_skill", "to an in or so"  # all words < 4 chars
+    )
+    builder = ContextBuilder(workspace)
+    msgs = builder.build_messages(
+        history=[],
+        current_message="please help me with this task",  # also short tokens
+        channel="cli",
+        chat_id="direct",
+        session_key="cli:direct",
+    )
+    user_content = msgs[-1]["content"]
+    assert "spam_skill" not in user_content
+
+
+def test_skill_match_keeps_system_prompt_byte_identical(tmp_path) -> None:
+    """The reminder lives in user content, not system prompt — keeps cache warm."""
+    workspace = _make_workspace_with_skill(
+        tmp_path, "dataset_explore", "Explore tabular datasets"
+    )
+    builder = ContextBuilder(workspace)
+    msgs_match = builder.build_messages(
+        history=[],
+        current_message="explore tabular data",
+        channel="cli",
+        chat_id="direct",
+        session_key="cli:direct",
+    )
+    msgs_nomatch = builder.build_messages(
+        history=[],
+        current_message="what's the weather",
+        channel="cli",
+        chat_id="direct",
+        session_key="cli:direct",
+    )
+    # system prompt is identical regardless of whether the skill matched
+    assert msgs_match[0]["content"] == msgs_nomatch[0]["content"]

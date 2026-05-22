@@ -198,3 +198,24 @@ def test_tool_hint_no_relativization_for_non_path_keys() -> None:
     out = format_tool_hint([_tc("web_fetch", args)], workspace="/some")
     # url not in _HINT_PATH_KEYS → no relativization
     assert "/some/path/looking/url" in out
+
+
+# ── load_skill tool renders skill name from its `name` arg ─────────────
+
+
+def test_load_skill_tool_hint_uses_name_arg(tmp_path: Path) -> None:
+    """load_skill takes a skill name (not a path) — the trace should show
+    that name verbatim instead of falling through to generic stringify."""
+    args = {"name": "dataset_explore"}
+    out = format_tool_hint([_tc("load_skill", args)], workspace=tmp_path)
+    assert out == 'load_skill("dataset_explore")'
+
+
+def test_read_file_skill_md_now_shows_as_read_file(tmp_path: Path) -> None:
+    """read_file on a SKILL.md no longer gets special-cased — the LLM
+    should be using load_skill instead. If it still does read_file, the
+    trace is just a plain read_file so the regression is visible."""
+    args = {"path": "skills/foo/SKILL.md"}
+    out = format_tool_hint([_tc("read_file", args)], workspace=tmp_path)
+    assert "load-skill" not in out
+    assert "read_file" in out and "SKILL.md" in out

@@ -34,6 +34,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.ask_user import AskUserTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.skill import LoadSkillTool
 from nanobot.agent.tools.todo import TodoWriteTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -407,6 +408,10 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(TodoWriteTool(sessions=self.sessions, bus=self.bus))
         self.tools.register(AskUserTool(bus=self.bus))
+        # Skills are loaded by name via LoadSkillTool. The skills loader
+        # already lives on ContextBuilder (used for the system-prompt
+        # listing); reuse it so workspace + builtin paths stay consistent.
+        self.tools.register(LoadSkillTool(loader=self.context.skills))
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
