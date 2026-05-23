@@ -16,3 +16,12 @@ carry minimal patches (1-3 lines): a callable registry slot or an
 This module is empty for now — phases 1+ of the fork-mirror refactor
 populate it as files migrate from the core tree.
 """
+
+# Tool self-registration — importing each module triggers its
+# ``register_fork_tool(...)`` call at the bottom of the file.
+from nanobot.fork.agent.tools import (  # noqa: F401
+    ask_user,
+    memory_search,
+    skill,
+    todo,
+)

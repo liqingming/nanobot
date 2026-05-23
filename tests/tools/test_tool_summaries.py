@@ -205,7 +205,7 @@ def test_web_fetch_summary_error() -> None:
 
 def test_tool_base_summarize_result_default() -> None:
     """Tools that don't override return empty string."""
-    from nanobot.agent.tools.todo import TodoWriteTool
+    from nanobot.fork.agent.tools.todo import TodoWriteTool
     from nanobot.session.manager import SessionManager
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
@@ -228,7 +228,7 @@ def _make_loader_with_skill(tmp_path: Path, name: str, body: str):
 
 def test_load_skill_returns_wrapped_skill_content(tmp_path: Path) -> None:
     import asyncio
-    from nanobot.agent.tools.skill import LoadSkillTool
+    from nanobot.fork.agent.tools.skill import LoadSkillTool
     loader = _make_loader_with_skill(tmp_path, "foo", "# foo\n## A\nbody")
     tool = LoadSkillTool(loader=loader)
     out = asyncio.run(tool.execute(name="foo"))
@@ -239,7 +239,7 @@ def test_load_skill_returns_wrapped_skill_content(tmp_path: Path) -> None:
 
 def test_load_skill_summary_counts_sections(tmp_path: Path) -> None:
     import asyncio
-    from nanobot.agent.tools.skill import LoadSkillTool
+    from nanobot.fork.agent.tools.skill import LoadSkillTool
     body = "# foo\n## Overview\n...\n## Usage\n...\n## Examples\n...\n"
     loader = _make_loader_with_skill(tmp_path, "foo", body)
     tool = LoadSkillTool(loader=loader)
@@ -249,7 +249,7 @@ def test_load_skill_summary_counts_sections(tmp_path: Path) -> None:
 
 def test_load_skill_unknown_lists_available(tmp_path: Path) -> None:
     import asyncio
-    from nanobot.agent.tools.skill import LoadSkillTool
+    from nanobot.fork.agent.tools.skill import LoadSkillTool
     loader = _make_loader_with_skill(tmp_path, "alpha", "# alpha\n")
     tool = LoadSkillTool(loader=loader)
     out = asyncio.run(tool.execute(name="nope"))
@@ -258,7 +258,7 @@ def test_load_skill_unknown_lists_available(tmp_path: Path) -> None:
 
 def test_load_skill_empty_name_returns_error(tmp_path: Path) -> None:
     import asyncio
-    from nanobot.agent.tools.skill import LoadSkillTool
+    from nanobot.fork.agent.tools.skill import LoadSkillTool
     loader = _make_loader_with_skill(tmp_path, "x", "# x\n")
     tool = LoadSkillTool(loader=loader)
     out = asyncio.run(tool.execute(name=""))
@@ -267,7 +267,7 @@ def test_load_skill_empty_name_returns_error(tmp_path: Path) -> None:
 
 def test_load_skill_no_sections_falls_back_to_line_count(tmp_path: Path) -> None:
     import asyncio
-    from nanobot.agent.tools.skill import LoadSkillTool
+    from nanobot.fork.agent.tools.skill import LoadSkillTool
     body = "Just plain text\nwith no headers\nat all\n"
     loader = _make_loader_with_skill(tmp_path, "plain", body)
     tool = LoadSkillTool(loader=loader)
@@ -294,7 +294,7 @@ def test_read_file_summary_no_longer_specializes_skill_md(tmp_path: Path) -> Non
 
 def test_load_skill_summary_includes_version_from_frontmatter(tmp_path: Path) -> None:
     import asyncio
-    from nanobot.agent.tools.skill import LoadSkillTool
+    from nanobot.fork.agent.tools.skill import LoadSkillTool
     body = "---\nversion: 1.2\nauthor: x\n---\n# foo\n## A\n## B\n"
     loader = _make_loader_with_skill(tmp_path, "foo", body)
     tool = LoadSkillTool(loader=loader)
@@ -305,7 +305,7 @@ def test_load_skill_summary_includes_version_from_frontmatter(tmp_path: Path) ->
 
 def test_load_skill_summary_no_version_when_no_frontmatter(tmp_path: Path) -> None:
     import asyncio
-    from nanobot.agent.tools.skill import LoadSkillTool
+    from nanobot.fork.agent.tools.skill import LoadSkillTool
     body = "# foo\n## A\n## B\n"
     loader = _make_loader_with_skill(tmp_path, "foo", body)
     tool = LoadSkillTool(loader=loader)
@@ -317,7 +317,7 @@ def test_load_skill_summary_no_version_when_no_frontmatter(tmp_path: Path) -> No
 
 def test_load_skill_summary_handles_quoted_version(tmp_path: Path) -> None:
     import asyncio
-    from nanobot.agent.tools.skill import LoadSkillTool
+    from nanobot.fork.agent.tools.skill import LoadSkillTool
     body = '---\nversion: "2.0.1"\n---\n# x\n## A\n'
     loader = _make_loader_with_skill(tmp_path, "x", body)
     tool = LoadSkillTool(loader=loader)

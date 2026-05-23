@@ -15,7 +15,7 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
-from nanobot.agent.learning import (
+from nanobot.fork.agent.learning import (
     PATTERN_THRESHOLD,
     PatternStore,
     TurnSummary,
@@ -28,14 +28,10 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
-from nanobot.agent.tools.memory_search import SearchHistoryTool
 from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.registry import ToolRegistry, iter_fork_tool_factories
 from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.ask_user import AskUserTool
 from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.skill import LoadSkillTool
-from nanobot.agent.tools.todo import TodoWriteTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -393,8 +389,6 @@ class AgentLoop:
         self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
-        if self.enable_learning:
-            self.tools.register(SearchHistoryTool(data_dir=self.context.data_dir))
         if self.exec_config.enable:
             self.tools.register(ExecTool(
                 working_dir=str(self.workspace),
@@ -406,12 +400,18 @@ class AgentLoop:
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
-        self.tools.register(TodoWriteTool(sessions=self.sessions, bus=self.bus))
-        self.tools.register(AskUserTool(bus=self.bus))
-        # Skills are loaded by name via LoadSkillTool. The skills loader
-        # already lives on ContextBuilder (used for the system-prompt
-        # listing); reuse it so workspace + builtin paths stay consistent.
-        self.tools.register(LoadSkillTool(loader=self.context.skills))
+
+        # Fork tools self-register via fork bootstrap. Iterate factories
+        # here so fork tools see the loop's wiring (bus / sessions /
+        # context) without import-time circular dependencies.
+        for factory in iter_fork_tool_factories():
+            try:
+                tool = factory(self)
+            except Exception:
+                continue
+            if tool is not None:
+                self.tools.register(tool)
+
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")

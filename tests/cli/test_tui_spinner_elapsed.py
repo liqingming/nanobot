@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from nanobot.cli.tui_textual import _TEXTUAL_AVAILABLE
+from nanobot.fork.cli.tui_textual import _TEXTUAL_AVAILABLE
 
 pytestmark = pytest.mark.skipif(
     not _TEXTUAL_AVAILABLE, reason="textual not installed"
@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(
 
 def _suffix_at(elapsed_seconds: float) -> str:
     """Construct a fake start_time so the helper sees a known elapsed value."""
-    from nanobot.cli.tui_textual import _NanobotApp
+    from nanobot.fork.cli.tui_textual import _NanobotApp
     fake_start = time.monotonic() - elapsed_seconds
     return _NanobotApp._elapsed_suffix(fake_start)
 
@@ -66,7 +66,7 @@ def test_suffix_transition_at_minute_boundary() -> None:
 
 def test_suffix_progresses_linearly_with_real_time() -> None:
     """Critical sanity: the displayed seconds advance at real-time rate."""
-    from nanobot.cli.tui_textual import _NanobotApp
+    from nanobot.fork.cli.tui_textual import _NanobotApp
     import re
 
     # Pretend we started 3 seconds ago, then sleep 1.1 real seconds and

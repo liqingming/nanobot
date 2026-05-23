@@ -9,7 +9,7 @@ from __future__ import annotations
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
-from nanobot.cli.tui_keys import (
+from nanobot.fork.cli.tui_keys import (
     EnterAction,
     EnterDecision,
     PopupAction,

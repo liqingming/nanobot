@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from nanobot.agent.tools.ask_user import AskUserTool, deliver_reply
+from nanobot.fork.agent.tools.ask_user import AskUserTool, deliver_reply
 from nanobot.bus.queue import MessageBus
 
 

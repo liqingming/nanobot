@@ -7,7 +7,7 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from nanobot.cli.tui import PromptTUI
+from nanobot.fork.cli.tui import PromptTUI
 
 
 @pytest.fixture

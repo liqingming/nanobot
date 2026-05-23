@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from nanobot.cli.tui_textual import _TEXTUAL_AVAILABLE, TextualTUI
+from nanobot.fork.cli.tui_textual import _TEXTUAL_AVAILABLE, TextualTUI
 
 pytestmark = pytest.mark.skipif(
     not _TEXTUAL_AVAILABLE, reason="textual library is not installed"

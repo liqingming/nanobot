@@ -13,7 +13,7 @@ import asyncio
 import pytest
 from prompt_toolkit.document import Document
 
-from nanobot.cli.tui import PromptTUI
+from nanobot.fork.cli.tui import PromptTUI
 
 
 async def _drain() -> None:

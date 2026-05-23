@@ -57,7 +57,7 @@ class ContextBuilder:
             parts.append("# Memory\n\n" + "\n\n".join(mem_parts))
 
         if todos:
-            from nanobot.agent.tools.todo import format_todos
+            from nanobot.fork.agent.tools.todo import format_todos
             parts.append("# Active Todos\n\n" + format_todos(todos))
 
         always_skills = self.skills.get_always_skills()

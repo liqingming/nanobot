@@ -1,8 +1,35 @@
 """Tool registry for dynamic tool management."""
 
-from typing import Any
+from typing import Any, Callable
 
 from nanobot.agent.tools.base import Tool
+
+
+# Fork extension point — list of factory callables that produce
+# fork-only Tool instances. Each callable receives the AgentLoop
+# instance (so it can wire bus / sessions / context dependencies) and
+# returns either a Tool to register or None to skip (e.g. a tool that
+# depends on optional features the loop didn't enable).
+#
+# Fork modules append here at import time via ``register_fork_tool``.
+# ``AgentLoop._register_default_tools`` iterates the list near the
+# end and registers each non-None return value, so adding a new fork
+# tool only requires:
+#   1. Drop the file in ``nanobot/fork/agent/tools/``.
+#   2. Import it from ``nanobot/fork/agent/tools/__init__.py`` so
+#      bootstrap triggers the registration.
+# Core never imports fork tool files directly.
+_FORK_TOOL_FACTORIES: list[Callable[[Any], Tool | None]] = []
+
+
+def register_fork_tool(factory: Callable[[Any], Tool | None]) -> None:
+    """Register a fork tool factory. See ``_FORK_TOOL_FACTORIES`` doc."""
+    _FORK_TOOL_FACTORIES.append(factory)
+
+
+def iter_fork_tool_factories() -> list[Callable[[Any], Tool | None]]:
+    """Return a snapshot of registered factories."""
+    return list(_FORK_TOOL_FACTORIES)
 
 
 class ToolRegistry:

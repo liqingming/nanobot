@@ -411,7 +411,7 @@ def _make_provider(config: Config):
 
     # --- instantiation by backend ---
     if backend == "claude_ai_oauth":
-        from nanobot.providers.claude_ai_oauth_provider import ClaudeAIOAuthProvider
+        from nanobot.fork.providers.claude_ai_oauth_provider import ClaudeAIOAuthProvider
         provider = ClaudeAIOAuthProvider(
             default_model=model,
             api_base=config.get_api_base(model),
@@ -903,7 +903,7 @@ def agent(
     else:
         # Interactive mode — split-pane TUI (output pane + persistent input line)
         from nanobot.bus.events import InboundMessage
-        from nanobot.cli.tui_factory import create_tui
+        from nanobot.fork.cli.tui_factory import create_tui
         from nanobot.config.paths import get_cli_history_path
 
         if ":" in session_id:
@@ -1157,7 +1157,7 @@ def agent(
                     return
 
                 if text == "/todos" or text.startswith("/todos "):
-                    from nanobot.agent.tools.todo import format_todos
+                    from nanobot.fork.agent.tools.todo import format_todos
                     arg = text[len("/todos"):].strip()
                     s = agent_loop.sessions.get_or_create(
                         f"{cli_channel}:{topic_state['chat_id']}"
@@ -1262,7 +1262,7 @@ def agent(
                         # We dispatch the user's selection back to the tool's
                         # awaiting Future via the module-level deliver_reply.
                         if msg.metadata.get("_ask_user"):
-                            from nanobot.agent.tools.ask_user import deliver_reply
+                            from nanobot.fork.agent.tools.ask_user import deliver_reply
                             correlation_id = str(msg.metadata.get("_ask_user_id") or "")
                             questions = msg.metadata.get("_ask_user_questions") or []
 
@@ -1630,7 +1630,7 @@ def _login_github_copilot() -> None:
 
 @_register_login("claude_ai")
 def _login_claude_ai() -> None:
-    from nanobot.providers.claude_ai_oauth_provider import (
+    from nanobot.fork.providers.claude_ai_oauth_provider import (
         CLAUDE_CODE_CRED_FILE,
         save_oauth_token,
     )

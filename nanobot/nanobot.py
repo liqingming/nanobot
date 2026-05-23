@@ -132,7 +132,7 @@ def _make_provider(config: Any) -> Any:
             raise ValueError(f"No API key configured for provider '{provider_name}'.")
 
     if backend == "claude_ai_oauth":
-        from nanobot.providers.claude_ai_oauth_provider import ClaudeAIOAuthProvider
+        from nanobot.fork.providers.claude_ai_oauth_provider import ClaudeAIOAuthProvider
 
         provider = ClaudeAIOAuthProvider(
             default_model=model,
