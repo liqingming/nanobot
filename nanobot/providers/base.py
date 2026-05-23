@@ -1,4 +1,12 @@
-"""Base LLM provider interface."""
+"""Base LLM provider interface.
+
+Fork additions:
+  * ``_is_max_tokens_error`` / ``_extract_max_tokens_upper_bound`` /
+    ``_downgrade_max_tokens`` — auto-detect ``max_tokens`` rejection
+    from the API, parse the upper bound from the error message, and
+    permanently downgrade this provider's default for the session.
+  * Wired into ``_safe_chat`` / ``_safe_chat_stream`` retry paths.
+"""
 
 import asyncio
 import json

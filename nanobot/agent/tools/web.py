@@ -1,4 +1,12 @@
-"""Web tools: web_search and web_fetch."""
+"""Web tools: web_search and web_fetch.
+
+Fork additions:
+  * ``WebSearchTool.summarize_result`` / ``WebFetchTool.summarize_result``
+    — pull error / result-count summaries via
+    ``nanobot/agent/tools/summaries.py`` so tool-trace lines stay short.
+    summaries.py is itself a fork file but kept in core because too many
+    upstream tools (filesystem / shell / web) consume it.
+"""
 
 from __future__ import annotations
 

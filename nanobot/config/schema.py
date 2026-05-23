@@ -1,4 +1,12 @@
-"""Configuration schema using Pydantic."""
+"""Configuration schema using Pydantic.
+
+Fork additions (kept in core so pydantic can validate):
+  * ``AgentDefaults.enable_learning``, ``tui_backend``,
+    ``promote_pending_on_restart``, ``pending_promote_threshold_chars``
+    — fork self-learning / TUI / consolidation knobs.
+  * ``AgentDefaults.max_tool_iterations`` default 40 → 1000.
+  * ``ProvidersConfig.claude_ai`` — fork claude.ai OAuth provider entry.
+"""
 
 from pathlib import Path
 from typing import Literal

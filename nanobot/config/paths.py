@@ -1,4 +1,11 @@
-"""Runtime path helpers derived from the active config context."""
+"""Runtime path helpers derived from the active config context.
+
+Fork additions:
+  * ``get_workspace_cache_dir(workspace)`` — fork-only utility for
+    per-workspace caches dir ``~/.nanobot/caches/<safe_name>_<hash>/``.
+    Stays in core because ``commands.py`` consumers need it and moving
+    it to ``fork/`` would invert the core → fork dependency direction.
+"""
 
 from __future__ import annotations
 

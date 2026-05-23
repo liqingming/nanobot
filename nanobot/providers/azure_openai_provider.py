@@ -1,4 +1,9 @@
-"""Azure OpenAI provider implementation with API version 2024-10-21."""
+"""Azure OpenAI provider implementation with API version 2024-10-21.
+
+Fork additions:
+  * ``asyncio.CancelledError`` re-raise in ``chat`` / ``chat_stream`` so
+    task cancellation isn't swallowed by the generic ``except Exception``.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,15 @@
-"""Anthropic provider — direct SDK integration for Claude models."""
+"""Anthropic provider — direct SDK integration for Claude models.
+
+Fork additions:
+  * ``_strip_prefix`` accepts ``claude-ai/`` / ``claude_ai/`` model
+    prefixes (fork claude.ai OAuth provider routes through this class).
+  * ``redacted_thinking`` block round-trip (both ``_assistant_blocks``
+    serialization + ``_parse_response`` deserialization).
+  * ``_is_temperature_deprecated_error`` + auto-retry without
+    ``temperature`` kwarg when Anthropic deprecates it on a model.
+  * ``asyncio.CancelledError`` re-raise in ``chat`` / ``chat_stream`` so
+    task cancellation isn't swallowed by the generic ``except Exception``.
+"""
 
 from __future__ import annotations
 

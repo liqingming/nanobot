@@ -1,6 +1,11 @@
 """
 Provider Registry — single source of truth for LLM provider metadata.
 
+Fork additions:
+  * ``claude_ai`` ProviderSpec — OAuth-backed claude.ai subscription
+    provider (backend ``claude_ai_oauth``, implemented in
+    ``nanobot/fork/providers/claude_ai_oauth_provider.py``).
+
 Adding a new provider:
   1. Add a ProviderSpec to PROVIDERS below.
   2. Add a field to ProvidersConfig in config/schema.py.

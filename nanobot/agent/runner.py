@@ -1,4 +1,13 @@
-"""Shared execution loop for tool-using agents."""
+"""Shared execution loop for tool-using agents.
+
+Fork additions:
+  * ``cache_read_input_tokens`` / ``cache_creation_input_tokens`` in
+    the ``usage`` dict — prompt-cache stats from Anthropic-style APIs.
+  * ``await hook.after_execute_tools(context)`` — fork hook used by
+    learning / TurnSummary capture to observe tool execution outcomes.
+  * Rephrased ``_DEFAULT_MAX_ITERATIONS_MESSAGE`` to mention
+    ``/continue`` (fork command).
+"""
 
 from __future__ import annotations
 

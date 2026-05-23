@@ -1,4 +1,10 @@
-"""Skills loader for agent capabilities."""
+"""Skills loader for agent capabilities.
+
+Fork additions:
+  * ``build_skills_summary`` omits ``<location>`` entries — fork's
+    ``load_skill(name=...)`` tool loads by name, exposing filesystem
+    paths just wastes prompt tokens and tempts read_file misuse.
+"""
 
 import json
 import os

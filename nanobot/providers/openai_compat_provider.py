@@ -1,4 +1,15 @@
-"""OpenAI-compatible provider for all non-Anthropic LLM APIs."""
+"""OpenAI-compatible provider for all non-Anthropic LLM APIs.
+
+Fork additions:
+  * DeepSeek thinking-mode history backfill — assistant messages
+    missing ``reasoning_content`` get ``""`` injected so DeepSeek-V4 /
+    R-thinking models accept the history (rejects requests otherwise).
+  * Recursive ``_deep_merge`` of user-configured ``extra_body`` after
+    provider-default extras, so nested dicts like
+    ``{"chat_template_kwargs": {"enable_thinking": false}}`` don't
+    clobber siblings.
+  * ``force_string_content`` for DeepSeek-style providers.
+"""
 
 from __future__ import annotations
 

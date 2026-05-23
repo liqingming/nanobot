@@ -1,4 +1,9 @@
-"""Subagent manager for background task execution."""
+"""Subagent manager for background task execution.
+
+Fork additions:
+  * Skills section prompt rephrased to instruct ``load_skill(name=...)``
+    (fork tool) instead of upstream's ``read_file`` SKILL.md hint.
+"""
 
 import asyncio
 import json
