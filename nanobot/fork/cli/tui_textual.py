@@ -54,8 +54,8 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from nanobot import __logo__, __version__
-from nanobot.cli.tui_base import TUIBase
-from nanobot.cli.tui_keys import (
+from nanobot.fork.cli.tui_base import TUIBase
+from nanobot.fork.cli.tui_keys import (
     EnterAction,
     PopupAction,
     TUIState,

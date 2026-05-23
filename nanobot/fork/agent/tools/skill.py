@@ -142,3 +142,10 @@ def _strip_frontmatter(text: str) -> str:
     if after < len(text) and text[after] == "\n":
         after += 1
     return text[after:]
+
+
+# ── self-registration ────────────────────────────────────────────────────
+
+from nanobot.agent.tools.registry import register_fork_tool
+
+register_fork_tool(lambda loop: LoadSkillTool(loader=loop.context.skills))

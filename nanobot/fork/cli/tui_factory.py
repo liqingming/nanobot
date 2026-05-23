@@ -6,7 +6,7 @@ Selection order:
 
 Usage::
 
-    from nanobot.cli.tui_factory import create_tui
+    from nanobot.fork.cli.tui_factory import create_tui
     tui = create_tui(render_markdown=True, history_file=..., model=...)
     await tui.run_async()
 """
@@ -16,7 +16,7 @@ import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from nanobot.cli.tui_base import TUIBase
+    from nanobot.fork.cli.tui_base import TUIBase
 
 _ENV_KEY = "NANOBOT_TUI"
 
@@ -31,7 +31,7 @@ def create_tui(
     backend = os.environ.get(_ENV_KEY, backend).strip().lower()
 
     if backend == "textual":
-        from nanobot.cli.tui_textual import TextualTUI
+        from nanobot.fork.cli.tui_textual import TextualTUI
         return TextualTUI(
             render_markdown=render_markdown,
             history_file=history_file,
@@ -39,7 +39,7 @@ def create_tui(
         )
 
     # Default: original prompt_toolkit backend
-    from nanobot.cli.tui import PromptTUI
+    from nanobot.fork.cli.tui import PromptTUI
     return PromptTUI(
         render_markdown=render_markdown,
         history_file=history_file,

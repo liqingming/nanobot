@@ -195,3 +195,10 @@ class AskUserTool(Tool):
             raise
 
         return json.dumps(result, ensure_ascii=False)
+
+
+# ── self-registration ────────────────────────────────────────────────────
+
+from nanobot.agent.tools.registry import register_fork_tool
+
+register_fork_tool(lambda loop: AskUserTool(bus=loop.bus))

@@ -318,3 +318,10 @@ class TodoWriteTool(Tool):
         if not new_items:
             return "Todo list cleared."
         return "Updated todo list:\n" + format_todos(new_items)
+
+
+# ── self-registration ────────────────────────────────────────────────────
+
+from nanobot.agent.tools.registry import register_fork_tool
+
+register_fork_tool(lambda loop: TodoWriteTool(sessions=loop.sessions, bus=loop.bus))

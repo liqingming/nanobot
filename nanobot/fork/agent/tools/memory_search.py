@@ -254,3 +254,17 @@ class SearchHistoryTool(Tool):
 
         header = f"Top {len(results)} results for {query!r} (out of {len(entries)} entries):\n\n"
         return header + "\n\n---\n\n".join(results)
+
+
+# ── self-registration ────────────────────────────────────────────────────
+
+from nanobot.agent.tools.registry import register_fork_tool
+
+
+def _search_history_factory(loop):
+    if not getattr(loop, "enable_learning", False):
+        return None
+    return SearchHistoryTool(data_dir=loop.context.data_dir)
+
+
+register_fork_tool(_search_history_factory)
