@@ -149,7 +149,8 @@ class TestMessageToolSuppressLogic:
         assert final_content == "Done"
         assert progress == [
             ("Visible", False),
-            ('read foo.txt', True),
+            # Fork: format_tool_hint shows tool_name("arg") with workspace-relative paths
+            ('read_file("foo.txt")', True),
         ]
 
 class TestMessageToolTurnTracking:

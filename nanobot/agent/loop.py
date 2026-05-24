@@ -188,7 +188,7 @@ class AgentLoop:
         max_messages: int = 120,
         hooks: list[AgentHook] | None = None,
         enable_learning: bool = True,
-        pending_promote_threshold_chars: int = 10_000,
+        nudge_after_empty_tools_message: str | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
@@ -246,8 +246,17 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self.enable_learning = enable_learning
+        # Fork: configurable nudge for empty-after-tools retry; empty disables.
+        self.nudge_after_empty_tools_message = (
+            nudge_after_empty_tools_message
+            if nudge_after_empty_tools_message is not None
+            else "请将你对上述内容的分析和总结写在回复正文里。"
+        )
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
+        # Fork: surface tool_events to _capture_turn_summary so error_count
+        # in TurnSummary reflects actual tool failures (was hardcoded 0).
+        self._last_tool_events: list[dict[str, Any]] = []
         self._pending_turn_latency_ms: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
@@ -341,6 +350,11 @@ class AgentLoop:
         self._register_default_tools()
         self._runtime_vars: dict[str, Any] = {}
         self._current_iteration: int = 0
+        # Fork: pre-build the tool-hint formatter once (closes over workspace)
+        # so each AgentProgressHook construction in _run_agent_loop is cheap.
+        from functools import partial
+        from nanobot.fork.utils.tool_hints import format_tool_hint as _fork_fmt
+        self._tool_hint_formatter = partial(_fork_fmt, workspace=self.workspace)
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
@@ -387,6 +401,9 @@ class AgentLoop:
             channels_config=config.channels,
             timezone=defaults.timezone,
             enable_learning=getattr(defaults, "enable_learning", True),
+            nudge_after_empty_tools_message=getattr(
+                defaults, "nudge_after_empty_tools_message", None,
+            ),
             unified_session=defaults.unified_session,
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
@@ -510,7 +527,11 @@ class AgentLoop:
         for factory in iter_fork_tool_factories():
             try:
                 tool = factory(self)
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    "Fork tool factory {!r} failed to construct, tool will be unavailable: {}",
+                    getattr(factory, "__name__", repr(factory)), e,
+                )
                 continue
             if tool is not None:
                 self.tools.register(tool)
@@ -732,6 +753,13 @@ class AgentLoop:
         usage = usage if usage is not None else self._last_usage
         tools_used = tools_used or []
         current_message = current_message or ""
+        # If caller didn't pass error_count, derive from the latest runner
+        # tool_events (Fork: was hardcoded 0 after merge).
+        if error_count == 0 and self._last_tool_events:
+            error_count = sum(
+                1 for ev in self._last_tool_events
+                if isinstance(ev, dict) and ev.get("status") == "error"
+            )
 
         # Compute pressure.
         prompt_tokens = usage.get("prompt_tokens", 0) if usage else 0
@@ -827,6 +855,7 @@ class AgentLoop:
             tool_hint_max_length=self.tool_hint_max_length,
             set_tool_context=self._set_tool_context,
             on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
+            tool_hint_formatter=self._tool_hint_formatter,
         )
         hook: AgentHook = (
             CompositeHook([loop_hook] + self._extra_hooks) if self._extra_hooks else loop_hook
@@ -899,6 +928,12 @@ class AgentLoop:
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=hook,
                 error_message="Sorry, I encountered an error calling the AI model.",
+                # Fork: friendly bilingual fallback (replaces upstream English-only)
+                max_iterations_message=(
+                    "我已经用完了本轮的工具调用预算 ({max_iterations} 次)，但任务还没完成。"
+                    "目前进度已保存——输入 `/continue` 可以从断点继续，"
+                    "或者把任务拆成更小的步骤。"
+                ),
                 concurrent_tools=True,
                 workspace=self.workspace,
                 session_key=session.key if session else None,
@@ -921,6 +956,7 @@ class AgentLoop:
         finally:
             reset_file_states(file_state_token)
         self._last_usage = result.usage
+        self._last_tool_events = list(result.tool_events or [])
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
             # Push final content through stream so streaming channels (e.g. Feishu)
@@ -1469,21 +1505,72 @@ class AgentLoop:
 
     async def _state_run(self, ctx: TurnContext) -> str:
         await self._webui_turns.publish_run_status(ctx.msg, "running")
-        result = await self._run_agent_loop(
-            ctx.initial_messages,
-            on_progress=ctx.on_progress,
-            on_stream=ctx.on_stream,
-            on_stream_end=ctx.on_stream_end,
-            on_retry_wait=ctx.on_retry_wait,
-            session=ctx.session,
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            message_id=ctx.msg.metadata.get("message_id"),
-            metadata=ctx.msg.metadata,
-            session_key=ctx.session_key,
-            pending_queue=ctx.pending_queue,
-        )
-        final_content, tools_used, all_msgs, stop_reason, had_injections = result
+
+        async def _invoke(initial_messages: list[dict]) -> tuple[
+            str | None, list[str], list[dict], str, bool,
+            dict[str, int], list[dict[str, Any]],
+        ]:
+            result = await self._run_agent_loop(
+                initial_messages,
+                on_progress=ctx.on_progress,
+                on_stream=ctx.on_stream,
+                on_stream_end=ctx.on_stream_end,
+                on_retry_wait=ctx.on_retry_wait,
+                session=ctx.session,
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                message_id=ctx.msg.metadata.get("message_id"),
+                metadata=ctx.msg.metadata,
+                session_key=ctx.session_key,
+                pending_queue=ctx.pending_queue,
+            )
+            # Snapshot self._last_usage / self._last_tool_events IMMEDIATELY
+            # after await so a cross-session concurrent _run_agent_loop cannot
+            # overwrite them before _capture_turn_summary sees them.  Both
+            # remain on self for external API (builtin /status command, etc.).
+            usage_snap = dict(self._last_usage)
+            events_snap = list(self._last_tool_events)
+            return (*result, usage_snap, events_snap)
+
+        (
+            final_content, tools_used, all_msgs, stop_reason, had_injections,
+            usage_snapshot, events_snapshot,
+        ) = await _invoke(ctx.initial_messages)
+
+        # Fork: nudge retry — some providers (notably zh LLMs) return an empty
+        # assistant message immediately after tool results without producing a
+        # real reply. Inject a follow-up user turn and re-run once; the second
+        # pass usually yields a real answer. Disable by setting the configured
+        # nudge message to an empty string.
+        if (
+            final_content is None
+            and self._empty_after_tools(all_msgs)
+            and self.nudge_after_empty_tools_message
+        ):
+            logger.info(
+                "Empty after tools for {}:{}, retrying with nudge",
+                ctx.msg.channel, ctx.msg.chat_id,
+            )
+            first_all_msgs = all_msgs
+            nudge = {
+                "role": "user",
+                "content": self.nudge_after_empty_tools_message,
+            }
+            (
+                r_content, r_tools, r_msgs, r_stop, _,
+                r_usage, r_events,
+            ) = await _invoke(first_all_msgs + [nudge])
+            if r_content is not None:
+                # Stitch: original messages + new messages, dropping the nudge.
+                # retry_msgs layout = first_all_msgs + [nudge] + retry_new_msgs
+                all_msgs = first_all_msgs + r_msgs[len(first_all_msgs) + 1:]
+                final_content = r_content
+                tools_used = tools_used + r_tools
+                stop_reason = r_stop
+                # Learning signal reflects the retry result (final turn state).
+                usage_snapshot = r_usage
+                events_snapshot = r_events
+
         ctx.final_content = final_content
         ctx.tools_used = tools_used
         ctx.all_messages = all_msgs
@@ -1491,13 +1578,21 @@ class AgentLoop:
         ctx.had_injections = had_injections
 
         # Fork learning hook: capture turn summary for next-turn injection.
+        # Pass snapshots directly so cross-session races on self._last_* cannot
+        # corrupt the TurnSummary error_count / pressure_pct signals.
         if self.enable_learning:
+            error_count = sum(
+                1 for ev in events_snapshot
+                if isinstance(ev, dict) and ev.get("status") == "error"
+            )
             self._capture_turn_summary(
                 ctx.session_key,
                 tools_used,
                 ctx.session,
                 ctx.msg.content,
                 stop_reason,
+                usage=usage_snapshot,
+                error_count=error_count,
             )
         return "ok"
 

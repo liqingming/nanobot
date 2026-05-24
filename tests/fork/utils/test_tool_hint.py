@@ -4,7 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from nanobot.agent.loop import _smart_truncate, format_tool_hint, relativize_path
+from nanobot.fork.utils.tool_hints import (
+    _smart_truncate,
+    format_tool_hint,
+    relativize_path,
+)
 
 
 def _tc(name: str, arguments) -> SimpleNamespace:

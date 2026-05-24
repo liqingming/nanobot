@@ -395,8 +395,10 @@ async def test_agent_loop_no_hooks_backward_compat(tmp_path):
     loop.max_iterations = 2
 
     content, tools_used, _, _, _ = await loop._run_agent_loop([])
+    # Fork: bilingual max_iterations message injected by loop._run_agent_loop
     assert content == (
-        "I reached the maximum number of tool call iterations (2) without "
-        "completing the task. You can try breaking the task into smaller steps."
+        "我已经用完了本轮的工具调用预算 (2 次)，但任务还没完成。"
+        "目前进度已保存——输入 `/continue` 可以从断点继续，"
+        "或者把任务拆成更小的步骤。"
     )
     assert tools_used == ["list_dir", "list_dir"]

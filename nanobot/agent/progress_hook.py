@@ -36,6 +36,7 @@ class AgentProgressHook(AgentHook):
         tool_hint_max_length: int = 40,
         set_tool_context: Callable[..., None] | None = None,
         on_iteration: Callable[[int], None] | None = None,
+        tool_hint_formatter: Callable[..., str] | None = None,
     ) -> None:
         super().__init__(reraise=True)
         self._on_progress = on_progress
@@ -49,6 +50,10 @@ class AgentProgressHook(AgentHook):
         self._tool_hint_max_length = tool_hint_max_length
         self._set_tool_context = set_tool_context
         self._on_iteration = on_iteration
+        # ``tool_hint_formatter`` (fork hook): drop-in replacement for
+        # ``format_tool_hints`` letting fork inject workspace-relative path
+        # display (closure captures workspace). Defaults to upstream.
+        self._tool_hint_formatter = tool_hint_formatter or format_tool_hints
         self._stream_buf = ""
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
@@ -63,7 +68,7 @@ class AgentProgressHook(AgentHook):
         return strip_think(text) or None
 
     def _tool_hint(self, tool_calls: list[Any]) -> str:
-        return format_tool_hints(tool_calls, max_length=self._tool_hint_max_length)
+        return self._tool_hint_formatter(tool_calls, max_length=self._tool_hint_max_length)
 
     @staticmethod
     def _on_progress_accepts(cb: Callable[..., Any], name: str) -> bool:

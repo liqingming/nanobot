@@ -2,8 +2,9 @@
 
 Fork additions (kept in core so pydantic can validate):
   * ``AgentDefaults.enable_learning``, ``tui_backend``,
-    ``promote_pending_on_restart``, ``pending_promote_threshold_chars``
-    — fork self-learning / TUI / consolidation knobs.
+    ``promote_pending_on_restart`` — fork self-learning / TUI / consolidation
+    knobs. (``pending_promote_threshold_chars`` removed after upstream
+    Consolidator+Dream merge made it obsolete.)
   * ``AgentDefaults.max_tool_iterations`` default 40 → 1000.
   * ``ProvidersConfig.claude_ai`` — fork claude.ai OAuth provider entry.
 """
@@ -174,10 +175,17 @@ class AgentDefaults(Base):
     # restarts but means MEMORY.md may stay stale until manually promoted
     # via /commit_memory.
     promote_pending_on_restart: bool = False
-    # Auto-promote the pending consolidation summary to MEMORY.md when it
-    # grows beyond this many characters (≈ chars/4 tokens). Keeps the
-    # injected <system-reminder> from bloating each user message.
-    pending_promote_threshold_chars: int = 10_000
+    # User-facing nudge message injected when the LLM returns empty content
+    # immediately after tool results (notably common with some zh LLMs).
+    # The retry runs once with this as a follow-up user turn and the nudge
+    # itself is stripped from saved history. Empty string disables the retry.
+    nudge_after_empty_tools_message: str = (
+        "请将你对上述内容的分析和总结写在回复正文里。"
+    )
+    # Removed: ``pending_promote_threshold_chars`` (fork). Was used by the
+    # old fork ``MemoryConsolidator.maybe_promote_pending`` path, which is
+    # now obsolete — upstream ``Consolidator`` + ``Dream`` (consolidation_ratio
+    # + history.jsonl cursor) take over. Field deleted to avoid confusion.
 
 
 class AgentsConfig(Base):
