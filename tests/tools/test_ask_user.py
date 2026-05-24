@@ -8,13 +8,14 @@ import pytest
 
 from nanobot.fork.agent.tools.ask_user import AskUserTool, deliver_reply
 from nanobot.bus.queue import MessageBus
+from nanobot.agent.tools.context import RequestContext
 
 
 @pytest.mark.asyncio
 async def test_non_cli_channel_returns_unsupported_error() -> None:
     bus = MessageBus()
     tool = AskUserTool(bus=bus)
-    tool.set_context("telegram", "12345")
+    tool.set_context(RequestContext(channel="telegram", chat_id="12345"))
 
     out = await tool.execute(questions=[
         {"question": "pick?", "options": [{"label": "a", "description": ""}, {"label": "b", "description": ""}]},
@@ -28,7 +29,7 @@ async def test_non_cli_channel_returns_unsupported_error() -> None:
 @pytest.mark.asyncio
 async def test_missing_bus_returns_error() -> None:
     tool = AskUserTool(bus=None)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
     out = await tool.execute(questions=[
         {"question": "x?", "options": [{"label": "a", "description": ""}, {"label": "b", "description": ""}]},
     ])
@@ -40,7 +41,7 @@ async def test_missing_bus_returns_error() -> None:
 async def test_empty_questions_returns_error() -> None:
     bus = MessageBus()
     tool = AskUserTool(bus=bus)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
     out = await tool.execute(questions=[])
     data = json.loads(out)
     assert "error" in data
@@ -51,7 +52,7 @@ async def test_publishes_ask_user_message_to_bus() -> None:
     """Tool should immediately push a question to the bus with a correlation id."""
     bus = MessageBus()
     tool = AskUserTool(bus=bus)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     questions = [
         {"question": "yes?", "options": [{"label": "y", "description": ""}, {"label": "n", "description": ""}]},
@@ -83,7 +84,7 @@ async def test_publishes_ask_user_message_to_bus() -> None:
 async def test_deliver_reply_resolves_pending_future() -> None:
     bus = MessageBus()
     tool = AskUserTool(bus=bus)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
     questions = [
         {"question": "color?", "options": [
             {"label": "red", "description": ""},
@@ -104,7 +105,7 @@ async def test_deliver_reply_resolves_pending_future() -> None:
 async def test_cancellation_via_deliver_reply() -> None:
     bus = MessageBus()
     tool = AskUserTool(bus=bus)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
     task = asyncio.create_task(tool.execute(questions=[
         {"question": "?", "options": [{"label": "a", "description": ""}, {"label": "b", "description": ""}]},
     ]))
@@ -121,7 +122,7 @@ async def test_stale_reply_after_resolution_is_ignored() -> None:
     """Calling deliver_reply twice (e.g. late TUI reply after timeout) is safe."""
     bus = MessageBus()
     tool = AskUserTool(bus=bus)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
     task = asyncio.create_task(tool.execute(questions=[
         {"question": "?", "options": [{"label": "a", "description": ""}, {"label": "b", "description": ""}]},
     ]))
@@ -140,7 +141,7 @@ async def test_stale_reply_after_resolution_is_ignored() -> None:
 async def test_timeout_returns_error(monkeypatch) -> None:
     bus = MessageBus()
     tool = AskUserTool(bus=bus)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
     monkeypatch.setattr(AskUserTool, "DEFAULT_TIMEOUT_SEC", 0.1)
     out = await tool.execute(questions=[
         {"question": "?", "options": [{"label": "a", "description": ""}, {"label": "b", "description": ""}]},

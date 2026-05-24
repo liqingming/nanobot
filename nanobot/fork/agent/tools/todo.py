@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 from nanobot.agent.tools.base import Tool
 
 if TYPE_CHECKING:
+    from nanobot.agent.tools.context import RequestContext
     from nanobot.bus.queue import MessageBus
     from nanobot.session.manager import SessionManager
 
@@ -136,10 +137,10 @@ class TodoWriteTool(Tool):
         self._done_count: dict[str, int] = {}
         self._last_done_delta: dict[str, int] = {}
 
-    def set_context(self, channel: str, chat_id: str) -> None:
-        self._channel = channel
-        self._chat_id = chat_id
-        self._session_key = f"{channel}:{chat_id}"
+    def set_context(self, ctx: "RequestContext") -> None:
+        self._channel = ctx.channel
+        self._chat_id = ctx.chat_id
+        self._session_key = ctx.session_key or f"{ctx.channel}:{ctx.chat_id}"
 
     @property
     def name(self) -> str:

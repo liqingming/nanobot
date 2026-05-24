@@ -21,6 +21,8 @@ class AgentHookContext:
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     tool_results: list[Any] = field(default_factory=list)
     tool_events: list[dict[str, str]] = field(default_factory=list)
+    streamed_content: bool = False
+    streamed_reasoning: bool = False
     final_content: str | None = None
     stop_reason: str | None = None
     error: str | None = None
@@ -28,6 +30,9 @@ class AgentHookContext:
 
 class AgentHook:
     """Minimal lifecycle surface for shared runner customization."""
+
+    def __init__(self, reraise: bool = False) -> None:
+        self._reraise = reraise
 
     def wants_streaming(self) -> bool:
         return False
@@ -49,6 +54,17 @@ class AgentHook:
         ``context.tool_results`` and ``context.tool_events`` are populated."""
         pass
 
+    async def emit_reasoning(self, reasoning_content: str | None) -> None:
+        pass
+
+    async def emit_reasoning_end(self) -> None:
+        """Mark the end of an in-flight reasoning stream.
+
+        Hooks that buffer ``emit_reasoning`` chunks (for in-place UI updates)
+        flush and freeze the rendered group here. One-shot hooks ignore.
+        """
+        pass
+
     async def after_iteration(self, context: AgentHookContext) -> None:
         pass
 
@@ -67,38 +83,40 @@ class CompositeHook(AgentHook):
     __slots__ = ("_hooks",)
 
     def __init__(self, hooks: list[AgentHook]) -> None:
+        super().__init__()
         self._hooks = list(hooks)
 
     def wants_streaming(self) -> bool:
         return any(h.wants_streaming() for h in self._hooks)
 
-    async def before_iteration(self, context: AgentHookContext) -> None:
+    async def _for_each_hook_safe(self, method_name: str, *args: Any, **kwargs: Any) -> None:
         for h in self._hooks:
+            if getattr(h, "_reraise", False):
+                await getattr(h, method_name)(*args, **kwargs)
+                continue
+
             try:
-                await h.before_iteration(context)
+                await getattr(h, method_name)(*args, **kwargs)
             except Exception:
-                logger.exception("AgentHook.before_iteration error in {}", type(h).__name__)
+                logger.exception("AgentHook.{} error in {}", method_name, type(h).__name__)
+
+    async def before_iteration(self, context: AgentHookContext) -> None:
+        await self._for_each_hook_safe("before_iteration", context)
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
-        for h in self._hooks:
-            try:
-                await h.on_stream(context, delta)
-            except Exception:
-                logger.exception("AgentHook.on_stream error in {}", type(h).__name__)
+        await self._for_each_hook_safe("on_stream", context, delta)
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
-        for h in self._hooks:
-            try:
-                await h.on_stream_end(context, resuming=resuming)
-            except Exception:
-                logger.exception("AgentHook.on_stream_end error in {}", type(h).__name__)
+        await self._for_each_hook_safe("on_stream_end", context, resuming=resuming)
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
-        for h in self._hooks:
-            try:
-                await h.before_execute_tools(context)
-            except Exception:
-                logger.exception("AgentHook.before_execute_tools error in {}", type(h).__name__)
+        await self._for_each_hook_safe("before_execute_tools", context)
+
+    async def emit_reasoning(self, reasoning_content: str | None) -> None:
+        await self._for_each_hook_safe("emit_reasoning", reasoning_content)
+
+    async def emit_reasoning_end(self) -> None:
+        await self._for_each_hook_safe("emit_reasoning_end")
 
     async def after_execute_tools(self, context: AgentHookContext) -> None:
         for h in self._hooks:
@@ -108,13 +126,28 @@ class CompositeHook(AgentHook):
                 logger.exception("AgentHook.after_execute_tools error in {}", type(h).__name__)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
-        for h in self._hooks:
-            try:
-                await h.after_iteration(context)
-            except Exception:
-                logger.exception("AgentHook.after_iteration error in {}", type(h).__name__)
+        await self._for_each_hook_safe("after_iteration", context)
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         for h in self._hooks:
             content = h.finalize_content(context, content)
         return content
+
+
+class SDKCaptureHook(AgentHook):
+    """Record tool names and the final message list for ``RunResult``.
+
+    The runner mutates ``context.messages`` in place across iterations, so the
+    snapshot is refreshed on every ``after_iteration`` call; the last call
+    reflects the end-of-turn state the SDK caller cares about.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tools_used: list[str] = []
+        self.messages: list[dict[str, Any]] = []
+
+    async def after_iteration(self, context: AgentHookContext) -> None:
+        for call in context.tool_calls:
+            self.tools_used.append(call.name)
+        self.messages = list(context.messages)

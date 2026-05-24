@@ -127,7 +127,7 @@ def test_edit_file_summary_shows_delta(tmp_path: Path) -> None:
     from nanobot.agent.tools.filesystem import EditFileTool
     tool = EditFileTool(workspace=tmp_path)
     out = tool.summarize_result(
-        {"old_string": "a", "new_string": "a\nb\nc"},
+        {"old_text": "a", "new_text": "a\nb\nc"},
         "Successfully edited",
     )
     assert "+2" in out
@@ -137,7 +137,7 @@ def test_edit_file_summary_shrink(tmp_path: Path) -> None:
     from nanobot.agent.tools.filesystem import EditFileTool
     tool = EditFileTool(workspace=tmp_path)
     out = tool.summarize_result(
-        {"old_string": "a\nb\nc", "new_string": "a"},
+        {"old_text": "a\nb\nc", "new_text": "a"},
         "Successfully edited",
     )
     assert "-2" in out

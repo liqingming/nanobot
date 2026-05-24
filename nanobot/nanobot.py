@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.hook import AgentHook
+from nanobot.agent.hook import AgentHook, SDKCaptureHook
 from nanobot.agent.loop import AgentLoop
-from nanobot.bus.queue import MessageBus
+from nanobot.providers.image_generation import image_gen_provider_configs
 
 
 @dataclass(slots=True)
@@ -47,7 +47,7 @@ class Nanobot:
                 ``~/.nanobot/config.json``.
             workspace: Override the workspace directory from config.
         """
-        from nanobot.config.loader import load_config
+        from nanobot.config.loader import load_config, resolve_config_env_vars
         from nanobot.config.schema import Config
 
         resolved: Path | None = None
@@ -56,29 +56,15 @@ class Nanobot:
             if not resolved.exists():
                 raise FileNotFoundError(f"Config not found: {resolved}")
 
-        config: Config = load_config(resolved)
+        config: Config = resolve_config_env_vars(load_config(resolved))
         if workspace is not None:
             config.agents.defaults.workspace = str(
                 Path(workspace).expanduser().resolve()
             )
 
-        provider = _make_provider(config)
-        bus = MessageBus()
-        defaults = config.agents.defaults
-
-        loop = AgentLoop(
-            bus=bus,
-            provider=provider,
-            workspace=config.workspace_path,
-            model=defaults.model,
-            max_iterations=defaults.max_tool_iterations,
-            context_window_tokens=defaults.context_window_tokens,
-            web_search_config=config.tools.web.search,
-            web_proxy=config.tools.web.proxy or None,
-            exec_config=config.tools.exec,
-            restrict_to_workspace=config.tools.restrict_to_workspace,
-            mcp_servers=config.tools.mcp_servers,
-            timezone=defaults.timezone,
+        loop = AgentLoop.from_config(
+            config,
+            image_generation_provider_configs=image_gen_provider_configs(config),
         )
         return cls(loop)
 
@@ -97,9 +83,10 @@ class Nanobot:
                 Different keys get independent history.
             hooks: Optional lifecycle hooks for this run.
         """
+        capture = SDKCaptureHook()
         prev = self._loop._extra_hooks
-        if hooks is not None:
-            self._loop._extra_hooks = list(hooks)
+        base_hooks = list(hooks) if hooks is not None else list(prev or [])
+        self._loop._extra_hooks = [capture, *base_hooks]
         try:
             response = await self._loop.process_direct(
                 message, session_key=session_key,
@@ -108,7 +95,11 @@ class Nanobot:
             self._loop._extra_hooks = prev
 
         content = (response.content if response else None) or ""
-        return RunResult(content=content, tools_used=[], messages=[])
+        return RunResult(
+            content=content,
+            tools_used=capture.tools_used,
+            messages=capture.messages,
+        )
 
 
 def _make_provider(config: Any) -> Any:
@@ -169,10 +160,4 @@ def _make_provider(config: Any) -> Any:
             spec=spec,
         )
 
-    defaults = config.agents.defaults
-    provider.generation = GenerationSettings(
-        temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
-        reasoning_effort=defaults.reasoning_effort,
-    )
-    return provider
+

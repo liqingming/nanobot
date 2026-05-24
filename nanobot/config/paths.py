@@ -13,8 +13,17 @@ import hashlib
 import re
 from pathlib import Path
 
-from nanobot.config.loader import get_config_path
 from nanobot.utils.helpers import ensure_dir
+
+
+def get_config_path() -> Path:
+    """Get the configuration file path (lazy import to break circular dependency).
+
+    Delegates to ``nanobot.config.loader.get_config_path`` at call time so
+    that importing this module never triggers a circular import during startup.
+    """
+    from nanobot.config.loader import get_config_path as _loader_get_config_path
+    return _loader_get_config_path()
 
 
 def get_data_dir() -> Path:
@@ -53,6 +62,11 @@ def get_workspace_cache_dir(workspace: Path) -> Path:
     h = hashlib.sha1(resolved.encode()).hexdigest()[:8]
     safe_name = re.sub(r"[^\w-]", "_", workspace.name) or "root"
     return ensure_dir(Path.home() / ".nanobot" / "caches" / f"{safe_name}_{h}")
+
+
+def get_webui_dir() -> Path:
+    """Return the directory for WebUI-only persisted display threads (JSON)."""
+    return get_runtime_subdir("webui")
 
 
 def get_workspace_path(workspace: str | None = None) -> Path:

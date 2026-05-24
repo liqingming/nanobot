@@ -59,7 +59,7 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
         ],
         tools=tools,
         model="test-model",
-        max_iterations=3,
+        max_iterations=3, max_tool_result_chars=16000,
     ))
 
     assert result.final_content == "done"
@@ -135,6 +135,7 @@ async def test_runner_calls_hooks_in_order():
         tools=tools,
         model="test-model",
         max_iterations=3,
+        max_tool_result_chars=16000,
         hook=RecordingHook(),
     ))
 
@@ -191,6 +192,7 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
         tools=tools,
         model="test-model",
         max_iterations=1,
+        max_tool_result_chars=16000,
         hook=StreamingHook(),
     ))
 
@@ -218,14 +220,13 @@ async def test_runner_returns_max_iterations_fallback():
         initial_messages=[],
         tools=tools,
         model="test-model",
-        max_iterations=2,
+        max_iterations=2, max_tool_result_chars=16000,
     ))
 
     assert result.stop_reason == "max_iterations"
     assert result.final_content == (
-        "I've used up the max tool-call budget (2 per turn) before "
-        "finishing the task. The work so far is preserved — type `/continue` to "
-        "keep going from where I stopped, or break the request into smaller steps."
+        "I reached the maximum number of tool call iterations (2) without "
+        "completing the task. You can try breaking the task into smaller steps."
     )
 
 
@@ -249,6 +250,7 @@ async def test_runner_returns_structured_tool_error():
         tools=tools,
         model="test-model",
         max_iterations=2,
+        max_tool_result_chars=16000,
         fail_on_tool_error=True,
     ))
 
@@ -270,12 +272,11 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
     loop.tools.execute = AsyncMock(return_value="ok")
     loop.max_iterations = 2
 
-    final_content, _, _, _ = await loop._run_agent_loop([])
+    final_content, _, _, _, _ = await loop._run_agent_loop([])
 
     assert final_content == (
-        "I've used up the max tool-call budget (2 per turn) before "
-        "finishing the task. The work so far is preserved — type `/continue` to "
-        "keep going from where I stopped, or break the request into smaller steps."
+        "I reached the maximum number of tool call iterations (2) without "
+        "completing the task. You can try breaking the task into smaller steps."
     )
 
 
@@ -298,7 +299,7 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
     async def on_stream_end(*, resuming: bool = False) -> None:
         endings.append(resuming)
 
-    final_content, _, _, _ = await loop._run_agent_loop(
+    final_content, _, _, _, _ = await loop._run_agent_loop(
         [],
         on_stream=on_stream,
         on_stream_end=on_stream_end,
@@ -319,9 +320,10 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
     provider.get_default_model.return_value = "test-model"
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
         content="working",
-        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
+        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
     ))
-    mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+    mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus, max_tool_result_chars=16000)
+    mgr.max_iterations = 2
     mgr._announce_result = AsyncMock()
 
     async def fake_execute(self, name, arguments):
@@ -329,7 +331,10 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
 
     monkeypatch.setattr("nanobot.agent.tools.registry.ToolRegistry.execute", fake_execute)
 
-    await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
+    import time
+    from nanobot.agent.subagent import SubagentStatus
+    status = SubagentStatus(task_id="sub-1", label="label", task_description="do task", started_at=time.monotonic())
+    await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, status)
 
     mgr._announce_result.assert_awaited_once()
     args = mgr._announce_result.await_args.args

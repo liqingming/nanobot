@@ -3,34 +3,63 @@
 import base64
 import mimetypes
 import platform
+from contextlib import suppress
+from importlib.resources import files as pkg_files
 from pathlib import Path
-from typing import Any
-
-from nanobot.utils.helpers import current_time_str, safe_filename
+from typing import Any, Mapping, Sequence
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
-from nanobot.utils.helpers import build_assistant_message, detect_image_mime
+from nanobot.session.goal_state import goal_state_runtime_lines
+from nanobot.utils.helpers import (
+    build_assistant_message,
+    current_time_str,
+    detect_image_mime,
+    safe_filename,
+    truncate_text,
+)
+from nanobot.utils.prompt_templates import render_template
 
 
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
+    _RUNTIME_CONTEXT_END = "[/Runtime Context]"
+    _MAX_RECENT_HISTORY = 50
+    _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
 
-    def __init__(self, data_dir: Path, workspace: Path | None = None, timezone: str | None = None):
-        self.data_dir = data_dir          # where nanobot stores metadata (memory, skills, bootstrap files)
-        self.workspace = workspace or data_dir  # actual working dir shown to the agent
+    def __init__(
+        self,
+        workspace: Path,
+        timezone: str | None = None,
+        disabled_skills: list[str] | None = None,
+        *,
+        data_dir: Path | None = None,
+        topic_memory_factory: Any = None,  # fork: TopicMemoryFactory | None
+    ):
+        # ``workspace`` is the user's working directory shown to the agent.
+        # ``data_dir`` (fork) is where nanobot stores its own metadata (memory,
+        # skills, bootstrap files); defaults to ``workspace`` for upstream
+        # compatibility. Fork callers pass an explicit cache dir.
+        self.workspace = workspace
+        self.data_dir = data_dir if data_dir is not None else workspace
         self.timezone = timezone
-        self.memory = MemoryStore(data_dir)
-        self.skills = SkillsLoader(data_dir)
-        self._topic_stores: dict[str, MemoryStore] = {}
+        self.memory = MemoryStore(self.data_dir)
+        self.skills = SkillsLoader(
+            self.data_dir,
+            disabled_skills=set(disabled_skills) if disabled_skills else None,
+        )
+        # fork: per-topic MemoryStore facade. ``None`` disables topic memory
+        # entirely (build_system_prompt skips the topic section); fork callers
+        # inject a TopicMemoryFactory in AgentLoop.__init__ when enabled.
+        self._topic_memory_factory = topic_memory_factory
 
-    def _get_topic_store(self, session_key: str) -> MemoryStore:
-        if session_key not in self._topic_stores:
-            self._topic_stores[session_key] = MemoryStore(self.data_dir, session_key)
-        return self._topic_stores[session_key]
+    def _get_topic_store(self, session_key: str) -> MemoryStore | None:
+        if self._topic_memory_factory is None or not session_key:
+            return None
+        return self._topic_memory_factory.get(session_key)
 
     def build_system_prompt(
         self,
@@ -38,16 +67,22 @@ class ContextBuilder:
         include_learning_rules: bool = False,
         session_key: str | None = None,
         todos: list[dict[str, Any]] | None = None,
+        channel: str | None = None,
+        session_summary: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity(session_key)]
+        parts = [self._get_identity(session_key=session_key, channel=channel)]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        global_mem = self.memory.read_long_term()
-        topic_mem = self._get_topic_store(session_key).read_long_term() if session_key else ""
+        # Tool usage notes — internalised in prompt (was bootstrap TOOLS.md in fork)
+        parts.append(render_template("agent/tool_contract.md"))
+
+        global_mem = self.memory.read_memory()
+        topic_store = self._get_topic_store(session_key) if session_key else None
+        topic_mem = topic_store.read_memory() if topic_store is not None else ""
         mem_parts = []
         if global_mem:
             mem_parts.append(global_mem)
@@ -66,7 +101,7 @@ class ContextBuilder:
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
-        skills_summary = self.skills.build_skills_summary()
+        skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
         if skills_summary:
             parts.append(f"""# Skills
 
@@ -86,6 +121,9 @@ Entries with `available="false"` need dependencies installed first (see `<requir
 
 {skills_summary}""")
 
+        if session_summary:
+            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+
         if include_learning_rules:
             lr_path = self.data_dir / "LEARNING_RULES.md"
             if lr_path.exists():
@@ -93,7 +131,11 @@ Entries with `available="false"` need dependencies installed first (see `<requir
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, session_key: str | None = None) -> str:
+    def _get_identity(
+        self,
+        session_key: str | None = None,
+        channel: str | None = None,
+    ) -> str:
         """Get the core identity section."""
         workspace_path = str(self.workspace.expanduser().resolve())
         data_path = str(self.data_dir.expanduser().resolve())
@@ -126,13 +168,15 @@ Entries with `available="false"` need dependencies installed first (see `<requir
                 f"- History log: {data_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM]."
             )
 
+        channel_line = f"\n## Channel\n{channel}\n" if channel else ""
+
         return f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant.
 
 ## Runtime
 {runtime}
-
+{channel_line}
 ## Workspace
 Your workspace is at: {workspace_path}
 {memory_lines}
@@ -157,25 +201,62 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
 
     @staticmethod
     def _build_runtime_context(
-        channel: str | None, chat_id: str | None, timezone: str | None = None,
+        channel: str | None,
+        chat_id: str | None,
+        timezone: str | None = None,
+        sender_id: str | None = None,
+        supplemental_lines: Sequence[str] | None = None,
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
-        return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
+        if sender_id:
+            lines += [f"Sender ID: {sender_id}"]
+        if supplemental_lines:
+            lines.extend(supplemental_lines)
+        return (
+            ContextBuilder._RUNTIME_CONTEXT_TAG + "\n"
+            + "\n".join(lines)
+            + "\n" + ContextBuilder._RUNTIME_CONTEXT_END
+        )
+
+    @staticmethod
+    def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
+        if isinstance(left, str) and isinstance(right, str):
+            return f"{left}\n\n{right}" if left else right
+
+        def _to_blocks(value: Any) -> list[dict[str, Any]]:
+            if isinstance(value, list):
+                return [item if isinstance(item, dict) else {"type": "text", "text": str(item)} for item in value]
+            if value is None:
+                return []
+            return [{"type": "text", "text": str(value)}]
+
+        return _to_blocks(left) + _to_blocks(right)
 
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+        """Load all bootstrap files from data_dir (falling back to workspace)."""
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.data_dir / filename
+            if not file_path.exists() and self.workspace != self.data_dir:
+                file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    @staticmethod
+    def _is_template_content(content: str, template_path: str) -> bool:
+        """Check if *content* is identical to the bundled template (user hasn't customized it)."""
+        with suppress(Exception):
+            tpl = pkg_files("nanobot") / "templates" / template_path
+            if tpl.is_file():
+                return content.strip() == tpl.read_text(encoding="utf-8").strip()
+        return False
 
     # Tokens shorter than this are skipped during skill-match scoring
     # (avoids matching on noise words like "to", "an", "in"). 4 is the
@@ -190,11 +271,6 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         with the user's message, return a ``<system-reminder>`` suggesting
         ``load_skill(name)`` for it. Returns empty when nothing matches —
         the LLM should not get a noisy nudge on every turn.
-
-        Matching is plain lowercase substring containment of description
-        tokens (length ≥ ``_SKILL_MATCH_MIN_TOKEN_LEN``) against the user
-        message. Cheap and false-positive-tolerant; the system-reminder
-        wording emphasizes "consider" so the LLM can dismiss bad matches.
         """
         if not user_message or not user_message.strip():
             return ""
@@ -211,9 +287,6 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             desc = self.skills._get_skill_description(name) or ""
             if not name or not desc:
                 continue
-            # Tokenize description into >= min-len words; count how many
-            # appear as substrings of the user message. More overlap → higher
-            # confidence the skill is relevant.
             tokens = {
                 t.strip(".,;:()[]{}\"'<>/").lower()
                 for t in desc.split()
@@ -252,9 +325,20 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         session_key: str | None = None,
         todos: list[dict[str, Any]] | None = None,
         pending_summary: str | None = None,
+        sender_id: str | None = None,
+        session_summary: str | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
+        current_runtime_lines: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
+        extra = [*goal_state_runtime_lines(session_metadata)]
+        if current_runtime_lines:
+            extra.extend(line for line in current_runtime_lines if line)
+        runtime_ctx = self._build_runtime_context(
+            channel, chat_id, self.timezone,
+            sender_id=sender_id,
+            supplemental_lines=extra or None,
+        )
         user_content = self._build_user_content(current_message, media)
 
         # If a pending consolidation summary is buffered (deferred from a
@@ -263,19 +347,18 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         # content so the LLM gets the updated context without us re-rendering
         # the (cached) system prompt.
         reminder = ""
-        if pending_summary and pending_summary.strip():
+        effective_pending = pending_summary or session_summary
+        if effective_pending and effective_pending.strip():
             reminder = (
                 "<system-reminder>\n"
                 "Updated long-term memory (consolidated from earlier in this "
                 "conversation; not yet promoted to MEMORY.md):\n\n"
-                f"{pending_summary.strip()}\n"
+                f"{effective_pending.strip()}\n"
                 "</system-reminder>"
             )
 
         # Soft hint: scan available skills against the current user message
         # and, if any look relevant, suggest load_skill via system-reminder.
-        # Decision stays with the LLM (it can ignore if the match was loose);
-        # this just nudges so a relevant skill doesn't get overlooked.
         skill_hint = self._build_skill_match_reminder(current_message)
 
         # Merge runtime context, optional turn summary, and user content into a single
@@ -290,16 +373,26 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
                 if prefix else user_content
             )
 
-        return [
+        messages = [
             {"role": "system", "content": self.build_system_prompt(
                 skill_names,
                 include_learning_rules=(learning_ctx is not None),
                 session_key=session_key,
                 todos=todos,
+                channel=channel,
+                session_summary=session_summary,
             )},
             *history,
-            {"role": current_role, "content": merged},
         ]
+        # If the last history message has the same role, merge to avoid
+        # consecutive same-role messages some providers reject.
+        if messages[-1].get("role") == current_role and len(messages) > 1:
+            last = dict(messages[-1])
+            last["content"] = self._merge_message_content(last.get("content"), merged)
+            messages[-1] = last
+            return messages
+        messages.append({"role": current_role, "content": merged})
+        return messages
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""

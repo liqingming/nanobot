@@ -1,6 +1,8 @@
 # Agent Instructions
 
-You are a helpful AI assistant. Be concise, accurate, and friendly.
+## Workspace Guidance
+
+Use this file for project-specific preferences, recurring workflow conventions, and instructions you want the agent to remember for this workspace. Keep durable facts about the user in `USER.md`, personality/style guidance in `SOUL.md`, and long-term memory in `memory/MEMORY.md`.
 
 ## Scheduled Reminders
 
@@ -141,10 +143,10 @@ When the user explicitly specifies a target file path (e.g., "写入这个文件
 
 ## Heartbeat Tasks
 
-`HEARTBEAT.md` is checked on the configured heartbeat interval. Use file tools to manage periodic tasks:
+`HEARTBEAT.md` is checked on the configured heartbeat interval. Use file tools to manage periodic tasks.
 
-- **Add**: `edit_file` to append new tasks
-- **Remove**: `edit_file` to delete completed tasks
-- **Rewrite**: `write_file` to replace all tasks
+- Use `apply_patch` for normal task-list updates, especially when adding, removing, or changing multiple lines.
+- Use `edit_file` only for small exact replacements copied from the current `HEARTBEAT.md`.
+- Use `write_file` for first creation or intentional full-file rewrites.
 
 When the user asks for a recurring/periodic task, update `HEARTBEAT.md` instead of creating a one-time cron reminder.

@@ -7,13 +7,14 @@ from nanobot.fork.agent.tools.todo import (
     format_todos,
 )
 from nanobot.session.manager import SessionManager
+from nanobot.agent.tools.context import RequestContext
 
 
 @pytest.mark.asyncio
 async def test_todo_write_persists_to_session(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     items = [
         {"content": "Plan refactor", "status": "completed"},
@@ -37,7 +38,7 @@ async def test_todo_write_persists_to_session(tmp_path) -> None:
 async def test_todo_write_rejects_multiple_in_progress(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     items = [
         {"content": "A", "status": "in_progress"},
@@ -55,7 +56,7 @@ async def test_todo_write_rejects_multiple_in_progress(tmp_path) -> None:
 async def test_todo_write_empty_clears_list(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     await tool.execute(items=[{"content": "X", "status": "pending"}])
     result = await tool.execute(items=[])
@@ -69,7 +70,7 @@ async def test_todo_write_empty_clears_list(tmp_path) -> None:
 async def test_todo_overwrite_replaces_full_list(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     await tool.execute(items=[
         {"content": "Old A", "status": "pending"},
@@ -123,7 +124,7 @@ def test_format_todos_empty() -> None:
 async def test_todo_rejects_completed_to_pending(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     await tool.execute(items=[{"content": "task", "status": "completed"}])
     result = await tool.execute(items=[{"content": "task", "status": "pending"}])
@@ -138,7 +139,7 @@ async def test_todo_rejects_completed_to_pending(tmp_path) -> None:
 async def test_todo_rejects_completed_to_in_progress(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     await tool.execute(items=[{"content": "task", "status": "completed"}])
     result = await tool.execute(items=[{"content": "task", "status": "in_progress"}])
@@ -150,7 +151,7 @@ async def test_todo_rejects_completed_to_in_progress(tmp_path) -> None:
 async def test_todo_rejects_empty_content(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     result = await tool.execute(items=[{"content": "   ", "status": "pending"}])
 
@@ -162,7 +163,7 @@ async def test_todo_rejects_empty_content(tmp_path) -> None:
 async def test_todo_rejects_duplicate_content(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     result = await tool.execute(items=[
         {"content": "dup", "status": "pending"},
@@ -177,7 +178,7 @@ async def test_todo_rejects_duplicate_content(tmp_path) -> None:
 async def test_todo_rejects_oversized_list(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     items = [{"content": f"task {i}", "status": "pending"} for i in range(MAX_TODO_ITEMS + 1)]
     result = await tool.execute(items=items)
@@ -190,7 +191,7 @@ async def test_todo_rejects_oversized_list(tmp_path) -> None:
 async def test_todo_timestamps_initialized_on_create(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     await tool.execute(items=[{"content": "a", "status": "pending"}])
     session = sessions.get_or_create("cli:test")
@@ -203,7 +204,7 @@ async def test_todo_timestamps_initialized_on_create(tmp_path) -> None:
 async def test_todo_started_at_set_on_first_in_progress(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     await tool.execute(items=[{"content": "a", "status": "pending"}])
     await tool.execute(items=[{"content": "a", "status": "in_progress"}])
@@ -221,7 +222,7 @@ async def test_todo_started_at_set_on_first_in_progress(tmp_path) -> None:
 async def test_todo_completed_at_set_and_preserved(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     await tool.execute(items=[{"content": "a", "status": "in_progress"}])
     await tool.execute(items=[{"content": "a", "status": "completed"}])
@@ -239,7 +240,7 @@ async def test_todo_completed_at_set_and_preserved(tmp_path) -> None:
 async def test_todo_created_at_preserved_across_updates(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     await tool.execute(items=[{"content": "a", "status": "pending"}])
     session = sessions.get_or_create("cli:test")
@@ -255,7 +256,7 @@ async def test_todo_allows_pending_to_completed_directly(tmp_path) -> None:
     """Skipping in_progress is allowed — useful for trivially-fast steps."""
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     await tool.execute(items=[{"content": "a", "status": "pending"}])
     result = await tool.execute(items=[{"content": "a", "status": "completed"}])
@@ -270,7 +271,7 @@ async def test_todo_in_progress_to_pending_revert_allowed(tmp_path) -> None:
     """Reverting an active task back to pending is allowed (e.g. blocked work)."""
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     await tool.execute(items=[{"content": "a", "status": "in_progress"}])
     result = await tool.execute(items=[{"content": "a", "status": "pending"}])
@@ -402,7 +403,7 @@ async def test_tool_pushes_diff_to_bus_on_each_call(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     bus = MessageBus()
     tool = TodoWriteTool(sessions=sessions, bus=bus)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     # First call: empty → 2 items → expect a "first creation" diff
     await tool.execute(items=[
@@ -431,7 +432,7 @@ async def test_tool_works_without_bus(tmp_path) -> None:
     """Bus is optional — passing None must not break execution."""
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions, bus=None)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
     result = await tool.execute(items=[{"content": "x", "status": "pending"}])
     assert result.startswith("Updated todo list")
 
@@ -482,7 +483,7 @@ async def test_summary_delta_appears_after_completion(tmp_path) -> None:
     """+N suffix should appear when a new execute() completes more todos."""
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     items_1 = [
         {"content": "a", "status": "completed"},
@@ -521,7 +522,7 @@ async def test_summary_no_delta_when_unchanged(tmp_path) -> None:
     """If no new todos completed this call, no +N suffix shown."""
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     items = [
         {"content": "a", "status": "in_progress"},
@@ -540,10 +541,10 @@ async def test_summary_delta_isolated_per_session(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     tool = TodoWriteTool(sessions=sessions)
 
-    tool.set_context("cli", "session_a")
+    tool.set_context(RequestContext(channel="cli", chat_id="session_a"))
     await tool.execute(items=[{"content": "x", "status": "completed"}])
 
-    tool.set_context("cli", "session_b")
+    tool.set_context(RequestContext(channel="cli", chat_id="session_b"))
     items_b = [{"content": "y", "status": "completed"}]
     result_b = await tool.execute(items=items_b)
     s = tool.summarize_result({"items": items_b}, result_b)
@@ -562,7 +563,7 @@ async def test_tool_does_not_push_when_no_change(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     bus = MessageBus()
     tool = TodoWriteTool(sessions=sessions, bus=bus)
-    tool.set_context("cli", "test")
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
 
     items = [{"content": "x", "status": "in_progress"}]
     await tool.execute(items=items)
