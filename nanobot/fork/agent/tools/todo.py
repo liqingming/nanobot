@@ -3,6 +3,8 @@
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from loguru import logger
+
 from nanobot.agent.tools.base import Tool
 
 if TYPE_CHECKING:
@@ -314,7 +316,10 @@ class TodoWriteTool(Tool):
                         metadata={"_system_message": True},
                     ))
                 except Exception:
-                    pass  # never break tool execution because of a UI side-effect
+                    # best-effort UI side-effect — never break tool execution,
+                    # but log so a real bug here (import/attr error) isn't
+                    # silently swallowed the way the replay ImportError was.
+                    logger.debug("todo diff push failed", exc_info=True)
 
         if not new_items:
             return "Todo list cleared."

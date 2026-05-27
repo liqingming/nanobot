@@ -49,6 +49,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
@@ -1366,8 +1367,11 @@ class TextualTUI(TUIBase):
                 args = raw_args
 
             # Build the hint using the same logic as live traces (including
-            # path relativization to the workspace).
-            from nanobot.agent.loop import format_tool_hint
+            # path relativization to the workspace). Import from the real module
+            # — loop.py only imports it function-locally as _fork_fmt, so
+            # `from nanobot.agent.loop import format_tool_hint` raised ImportError
+            # and (silently swallowed below) wiped every replayed tool trace.
+            from nanobot.fork.utils.tool_hints import format_tool_hint
             tc_like = type("TC", (), {"name": name, "arguments": args})()
             hint = format_tool_hint([tc_like], workspace=workspace)
 
@@ -1403,9 +1407,11 @@ class TextualTUI(TUIBase):
                 out = self._app.query_one("#output", _OutputLog)
                 out.write(line)
             except Exception:
-                pass
+                logger.debug("replay tool trace: write to #output failed", exc_info=True)
         except Exception:
-            pass
+            # Log instead of silently swallowing — a swallowed ImportError here
+            # is exactly what hid the lost-tool-trace bug for so long.
+            logger.debug("replay tool trace: render failed", exc_info=True)
 
     def add_user_echo(self, text: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
