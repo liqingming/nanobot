@@ -68,6 +68,18 @@ def _make_provider_core(
         from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
 
         provider = GitHubCopilotProvider(default_model=model)
+    elif backend == "claude_ai_oauth":
+        # Fork: claude.ai subscription OAuth provider. Must be routed here in the
+        # single provider factory — every runtime path (CLI + SDK + fallback)
+        # goes through _make_provider_core, so a missing branch silently fell
+        # through to the OpenAICompatProvider `else` below.
+        from nanobot.fork.providers.claude_ai_oauth_provider import ClaudeAIOAuthProvider
+
+        provider = ClaudeAIOAuthProvider(
+            default_model=model,
+            api_base=config.get_api_base(model, preset=resolved),
+            extra_headers=p.extra_headers if p else None,
+        )
     elif backend == "anthropic":
         from nanobot.providers.anthropic_provider import AnthropicProvider
 

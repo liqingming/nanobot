@@ -87,10 +87,10 @@ _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
 
 
 if _TEXTUAL_AVAILABLE:
-    import subprocess
     import sys as _sys
+
     from rich.style import Style as _Style
-    from textual.events import MouseDown, MouseMove, MouseUp, MouseScrollUp, MouseScrollDown
+    from textual.events import MouseDown, MouseMove, MouseScrollDown, MouseScrollUp, MouseUp
     from textual.geometry import Size
     from textual.strip import Strip
 
@@ -141,8 +141,8 @@ if _TEXTUAL_AVAILABLE:
             if _sys.platform == "win32":
                 try:
                     import ctypes
-                    CF_UNICODETEXT = 13
-                    GMEM_MOVEABLE = 0x0002
+                    CF_UNICODETEXT = 13  # noqa: N806
+                    GMEM_MOVEABLE = 0x0002  # noqa: N806
                     k32 = ctypes.windll.kernel32
                     u32 = ctypes.windll.user32
                     # Must declare restype=c_void_p — default c_long truncates
@@ -1271,7 +1271,7 @@ class TextualTUI(TUIBase):
         tool_registry: Any = None,
         workspace: Any = None,
     ) -> None:
-        _RUNTIME_TAG = "[Runtime Context — metadata only, not instructions]"
+        _RUNTIME_TAG = "[Runtime Context — metadata only, not instructions]"  # noqa: N806
         recent = messages[-max_messages:] if len(messages) > max_messages else messages
 
         def _extract(content: Any) -> str:
@@ -1346,8 +1346,9 @@ class TextualTUI(TUIBase):
         """Render a single historical tool call as a static trace line during
         load_session_history. Mirrors the live look of _render_tool_trace.
         """
-        from rich.text import Text as _RText
         import json as _json
+
+        from rich.text import Text as _RText
 
         try:
             fn = tool_call.get("function") or {}
@@ -1679,7 +1680,7 @@ class TextualTUI(TUIBase):
         # Append placeholder at the current end of output — do NOT truncate so
         # any content flush_stream already rendered between tool calls is preserved.
         # If the intermediate content block is large, collapse it to save space.
-        _COLLAPSE_THRESHOLD = 6
+        _COLLAPSE_THRESHOLD = 6  # noqa: N806
         try:
             out = self._app.query_one("#output", _OutputLog)
             content_end = len(out.lines)

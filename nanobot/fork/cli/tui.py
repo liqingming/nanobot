@@ -29,26 +29,14 @@ from datetime import datetime
 from io import StringIO
 from typing import Any
 
-from wcwidth import wcswidth as _wcswidth
-
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, HTML, AnyFormattedText
 from prompt_toolkit.history import FileHistory as _FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-
-_HISTORY_SKIP = {"exit", "quit", "/exit", "/quit", ":q"}
-
-
-class _FilteredFileHistory(_FileHistory):
-    """FileHistory that silently drops exit-style commands."""
-
-    def store_string(self, string: str) -> None:
-        if string.strip().lower() not in _HISTORY_SKIP:
-            super().store_string(string)
 from prompt_toolkit.layout import Layout
-from prompt_toolkit.filters import Condition
 from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, VSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import D
@@ -57,6 +45,7 @@ from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
+from wcwidth import wcswidth as _wcswidth
 
 from nanobot import __logo__, __version__
 from nanobot.fork.cli.tui_base import TUIBase
@@ -67,6 +56,16 @@ from nanobot.fork.cli.tui_keys import (
     decide_enter_action,
     decide_popup_key,
 )
+
+_HISTORY_SKIP = {"exit", "quit", "/exit", "/quit", ":q"}
+
+
+class _FilteredFileHistory(_FileHistory):
+    """FileHistory that silently drops exit-style commands."""
+
+    def store_string(self, string: str) -> None:
+        if string.strip().lower() not in _HISTORY_SKIP:
+            super().store_string(string)
 
 
 def _ansi_width() -> int:
@@ -300,6 +299,13 @@ class PromptTUI(TUIBase):
         self._render_md = render_markdown
         self._model = model
         self._output_lines: list[str] = []   # completed ANSI blocks
+        # Fork(perf): cache of "".join(_output_lines), keyed by list length. Every
+        # _invalidate/redraw (and each stream delta) called _get_output_text which
+        # re-joined the whole history; this rebuilds only when a block is appended
+        # or the log is cleared (both change len). Invariant: _output_lines is only
+        # appended-to or cleared, never mutated in place — else this goes stale.
+        self._output_joined_cache: str = ""  # cached join of _output_lines
+        self._output_joined_n: int = -1      # len(_output_lines) when cache built
         self._stream_buf: str = ""            # raw text accumulating during streaming
         self._stream_ts: str = ""            # timestamp captured at stream start
         self._stream_cache: str = ""         # cached ANSI render of stream_buf
@@ -373,7 +379,7 @@ class PromptTUI(TUIBase):
         traces in the legacy backend is unsupported.
         """
         del tool_registry, workspace  # unused in this backend
-        _RUNTIME_TAG = "[Runtime Context — metadata only, not instructions]"
+        _RUNTIME_TAG = "[Runtime Context — metadata only, not instructions]"  # noqa: N806
         recent = messages[-max_messages:] if len(messages) > max_messages else messages
 
         for msg in recent:
@@ -591,11 +597,16 @@ class PromptTUI(TUIBase):
         return esc_part + [("", " " * padding)] + ctx_part
 
     def _get_output_text(self) -> AnyFormattedText:
-        parts = "".join(self._output_lines)
+        # Fork(perf): reuse cached join of committed history (see __init__).
+        n = len(self._output_lines)
+        if n != self._output_joined_n:
+            self._output_joined_cache = "".join(self._output_lines)
+            self._output_joined_n = n
+        parts = self._output_joined_cache
         if self._stream_buf or self._stream_ts:
-            parts += self._stream_cache
+            parts = parts + self._stream_cache
             if self._live_progress:
-                parts += self._live_progress
+                parts = parts + self._live_progress
         if not parts:
             parts = self._render_welcome()
 
@@ -888,7 +899,7 @@ class PromptTUI(TUIBase):
         n = len(self._popup_items)
         if n == 0:
             return 0
-        MAX = _PopupMenuControl.MAX_VISIBLE
+        MAX = _PopupMenuControl.MAX_VISIBLE  # noqa: N806
         idx = self._popup_idx
         start = max(0, idx - MAX + 1)
         if start + MAX > n:

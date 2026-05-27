@@ -7,10 +7,17 @@ so the LLM can make learning decisions without scanning raw message history.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 PATTERN_THRESHOLD = 3  # times a tool sequence must repeat before flagging
+
+# Fork(perf): PatternStore throttles disk writes to at most one per this many
+# seconds. increment() runs on every tool-using turn; in-memory counts stay
+# exact (get() is always current), only persistence is deferred. A crash loses
+# at most this window of increments — acceptable for non-critical pattern stats.
+_PATTERN_SAVE_MIN_INTERVAL_SEC = 30.0
 
 
 def _compress_tool_sequence(tools: list[str]) -> tuple[str, ...]:
@@ -36,6 +43,8 @@ class PatternStore:
     def __init__(self, data_dir: Path) -> None:
         self._path = data_dir / "memory" / "patterns.json"
         self._counts: dict[str, int] = self._load()
+        self._dirty = False
+        self._last_save = 0.0
 
     # ── persistence ──────────────────────────────────────────────────
 
@@ -53,6 +62,19 @@ class PatternStore:
             json.dumps(self._counts, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        self._dirty = False
+        self._last_save = time.monotonic()
+
+    def _save_throttled(self) -> None:
+        """Persist at most once per _PATTERN_SAVE_MIN_INTERVAL_SEC; else mark dirty."""
+        self._dirty = True
+        if time.monotonic() - self._last_save >= _PATTERN_SAVE_MIN_INTERVAL_SEC:
+            self._save()
+
+    def flush(self) -> None:
+        """Force-persist any pending counts. Call on shutdown / session end."""
+        if self._dirty:
+            self._save()
 
     # ── public API ───────────────────────────────────────────────────
 
@@ -60,7 +82,7 @@ class PatternStore:
         """Increment count for *pattern* and return the new count."""
         key = ",".join(pattern)
         self._counts[key] = self._counts.get(key, 0) + 1
-        self._save()
+        self._save_throttled()
         return self._counts[key]
 
     def get(self, pattern: tuple[str, ...]) -> int:

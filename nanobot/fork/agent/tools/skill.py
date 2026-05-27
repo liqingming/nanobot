@@ -146,6 +146,6 @@ def _strip_frontmatter(text: str) -> str:
 
 # ── self-registration ────────────────────────────────────────────────────
 
-from nanobot.agent.tools.registry import register_fork_tool
+from nanobot.agent.tools.registry import register_fork_tool  # noqa: E402
 
 register_fork_tool(lambda loop: LoadSkillTool(loader=loop.context.skills))

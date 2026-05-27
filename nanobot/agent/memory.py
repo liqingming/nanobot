@@ -72,6 +72,10 @@ class MemoryStore:
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
+        # Fork(perf): cache MEMORY.md content keyed by mtime. build_system_prompt
+        # reads it every turn (global store + per-topic store = two reads/turn);
+        # invalidated by mtime change and by write_memory.
+        self._memory_cache: tuple[float, str] | None = None
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
         ])
@@ -214,10 +218,22 @@ class MemoryStore:
     # -- MEMORY.md (long-term facts) -----------------------------------------
 
     def read_memory(self) -> str:
-        return self.read_file(self.memory_file)
+        # Fork(perf): serve from mtime-keyed cache when MEMORY.md is unchanged.
+        try:
+            mtime = self.memory_file.stat().st_mtime
+        except OSError:
+            self._memory_cache = None
+            return self.read_file(self.memory_file)
+        cached = self._memory_cache
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        content = self.read_file(self.memory_file)
+        self._memory_cache = (mtime, content)
+        return content
 
     def write_memory(self, content: str) -> None:
         self.memory_file.write_text(content, encoding="utf-8")
+        self._memory_cache = None  # invalidate read_memory cache
 
     # -- SOUL.md -------------------------------------------------------------
 

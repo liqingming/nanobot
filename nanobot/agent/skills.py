@@ -4,6 +4,9 @@ Fork additions:
   * ``build_skills_summary`` omits ``<location>`` entries — fork's
     ``load_skill(name=...)`` tool loads by name, exposing filesystem
     paths just wastes prompt tokens and tempts read_file misuse.
+  * ``get_skill_metadata`` caches parsed frontmatter by mtime (perf) — it is
+    called per-skill on every turn via the skill-match hint and
+    build_skills_summary, and was previously a fresh read + YAML parse each time.
 """
 
 import json
@@ -37,6 +40,11 @@ class SkillsLoader:
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
         self.disabled_skills = disabled_skills or set()
+        # Fork(perf): cache parsed frontmatter metadata keyed by skill name,
+        # invalidated by SKILL.md mtime. Without this, get_skill_metadata is a
+        # fresh read + yaml.safe_load on every call, and build_skills_summary /
+        # list_skills / the per-turn skill-match hint invoke it per skill.
+        self._meta_cache: dict[str, tuple[float, dict | None]] = {}
 
     def _skill_entries_from_dir(self, base: Path, source: str, *, skip_names: set[str] | None = None) -> list[dict[str, str]]:
         if not base.exists():
@@ -78,6 +86,17 @@ class SkillsLoader:
             return [skill for skill in skills if self._check_requirements(self._get_skill_meta(skill["name"]))]
         return skills
 
+    def _resolve_skill_path(self, name: str) -> Path | None:
+        """Return the SKILL.md path for *name* (workspace overrides builtin)."""
+        roots = [self.workspace_skills]
+        if self.builtin_skills:
+            roots.append(self.builtin_skills)
+        for root in roots:
+            path = root / name / "SKILL.md"
+            if path.exists():
+                return path
+        return None
+
     def load_skill(self, name: str) -> str | None:
         """
         Load a skill by name.
@@ -88,14 +107,8 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
-        roots = [self.workspace_skills]
-        if self.builtin_skills:
-            roots.append(self.builtin_skills)
-        for root in roots:
-            path = root / name / "SKILL.md"
-            if path.exists():
-                return path.read_text(encoding="utf-8")
-        return None
+        path = self._resolve_skill_path(name)
+        return path.read_text(encoding="utf-8") if path else None
 
     def load_skills_for_context(self, skill_names: list[str]) -> str:
         """
@@ -237,14 +250,35 @@ class SkillsLoader:
         """
         Get metadata from a skill's frontmatter.
 
+        Fork(perf): result is cached per skill name and invalidated when the
+        SKILL.md mtime changes — callers (build_skills_summary, list_skills,
+        skill-match hint) hit this per skill on every turn. The cached dict is
+        treated as read-only by all callers; do not mutate the return value.
+
         Args:
             name: Skill name.
 
         Returns:
             Metadata dict or None.
         """
-        content = self.load_skill(name)
-        if not content or not content.startswith("---"):
+        path = self._resolve_skill_path(name)
+        if path is None:
+            return None
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return None
+        cached = self._meta_cache.get(name)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        meta = self._parse_skill_metadata(path)
+        self._meta_cache[name] = (mtime, meta)
+        return meta
+
+    def _parse_skill_metadata(self, path: Path) -> dict | None:
+        """Parse YAML frontmatter from a SKILL.md path (no caching)."""
+        content = path.read_text(encoding="utf-8")
+        if not content.startswith("---"):
             return None
         match = _STRIP_SKILL_FRONTMATTER.match(content)
         if not match:

@@ -200,6 +200,6 @@ class AskUserTool(Tool):
 
 # ── self-registration ────────────────────────────────────────────────────
 
-from nanobot.agent.tools.registry import register_fork_tool
+from nanobot.agent.tools.registry import register_fork_tool  # noqa: E402
 
 register_fork_tool(lambda loop: AskUserTool(bus=loop.bus))

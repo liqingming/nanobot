@@ -150,6 +150,10 @@ class SearchHistoryTool(Tool):
 
     # path → (mtime, entries, BM25Okapi) — single-slot cache per file
     _cache: dict[str, tuple[float, list[str], Any]] = {}
+    # Fork(perf): merged-index cache — (signature, all_entries, BM25Okapi) where
+    # signature = ((path, mtime), ...) over every history file. Reused across
+    # searches so the combined BM25 isn't re-tokenized/rebuilt on every execute().
+    _combined_cache: tuple[tuple, list[str], Any] | None = None
 
     def __init__(self, data_dir: Path) -> None:
         self._memory_dir = data_dir / "memory"
@@ -209,6 +213,12 @@ class SearchHistoryTool(Tool):
         if not history_files:
             return None, None
 
+        # Fork(perf): reuse the merged index when no history file changed.
+        signature = tuple((str(f), f.stat().st_mtime) for f in history_files)
+        combined = type(self)._combined_cache
+        if combined is not None and combined[0] == signature:
+            return combined[1], combined[2]
+
         all_entries: list[str] = []
         for hist_file in history_files:
             path = str(hist_file)
@@ -228,6 +238,7 @@ class SearchHistoryTool(Tool):
             return None, None
 
         combined_index = BM25Okapi([_tokenize(e) for e in all_entries])
+        type(self)._combined_cache = (signature, all_entries, combined_index)
         return all_entries, combined_index
 
     async def execute(self, query: str, top_k: int = 5) -> str:
@@ -258,7 +269,7 @@ class SearchHistoryTool(Tool):
 
 # ── self-registration ────────────────────────────────────────────────────
 
-from nanobot.agent.tools.registry import register_fork_tool
+from nanobot.agent.tools.registry import register_fork_tool  # noqa: E402
 
 
 def _search_history_factory(loop):

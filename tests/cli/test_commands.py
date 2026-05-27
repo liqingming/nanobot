@@ -11,10 +11,9 @@ from typer.testing import CliRunner
 from nanobot.bus.events import OutboundMessage
 from nanobot.cli.commands import app
 from nanobot.config.paths import get_workspace_cache_dir
-from nanobot.providers.factory import make_provider
 from nanobot.config.schema import Config
 from nanobot.cron.types import CronJob, CronPayload
-from nanobot.providers.factory import ProviderSnapshot
+from nanobot.providers.factory import ProviderSnapshot, make_provider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
 
@@ -521,8 +520,8 @@ def test_openai_compat_provider_passes_model_through():
 
 
 def test_make_provider_uses_github_copilot_backend():
-    from nanobot.providers.factory import make_provider
     from nanobot.config.schema import Config
+    from nanobot.providers.factory import make_provider
 
     config = Config.model_validate(
         {
@@ -539,6 +538,35 @@ def test_make_provider_uses_github_copilot_backend():
         provider = make_provider(config)
 
     assert provider.__class__.__name__ == "GitHubCopilotProvider"
+
+
+def test_make_provider_uses_claude_ai_oauth_backend():
+    """Fork: ``claude_ai`` backend must route to ClaudeAIOAuthProvider through the
+    single provider factory. Before the fix the missing branch silently fell
+    through to OpenAICompatProvider. Also guards against a future upstream merge
+    overwriting factory.py and dropping the claude_ai_oauth branch again.
+    """
+    from nanobot.config.schema import Config
+    from nanobot.providers.factory import make_provider
+
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "claude-ai",
+                    "model": "claude-ai/claude-sonnet-4-6",
+                }
+            }
+        }
+    )
+
+    with patch(
+        "nanobot.fork.providers.claude_ai_oauth_provider.load_oauth_token",
+        return_value="fake-token",
+    ), patch("anthropic.AsyncAnthropic"):
+        provider = make_provider(config)
+
+    assert provider.__class__.__name__ == "ClaudeAIOAuthProvider"
 
 
 def test_github_copilot_provider_strips_prefixed_model_name():
