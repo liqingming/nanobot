@@ -101,6 +101,14 @@ class TUIBase(ABC):
         """
         return None
 
+    def stop_thinking(self) -> None:
+        """Stop any in-flight thinking / idle spinner. Called on turn completion
+        so the spinner never outlives the turn — the streaming path stops it via
+        pop_stream, but the non-streaming reply path has no such hook. Default
+        no-op for backends without a spinner.
+        """
+        return None
+
     # ── State updates ──────────────────────────────────────────────────────
 
     @abstractmethod

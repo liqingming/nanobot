@@ -1661,6 +1661,18 @@ class TextualTUI(TUIBase):
                 self._tool_placeholder_line = self._tool_placeholder_line_backup
                 self._tool_placeholder_line_backup = None
 
+    def stop_thinking(self) -> None:
+        """TUIBase hook: stop the idle/thinking spinner on turn completion so it
+        never outlives the turn. The non-streaming reply path has no pop_stream
+        to stop it, so the idle spinner scheduled after the last tool call would
+        otherwise spin (and keep counting) forever.
+        """
+        self._cancel_idle_thinking()
+        try:
+            self._app.stop_spinner()
+        except Exception:
+            pass
+
     def _schedule_idle_thinking(self, delay: float = 0.5) -> None:
         """Schedule a "still thinking..." spinner in #live after ``delay`` seconds
         of no further stream_delta. Provides UX feedback during LLM reasoning

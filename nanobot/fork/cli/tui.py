@@ -545,6 +545,13 @@ class PromptTUI(TUIBase):
             self._thinking_task.cancel()
             self._thinking_task = None
 
+    def stop_thinking(self) -> None:
+        """TUIBase hook: stop the thinking/tool spinner animation on turn
+        completion so it never outlives the turn."""
+        self._cancel_thinking()
+        self._cancel_tool_task()
+        self._invalidate()
+
     def _cancel_tool_task(self) -> None:
         if self._tool_task is not None:
             self._tool_task.cancel()

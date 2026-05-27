@@ -1406,6 +1406,11 @@ def agent(
                 nonlocal is_processing
                 is_processing = False
                 tui.set_is_processing(False)
+                # Fork: stop any thinking/idle spinner on turn completion. The
+                # streaming path stops it via pop_stream, but the non-streaming
+                # reply path (add_response) had no such hook — an idle spinner
+                # scheduled after the last tool call would otherwise spin forever.
+                tui.stop_thinking()
                 usage = agent_loop._last_usage
                 if usage and agent_loop.context_window_tokens:
                     ctx_used = (
