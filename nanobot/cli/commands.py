@@ -1285,6 +1285,13 @@ def agent(
                         tui.update_context_usage(ctx_est, agent_loop.context_window_tokens)
                     except Exception:
                         pass
+                # Fork(perf): warm this topic's lazy caches (skills/memory/BM25)
+                # in the background so the first turn doesn't pay cold-start cost.
+                # _load_topic runs inside the async run_interactive loop, so a
+                # running event loop is guaranteed here.
+                agent_loop._schedule_background(
+                    agent_loop.warmup_caches(f"{cli_channel}:{name}")
+                )
 
             tui.set_commands([
                 ("/new", "新建话题"),
@@ -1417,6 +1424,12 @@ def agent(
                     await _send_message(pending_queue.pop(0))
 
             async def _switch_topic(name: str) -> None:
+                # Fork: drop the previous topic's per-session learning state so
+                # the loop's learning dicts don't grow unbounded as topics pile up.
+                old_key = f"{cli_channel}:{topic_state['chat_id']}"
+                new_key = f"{cli_channel}:{name}"
+                if old_key != new_key:
+                    agent_loop.clear_session_learning(old_key)
                 topic_state["chat_id"] = name
                 tui.reset_history()
                 _load_topic(name)

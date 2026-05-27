@@ -725,6 +725,17 @@ class AgentLoop:
             and prev.get("role") == "tool"
         )
 
+    def clear_session_learning(self, session_key: str) -> None:
+        """Fork: drop per-session learning state for *session_key*. Called on CLI
+        topic switch so these dicts don't grow unbounded as topics accumulate.
+        Safe for unknown keys. Note: only the CLI switch path is covered — other
+        channels' session_keys still accumulate (acceptable; CLI is the main
+        long-lived interactive surface; switch to an LRU cap if that changes).
+        """
+        self._last_turn_summary.pop(session_key, None)
+        self._prev_consolidated.pop(session_key, None)
+        self._last_user_input.pop(session_key, None)
+
     def _build_learning_ctx(self, session_key: str) -> str | None:
         """Build TurnSummary block for injection before the next user message."""
         if not self.enable_learning:
@@ -1184,6 +1195,42 @@ class AgentLoop:
         task = asyncio.create_task(coro)
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
+
+    async def warmup_caches(self, session_key: str) -> None:
+        """Fork(perf): pre-build lazily-constructed caches off the event loop so
+        the first request after entering a session / switching topics doesn't
+        pay the cold start — skills frontmatter (the P1 hot path), MEMORY.md
+        (global + per-topic), and the BM25 search index. Best-effort: each step
+        swallows its own errors and the whole thing runs in a worker thread via
+        ``to_thread`` so it never blocks input or the first turn.
+        """
+        def _warm() -> None:
+            try:
+                self.context.skills.build_skills_summary()
+            except Exception:
+                logger.debug("warmup: skills summary failed", exc_info=True)
+            try:
+                self.context.memory.read_memory()
+            except Exception:
+                logger.debug("warmup: global memory failed", exc_info=True)
+            try:
+                topic_store = self.context._get_topic_store(session_key)
+                if topic_store is not None:
+                    topic_store.read_memory()
+            except Exception:
+                logger.debug("warmup: topic memory failed", exc_info=True)
+            try:
+                if "search_history" in self.tools.tool_names:
+                    search = self.tools.get("search_history")
+                    if hasattr(search, "_load_index"):
+                        search._load_index()
+            except Exception:
+                logger.debug("warmup: search index failed", exc_info=True)
+
+        try:
+            await asyncio.to_thread(_warm)
+        except Exception:
+            logger.debug("warmup_caches failed", exc_info=True)
 
     def stop(self) -> None:
         """Stop the agent loop."""
