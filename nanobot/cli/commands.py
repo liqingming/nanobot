@@ -1579,11 +1579,30 @@ def agent(
                             continue
 
                         if msg.metadata.get("_progress"):
-                            if msg.content and not _turn_cancelled[0]:
-                                if msg.metadata.get("_tool_result"):
-                                    tui.add_tool_result(msg.content)
-                                else:
-                                    tui.add_progress(msg.content)
+                            if not _turn_cancelled[0]:
+                                # Reasoning trace (LLM thinking content). Render
+                                # below the thinking spinner, then flush to
+                                # history on _reasoning_end. Must branch
+                                # *before* add_progress: otherwise reasoning
+                                # would race with stream_delta over _stream_cache
+                                # and the UI flickers visibly.
+                                # hasattr guard: not every TUI backend ships
+                                # reasoning hooks; missing methods used to
+                                # raise AttributeError, killing _consume_outbound
+                                # entirely and freezing the UI at the spinner.
+                                if msg.metadata.get("_reasoning_end") or msg.metadata.get("_reasoning_delta"):
+                                    # Fork: reasoning (思考链) 显示已屏蔽 — 直接丢弃,
+                                    # 不分发到 TUI。必须在 add_progress 之前显式拦截:
+                                    # 否则带 _reasoning_delta 的消息(content 为思考链
+                                    # 文本)会掉到下面的 add_progress 分支被当成普通进度
+                                    # 渲染出来。TUI 侧 add_reasoning/flush_reasoning
+                                    # 方法仍保留,日后想恢复只需还原本分支。
+                                    pass
+                                elif msg.content:
+                                    if msg.metadata.get("_tool_result"):
+                                        tui.add_tool_result(msg.content)
+                                    else:
+                                        tui.add_progress(msg.content)
                             continue
 
                         # Interactive question popup pushed by AskUserTool.
@@ -1635,6 +1654,14 @@ def agent(
                         continue
                     except asyncio.CancelledError:
                         break
+                    except Exception:
+                        # Never let an unhandled exception kill the consumer:
+                        # if the task dies, _stream_delta / _streamed messages
+                        # stop being consumed and the UI freezes at the
+                        # spinner.  Log and continue so the user always gets
+                        # the response (lost the offending message at worst).
+                        logger.exception("Outbound consumer recovered from error")
+                        continue
 
             outbound_task = asyncio.create_task(_consume_outbound())
 

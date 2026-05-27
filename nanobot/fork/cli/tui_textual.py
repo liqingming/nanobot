@@ -1001,8 +1001,18 @@ class TextualTUI(TUIBase):
         self._last_content_start: int = 0  # where the most recent intermediate content block started
         self._flushed_parts: list[str] = []  # intermediate LLM text flushed between tool calls
         self._tool_hint: str = ""
+        # Accumulates reasoning_content chunks (LLM thinking trace) so we can
+        # flush them as a dim italic history block on _reasoning_end. Mirrors
+        # PromptTUI's behavior; required because reasoning models like
+        # DeepSeek-v4-pro otherwise have no place to land their trace.
+        self._reasoning_buf: str = ""
         self._last_sep: bool = False
         self._header_already_rendered: bool = False  # set by pop_stream so add_response skips a second header
+        # Fork: when a turn's header is on screen but NOTHING visible followed
+        # it (reasoning suppressed + no tool trace + no mid-turn flush), the
+        # continuation "─ts─" separator in _write_response would dangle with
+        # nothing to separate. pop_stream sets this so _write_response skips it.
+        self._suppress_segment_sep: bool = False
         self._idle_thinking_task: Any = None  # asyncio.Task scheduling the "still thinking" spinner
         self._idle_placeholder_visible: bool = False  # whether the idle thinking line is in #output
         # When idle thinking is shown, _tool_placeholder_line is moved to its
@@ -1117,13 +1127,17 @@ class TextualTUI(TUIBase):
             # Continuation of an already-headed turn — mark the new segment
             # with a lightweight timestamp so it isn't glued to the previous one.
             # Strip date portion if present ("2026-05-20 22:45:30" → "22:45:30").
-            short_ts = ts.split(" ", 1)[1] if " " in ts else ts
-            self._log_write(f"[{self.THEME_MUTED}]─ {short_ts} ─[/{self.THEME_MUTED}]")
-            self._log_write("")
+            # Fork: skip the separator entirely when nothing visible followed the
+            # header (suppressed reasoning, no tool trace) — see pop_stream.
+            if not self._suppress_segment_sep:
+                short_ts = ts.split(" ", 1)[1] if " " in ts else ts
+                self._log_write(f"[{self.THEME_MUTED}]─ {short_ts} ─[/{self.THEME_MUTED}]")
+                self._log_write("")
         else:
             self._log_write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
             self._log_write("")
         self._header_already_rendered = False  # consume flag
+        self._suppress_segment_sep = False  # consume flag
         if self._render_md and not render_as_text and content.strip():
             self._log_write(Markdown(content))
         else:
@@ -1150,6 +1164,11 @@ class TextualTUI(TUIBase):
             except Exception:
                 pass
         self._log_write("")  # trailing blank (outside gray bg)
+        # Fork: a full-width rule between the user block and the upcoming
+        # response header — turns are separated more clearly than by a bare
+        # blank line. Written outside the gray user-range recorded above.
+        self._log_write(f"[{self.THEME_MUTED}]{'─' * 80}[/{self.THEME_MUTED}]")
+        self._log_write("")
         self._last_sep = True
 
     # ── Popup helpers ──────────────────────────────────────────────────────
@@ -1408,6 +1427,69 @@ class TextualTUI(TUIBase):
         self._tool_start_time = time.monotonic()
         self._app._safe_call(self._update_progress_line, text)
 
+    def add_reasoning(self, text: str) -> None:
+        """Accumulate a reasoning_content chunk; flushed on _reasoning_end.
+
+        Unlike PromptTUI we do not render reasoning under the spinner — the
+        Textual output log doesn't have a live ANSI cache the same way, so
+        showing reasoning live here would require a separate widget. Keeping
+        the trace silent until flush is the conservative choice; users can
+        switch to the prompt_toolkit backend if they want live reasoning.
+        """
+        if not text:
+            return
+        self._reasoning_buf += text
+
+    def flush_reasoning(self) -> None:
+        """Dump the accumulated reasoning trace as a dim italic history block.
+
+        Deferred-when-streaming: if content_delta already started writing the
+        response, flushing now would visually split the response (truncate +
+        rewrite from below the reasoning block, leaving the early chunk
+        stranded above). In that case we keep the buffer and let pop_stream
+        flush at turn end so the reasoning block lands cleanly between the
+        header and the finalised response.
+        """
+        if not self._reasoning_buf.strip():
+            self._reasoning_buf = ""
+            return
+        if self._stream_buf:
+            # Stream already started — defer flush to pop_stream.
+            return
+        buf = self._reasoning_buf
+        self._reasoning_buf = ""
+        # Render on the Textual UI thread.
+        self._app._safe_call(self._write_reasoning_block, buf)
+
+    def _write_reasoning_block(self, buf: str) -> None:
+        """Append a finalised reasoning trace to the output log (dim italic).
+
+        Crucially advances ``_tool_placeholder_line`` past the block so the
+        next ``stream_delta`` truncate (``out.truncate_to(_tool_placeholder_line)``)
+        treats the reasoning as already-committed history rather than wiping
+        it. Without this the reasoning would visibly flash and disappear the
+        moment the first content_delta arrived.
+        """
+        self._log_write(f"[{self.THEME_MUTED}]💭 thinking[/{self.THEME_MUTED}]")
+        for ln in buf.strip().splitlines():
+            # markup=False would be ideal but Textual's RichLog wraps via Rich;
+            # using a pre-built Text object avoids markup interpretation.
+            self._log_write(Text(f"  {ln}", style=f"{self.THEME_MUTED} italic"))
+        self._log_write("")
+        # Anchor the stream truncate point below the reasoning block so the
+        # next stream_delta / flush_stream doesn't clobber it.
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            self._tool_placeholder_line = len(out.lines)
+            # Scroll to bottom: appending the (often long) reasoning block grows
+            # max_scroll_y without moving scroll_offset, which would leave the
+            # viewport "not at bottom". stream_delta only renders live when
+            # sc_y >= mx_y, so without this the response stops streaming and
+            # only appears in one shot at flush_stream/add_response.
+            out.scroll_end(animate=False)
+        except Exception:
+            pass
+
     def _update_progress_line(self, text: str) -> None:
         """Overwrite the executing placeholder line with the tool name (runs in Textual context)."""
         self._render_placeholder_line(f"⠋ {text}", "dim")
@@ -1558,6 +1640,7 @@ class TextualTUI(TUIBase):
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
         self._flushed_parts = []
+        self._suppress_segment_sep = False  # reset per turn; pop_stream may set it
         # Anchor the "thinking time" displayed by spinners to the moment the
         # turn began — not to each individual spinner restart. This keeps the
         # elapsed counter continuous across idle gaps + tool calls.
@@ -1775,9 +1858,29 @@ class TextualTUI(TUIBase):
             out.truncate_to(self._tool_placeholder_line)
         except Exception:
             pass
+        # Fork: deferred reasoning flush. flush_reasoning skipped while stream
+        # was active to avoid splitting the response visually; now is the right
+        # time — stream chunk is gone, response will be re-written by
+        # add_response below. Reasoning lands between header and response.
+        if self._reasoning_buf.strip():
+            deferred = self._reasoning_buf
+            self._reasoning_buf = ""
+            self._app._safe_call(self._write_reasoning_block, deferred)
         # If the streaming session was active, signal add_response to skip
         # the header (we keep the original one written by stream_start).
         self._header_already_rendered = bool(ts_was) or self._stream_header_line > 0
+        # Fork: suppress the continuation "─ts─" separator when no visible
+        # content followed the header. _tool_placeholder_line only advances past
+        # the header anchor (_stream_header_line + 2 = header line + its trailing
+        # blank) when flush_stream lands a mid-turn segment or a tool trace is
+        # petrified. If it still sits at that anchor, the only thing between the
+        # header and the upcoming response was suppressed reasoning — so a
+        # "─ts─" line would dangle. NOTE: the "+2" is coupled to stream_start
+        # writing a single-line header + one blank; keep them in sync.
+        self._suppress_segment_sep = (
+            self._header_already_rendered
+            and self._tool_placeholder_line <= self._stream_header_line + 2
+        )
         return buf
 
     def flush_accumulator(self) -> str:

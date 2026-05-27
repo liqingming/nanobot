@@ -313,6 +313,8 @@ class PromptTUI(TUIBase):
         self._tool_frame: int = 0            # spinner frame index for tool execution
         self._tool_task: Any = None          # asyncio.Task for tool animation
         self._tool_hint: str = ""            # current tool hint label
+        self._reasoning_buf: str = ""        # accumulated reasoning chunks (LLM thinking trace)
+        self._reasoning_tail_lines: int = 5  # only the last N lines render under spinner
         self._ctx_used: int = 0              # last known prompt tokens
         self._ctx_total: int = 0             # context window size
         self._is_processing: bool = False    # True while agent is running
@@ -492,10 +494,23 @@ class PromptTUI(TUIBase):
     def _render_thinking(self) -> str:
         ts = self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         spinner = self._SPINNER[self._thinking_frame % len(self._SPINNER)]
+        # Reasoning tail: only render the last N lines so spinner stays anchored.
+        # Avoid re-rendering very long buffers each 0.1s tick (CPU cost on big buf).
+        reasoning_tail = ""
+        if self._reasoning_buf:
+            lines = self._reasoning_buf.splitlines()
+            tail = lines[-self._reasoning_tail_lines:]
+            reasoning_tail = "\n".join(tail).strip()
         def _fn(c: Console) -> None:
             c.print()
             c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
             c.print(f"[dim]{spinner} thinking...[/dim]")
+            if reasoning_tail:
+                # markup=False: reasoning is untrusted LLM output that may contain
+                # `[1]`/`[note]` etc. which rich would otherwise parse as markup
+                # tags and raise MarkupError, killing the animation task.
+                for ln in reasoning_tail.splitlines():
+                    c.print(f"  {ln}", style="dim italic", markup=False)
         return _rich_to_ansi(_fn)
 
     def _render_tool_executing(self) -> str:
@@ -965,6 +980,45 @@ class PromptTUI(TUIBase):
         self._pin_to_bottom()
         self._invalidate()
 
+    def add_reasoning(self, text: str) -> None:
+        """Append a reasoning (thinking-content) chunk to the live buffer.
+
+        Reasoning is shown *under* the thinking spinner via ``_render_thinking``
+        — we only append to ``_reasoning_buf`` and rely on ``_animate_thinking``
+        to pick it up on its 0.1s tick.  We deliberately do NOT force a render
+        when ``_thinking_task is None``: reasoning models (e.g. DeepSeek-v4-pro)
+        interleave reasoning_delta with content_delta, and a forced redraw here
+        would overwrite the in-progress stream snapshot.  When the spinner is
+        gone (stream phase / tool phase), reasoning accumulates silently and is
+        flushed to history on ``_reasoning_end`` or ``pop_stream``.
+        """
+        if not text:
+            return
+        self._reasoning_buf += text
+
+    def flush_reasoning(self) -> None:
+        """Move the accumulated reasoning buffer into the history pane as a
+        dim italic block. Called on ``_reasoning_end`` so the trace persists
+        after the spinner / stream segment ends.
+        """
+        if not self._reasoning_buf.strip():
+            self._reasoning_buf = ""
+            return
+        self._append_block(self._render_reasoning_block(self._reasoning_buf))
+        self._reasoning_buf = ""
+        self._pin_to_bottom()
+        self._invalidate()
+
+    def _render_reasoning_block(self, buf: str) -> str:
+        """Render a finalized reasoning trace as a dim italic history block."""
+        def _fn(c: Console) -> None:
+            c.print()
+            c.print("[dim]💭 thinking[/dim]")
+            for ln in buf.strip().splitlines():
+                # markup=False — see _render_thinking docstring.
+                c.print(f"  {ln}", style="dim italic", markup=False)
+        return _rich_to_ansi(_fn)
+
     def add_progress(self, text: str) -> None:
         """Show the current tool being executed (with rotation animation)."""
         self._tool_hint = text
@@ -997,6 +1051,9 @@ class PromptTUI(TUIBase):
 
     def tool_phase_start(self) -> None:
         """Switch to tool-execution phase: stop thinking animation, start tool rotation."""
+        # No flush_reasoning here — same rationale as stream_delta. If the LLM
+        # is still emitting reasoning while tools run, let it accumulate and
+        # flush on _reasoning_end / pop_stream.
         self._cancel_thinking()
         self._cancel_tool_task()
         self._stream_buf = ""
@@ -1014,6 +1071,10 @@ class PromptTUI(TUIBase):
 
     def stream_delta(self, delta: str) -> None:
         """Append a streaming delta and refresh the output pane."""
+        # Do NOT flush reasoning here — reasoning models interleave
+        # reasoning_delta with content_delta; flushing mid-stream injects a
+        # history block on every content chunk, disrupting the live render.
+        # Reasoning is flushed only on _reasoning_end or pop_stream.
         self._cancel_thinking()
         self._cancel_tool_task()
         self._stream_buf += delta
@@ -1041,6 +1102,8 @@ class PromptTUI(TUIBase):
 
     def pop_stream(self) -> str:
         """Return accumulated stream text and clear without adding to history."""
+        if self._reasoning_buf.strip():
+            self.flush_reasoning()
         self._cancel_thinking()
         self._cancel_tool_task()
         buf = self._stream_buf

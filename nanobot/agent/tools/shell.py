@@ -552,6 +552,13 @@ class ExecTool(Tool):
                 "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
                 "PATH": os.environ.get("PATH", f"{sr}\\system32;{sr}"),
                 "PYTHONUNBUFFERED": "1",
+                # Force UTF-8 for child Python processes so LLM-generated code
+                # that prints emoji / CJK (e.g. print("📊 报告")) doesn't crash
+                # with UnicodeEncodeError under the Windows console's legacy
+                # GBK/cp936 codepage. PYTHONUTF8=1 also makes open() default to
+                # UTF-8, avoiding the cp936 default-encoding trap on Windows.
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
                 "APPDATA": os.environ.get("APPDATA", ""),
                 "LOCALAPPDATA": os.environ.get("LOCALAPPDATA", ""),
                 "ProgramData": os.environ.get("ProgramData", ""),
@@ -570,6 +577,11 @@ class ExecTool(Tool):
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "TERM": os.environ.get("TERM", "dumb"),
             "PYTHONUNBUFFERED": "1",
+            # Keep child Python stdout/stderr on UTF-8 regardless of the host
+            # locale (mirrors the Windows branch; harmless on POSIX where LANG
+            # already implies UTF-8).
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
         }
         for key in self.allowed_env_keys:
             val = os.environ.get(key)
