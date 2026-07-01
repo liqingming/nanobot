@@ -44,9 +44,10 @@ from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
+
+from nanobot.cli.markdown import terminal_markdown
 
 from nanobot import __logo__, __version__
 from nanobot.agent.loop import AgentLoop
@@ -199,7 +200,7 @@ def _response_renderable(content: str, render_markdown: bool, metadata: dict | N
         return Text(content)
     if (metadata or {}).get("render_as") == "text":
         return Text(content)
-    return Markdown(content)
+    return terminal_markdown(content)
 
 
 async def _print_interactive_line(text: str) -> None:

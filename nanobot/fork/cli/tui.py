@@ -43,8 +43,9 @@ from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.text import Text
+
+from nanobot.cli.markdown import terminal_markdown
 from wcwidth import wcswidth as _wcswidth
 
 from nanobot import __logo__, __version__
@@ -416,7 +417,7 @@ class PromptTUI(TUIBase):
             c.print()
             c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
             if self._render_md and not render_as_text and content.strip():
-                c.print(Markdown(content))
+                c.print(terminal_markdown(content))
             else:
                 c.print(Text(content))
             c.print()
@@ -430,7 +431,7 @@ class PromptTUI(TUIBase):
             c.print()
             c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
             if self._render_md and self._stream_buf.strip():
-                c.print(Markdown(self._stream_buf))
+                c.print(terminal_markdown(self._stream_buf))
             else:
                 c.print(self._stream_buf or "")
 

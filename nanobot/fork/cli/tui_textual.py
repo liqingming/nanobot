@@ -51,8 +51,9 @@ from typing import Any
 
 from loguru import logger
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.text import Text
+
+from nanobot.cli.markdown import terminal_markdown
 
 from nanobot import __logo__, __version__
 from nanobot.fork.cli.tui_base import TUIBase
@@ -1075,7 +1076,7 @@ class TextualTUI(TUIBase):
         self._header_already_rendered = False  # consume flag
         self._suppress_segment_sep = False  # consume flag
         if self._render_md and not render_as_text and content.strip():
-            self._log_write(Markdown(content))
+            self._log_write(terminal_markdown(content))
         else:
             self._log_write(Text(content))
         self._log_write("")
@@ -1761,7 +1762,7 @@ class TextualTUI(TUIBase):
                     out.write(Text(f"─ {now_ts} ─", style=self.THEME_MUTED))
                     out.write("")
                 if self._render_md and not render_as_text:
-                    out.write(Markdown(self._stream_buf))
+                    out.write(terminal_markdown(self._stream_buf))
                 else:
                     out.write(Text(self._stream_buf))
                 out.write("")

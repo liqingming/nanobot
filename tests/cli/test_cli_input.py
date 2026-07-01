@@ -4,6 +4,7 @@ from io import StringIO
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from rich.console import Console
 from prompt_toolkit.formatted_text import HTML
 
 from nanobot.cli import commands
@@ -198,7 +199,7 @@ def test_response_renderable_uses_text_for_explicit_plain_rendering():
 def test_response_renderable_preserves_normal_markdown_rendering():
     renderable = commands._response_renderable("**bold**", render_markdown=True)
 
-    assert renderable.__class__.__name__ == "Markdown"
+    assert renderable.__class__.__name__ == "TerminalMarkdown"
 
 
 def test_response_renderable_without_metadata_keeps_markdown_path():
@@ -206,8 +207,30 @@ def test_response_renderable_without_metadata_keeps_markdown_path():
 
     renderable = commands._response_renderable(help_text, render_markdown=True)
 
-    assert renderable.__class__.__name__ == "Markdown"
+    assert renderable.__class__.__name__ == "TerminalMarkdown"
 
+
+
+
+def test_terminal_markdown_code_blocks_do_not_emit_background_colors():
+    renderable = commands._response_renderable(
+        "Verified:\n\n    cmd /c setup-dev.bat\n    skipped existing skills",
+        render_markdown=True,
+    )
+    stream = StringIO()
+    console = Console(
+        file=stream,
+        force_terminal=True,
+        color_system="256",
+        width=80,
+    )
+
+    console.print(renderable)
+    rendered = stream.getvalue()
+
+    assert "cmd /c setup-dev.bat" in rendered
+    assert "\x1b[48;" not in rendered
+    assert "\x1b[40m" not in rendered
 
 def test_stream_renderer_stop_for_input_stops_spinner():
     """stop_for_input should stop the active spinner to avoid prompt_toolkit conflicts."""

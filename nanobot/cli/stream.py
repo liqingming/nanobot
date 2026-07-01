@@ -16,8 +16,9 @@ from datetime import datetime
 
 from rich.console import Console
 from rich.live import Live
-from rich.markdown import Markdown
 from rich.text import Text
+
+from nanobot.cli.markdown import terminal_markdown
 
 
 def _clear_current_line(console: Console) -> None:
@@ -115,7 +116,7 @@ class StreamRenderer:
     def _renderable(self):
         """Create a renderable from the current buffer."""
         if self._md and self._buf:
-            return Markdown(self._buf)
+            return terminal_markdown(self._buf)
         return Text(self._buf or "")
 
     def _render_str(self) -> str:
