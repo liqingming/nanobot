@@ -97,28 +97,66 @@ if _TEXTUAL_AVAILABLE:
     from textual.strip import Strip
 
     class _OutputLog(RichLog):
-        """RichLog with line-range text selection and clipboard copy.
+        """RichLog with cell-range text selection and clipboard copy.
 
-        Mouse drag selects rows; releasing the mouse copies the selection to
+        Mouse drag selects text; releasing the mouse copies the selection to
         the system clipboard via Windows ``clip`` (primary) or Textual's OSC-52
-        API (fallback).  Selected rows are highlighted with a dark-blue tint.
+        API (fallback).  Selected text is highlighted with a dark-blue tint.
         """
         can_focus = False
 
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
-            self._sel_start: int | None = None  # content-space row index
-            self._sel_end: int | None = None
+            self._sel_start: tuple[int, int] | None = None  # content-space row, cell column
+            self._sel_end: tuple[int, int] | None = None
             self._selecting: bool = False
             self._sel_moved: bool = False  # True once mouse moves during drag
             self._user_ranges: list[tuple[int, int]] = []  # gray-bg row ranges
 
         # ── selection helpers ──────────────────────────────────────────────
 
-        def _sel_rows(self) -> tuple[int, int] | None:
+        def _selection_points(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
             if self._sel_start is None or self._sel_end is None:
                 return None
-            return min(self._sel_start, self._sel_end), max(self._sel_start, self._sel_end)
+            return (
+                (self._sel_start, self._sel_end)
+                if self._sel_start <= self._sel_end
+                else (self._sel_end, self._sel_start)
+            )
+
+        def _sel_rows(self) -> tuple[int, int] | None:
+            points = self._selection_points()
+            if points is None:
+                return None
+            start, end = points
+            return start[0], end[0]
+
+        @staticmethod
+        def _selection_cols_for_row(
+            row: int,
+            start: tuple[int, int],
+            end: tuple[int, int],
+            line_width: int,
+        ) -> tuple[int, int] | None:
+            start_row, start_col = start
+            end_row, end_col = end
+            if row < start_row or row > end_row:
+                return None
+            if start_row == end_row:
+                col_start = min(start_col, line_width)
+                col_end = min(end_col + 1, line_width)
+            elif row == start_row:
+                col_start = min(start_col, line_width)
+                col_end = line_width
+            elif row == end_row:
+                col_start = 0
+                col_end = min(end_col + 1, line_width)
+            else:
+                col_start = 0
+                col_end = line_width
+            if col_end <= col_start:
+                return None
+            return col_start, col_end
 
         def _clear_selection(self) -> None:
             self._sel_start = None
@@ -126,14 +164,23 @@ if _TEXTUAL_AVAILABLE:
             self.refresh()
 
         def _extract_selected_text(self) -> str:
-            rows = self._sel_rows()
-            if rows is None:
+            points = self._selection_points()
+            if points is None:
                 return ""
-            start, end = rows
+            row_start, row_end = self._sel_rows() or (0, -1)
             parts: list[str] = []
-            for row in range(start, end + 1):
+            for row in range(row_start, row_end + 1):
                 if row < len(self.lines):
-                    parts.append(self.lines[row].text.rstrip())
+                    line = self.lines[row]
+                    cols = self._selection_cols_for_row(
+                        row,
+                        points[0],
+                        points[1],
+                        line.cell_length,
+                    )
+                    if cols is not None:
+                        col_start, col_end = cols
+                        parts.append(line.crop(col_start, col_end).text)
             return "\n".join(parts)
 
         def _copy_to_clipboard(self, text: str) -> None:
@@ -236,6 +283,29 @@ if _TEXTUAL_AVAILABLE:
                 new_segs.append(_Seg(text, new_style, ctrl))
             return Strip(new_segs, strip.cell_length)
 
+        @classmethod
+        def _force_color_range(
+            cls,
+            strip: Strip,
+            start: int,
+            end: int,
+            bgcolor: str,
+            color: str,
+        ) -> Strip:
+            if end <= start:
+                return strip
+            before = strip.crop(0, start)
+            selected = cls._force_colors(strip.crop(start, end), bgcolor, color)
+            after = strip.crop(end, strip.cell_length)
+            return Strip(
+                [
+                    *before._segments,
+                    *selected._segments,
+                    *after._segments,
+                ],
+                strip.cell_length,
+            )
+
         def render_line(self, y: int) -> Strip:
             scroll_x, scroll_y = self.scroll_offset
             n = len(self.lines)
@@ -257,9 +327,25 @@ if _TEXTUAL_AVAILABLE:
                 strip = super().render_line(y)
             if self._user_ranges and any(s <= content_row <= e for s, e in self._user_ranges):
                 strip = self._force_bgcolor(strip, "#2d2d2d")
-            rows = self._sel_rows()
-            if rows is not None and rows[0] <= content_row <= rows[1]:
-                strip = self._force_colors(strip, bgcolor="white", color="black")
+            points = self._selection_points()
+            if points is not None:
+                cols = self._selection_cols_for_row(
+                    content_row,
+                    points[0],
+                    points[1],
+                    self.lines[content_row].cell_length if content_row < n else 0,
+                )
+                if cols is not None:
+                    scroll_x, _ = self.scroll_offset
+                    col_start = max(0, cols[0] - scroll_x)
+                    col_end = max(0, cols[1] - scroll_x)
+                    strip = self._force_color_range(
+                        strip,
+                        col_start,
+                        col_end,
+                        bgcolor="white",
+                        color="black",
+                    )
             return strip
 
         # ── mouse events ───────────────────────────────────────────────────
@@ -271,10 +357,11 @@ if _TEXTUAL_AVAILABLE:
                 n = len(self.lines)
                 if n == 0:
                     return
-                _, scroll_y = self.scroll_offset
+                scroll_x, scroll_y = self.scroll_offset
                 row = max(0, min(scroll_y + event.y, n - 1))
-                self._sel_start = row
-                self._sel_end = row
+                col = max(0, scroll_x + event.x)
+                self._sel_start = (row, col)
+                self._sel_end = (row, col)
                 self._selecting = True
                 self._sel_moved = False
                 self.capture_mouse()
@@ -286,11 +373,13 @@ if _TEXTUAL_AVAILABLE:
             if not self._selecting:
                 return
             try:
-                _, scroll_y = self.scroll_offset
+                scroll_x, scroll_y = self.scroll_offset
                 row = max(0, min(scroll_y + event.y, len(self.lines) - 1))
-                self._sel_moved = True
-                if row != self._sel_end:
-                    self._sel_end = row
+                col = max(0, scroll_x + event.x)
+                point = (row, col)
+                if point != self._sel_end:
+                    self._sel_moved = True
+                    self._sel_end = point
                     self.refresh()
             except Exception:
                 pass
@@ -300,9 +389,12 @@ if _TEXTUAL_AVAILABLE:
             if not self._selecting:
                 return
             try:
-                _, scroll_y = self.scroll_offset
+                scroll_x, scroll_y = self.scroll_offset
                 row = max(0, min(scroll_y + event.y, len(self.lines) - 1))
-                self._sel_end = row
+                col = max(0, scroll_x + event.x)
+                if (row, col) != self._sel_end:
+                    self._sel_moved = True
+                self._sel_end = (row, col)
                 self._selecting = False
                 self.release_mouse()
                 if self._sel_moved:
