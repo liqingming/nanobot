@@ -60,6 +60,12 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "activity",
     ),
     BuiltinCommandSpec(
+        "/skills",
+        "Show skills",
+        "List available skills for the current workspace.",
+        "book-open",
+    ),
+    BuiltinCommandSpec(
         "/model",
         "Switch model preset",
         "Show or switch the active model preset.",
@@ -617,6 +623,16 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_skills(ctx: CommandContext) -> OutboundMessage:
+    """List available skills for the current workspace."""
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=ctx.loop.context.skills.format_listing(),
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
 def build_help_text() -> str:
     """Build canonical help text shared across channels."""
     lines = ["🐈 nanobot commands:"]
@@ -635,6 +651,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
+    router.exact("/skills", cmd_skills)
     router.exact("/model", cmd_model)
     router.prefix("/model ", cmd_model)
     router.exact("/history", cmd_history)

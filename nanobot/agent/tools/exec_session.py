@@ -105,9 +105,7 @@ class _ExecSession:
             return "session has already exited"
         if self.process.stdin is None:
             return "session stdin is not available"
-        self.process.stdin.close()
-        with suppress(BrokenPipeError, ConnectionResetError):
-            await self.process.stdin.wait_closed()
+        await self._close_stdin()
         return None
 
     async def poll(
@@ -127,11 +125,8 @@ class _ExecSession:
             await self.kill()
 
         if self.process.returncode is not None:
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.gather(self._stdout_task, self._stderr_task),
-                    timeout=2.0,
-                )
+            await self._drain_reader_tasks()
+            await self._close_process_transport()
 
         async with self._lock:
             output = "".join(self._chunks)
@@ -150,11 +145,39 @@ class _ExecSession:
         )
 
     async def kill(self) -> None:
-        if self.process.returncode is not None:
+        await self._close_stdin()
+        if self.process.returncode is None:
+            with suppress(ProcessLookupError):
+                self.process.kill()
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        await self._drain_reader_tasks()
+        await self._close_process_transport()
+
+    async def _close_stdin(self) -> None:
+        stdin = self.process.stdin
+        if stdin is None:
             return
-        self.process.kill()
-        with suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        if not stdin.is_closing():
+            stdin.close()
+        with suppress(BrokenPipeError, ConnectionResetError, RuntimeError, ValueError):
+            await stdin.wait_closed()
+
+    async def _drain_reader_tasks(self) -> None:
+        tasks = [self._stdout_task, self._stderr_task]
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2.0)
+        except asyncio.TimeoutError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _close_process_transport(self) -> None:
+        transport = getattr(self.process, "_transport", None)
+        if transport is not None:
+            with suppress(RuntimeError, ValueError):
+                transport.close()
+            await asyncio.sleep(0)
 
 
 class ExecSessionManager:
@@ -252,6 +275,16 @@ class ExecSessionManager:
                 )
                 for session_id, session in sorted(self._sessions.items())
             ]
+
+    async def shutdown(self) -> None:
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        if sessions:
+            await asyncio.gather(
+                *(session.kill() for session in sessions),
+                return_exceptions=True,
+            )
 
     async def _cleanup_locked(self) -> None:
         now = time.monotonic()

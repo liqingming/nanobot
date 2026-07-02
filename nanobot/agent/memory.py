@@ -724,7 +724,8 @@ class Consolidator:
                 replay_max_messages,
             )
             try:
-                estimated, source = self.estimate_session_prompt_tokens(
+                estimated, source = await asyncio.to_thread(
+                    self.estimate_session_prompt_tokens,
                     session,
                 )
             except Exception:
@@ -789,7 +790,8 @@ class Consolidator:
                     break
 
                 try:
-                    estimated, source = self.estimate_session_prompt_tokens(
+                    estimated, source = await asyncio.to_thread(
+                        self.estimate_session_prompt_tokens,
                         session,
                     )
                 except Exception:

@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 
 import yaml
@@ -27,6 +28,13 @@ _STRIP_SKILL_FRONTMATTER = re.compile(
 )
 
 
+def project_skill_roots(workspace: Path) -> list[tuple[str, Path]]:
+    claude_dir = workspace / ".claude"
+    if claude_dir.is_dir():
+        return [("claude", claude_dir / "skills")]
+    return []
+
+
 class SkillsLoader:
     """
     Loader for agent skills.
@@ -35,11 +43,18 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None, disabled_skills: set[str] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        builtin_skills_dir: Path | None = None,
+        disabled_skills: set[str] | None = None,
+        extra_skill_roots: Sequence[tuple[str, Path]] | None = None,
+    ):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
         self.disabled_skills = disabled_skills or set()
+        self.extra_skill_roots = list(extra_skill_roots or [])
         # Fork(perf): cache parsed frontmatter metadata keyed by skill name,
         # invalidated by SKILL.md mtime. Without this, get_skill_metadata is a
         # fresh read + yaml.safe_load on every call, and build_skills_summary /
@@ -72,11 +87,19 @@ class SkillsLoader:
         Returns:
             List of skill info dicts with 'name', 'path', 'source'.
         """
-        skills = self._skill_entries_from_dir(self.workspace_skills, "workspace")
-        workspace_names = {entry["name"] for entry in skills}
+        skills: list[dict[str, str]] = []
+        seen_names: set[str] = set()
+        for source, root in self.extra_skill_roots:
+            entries = self._skill_entries_from_dir(root, source, skip_names=seen_names)
+            skills.extend(entries)
+            seen_names.update(entry["name"] for entry in entries)
+
+        entries = self._skill_entries_from_dir(self.workspace_skills, "workspace", skip_names=seen_names)
+        skills.extend(entries)
+        seen_names.update(entry["name"] for entry in entries)
         if self.builtin_skills and self.builtin_skills.exists():
             skills.extend(
-                self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=workspace_names)
+                self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=seen_names)
             )
 
         if self.disabled_skills:
@@ -86,9 +109,33 @@ class SkillsLoader:
             return [skill for skill in skills if self._check_requirements(self._get_skill_meta(skill["name"]))]
         return skills
 
+    def format_listing(self) -> str:
+        entries = self.list_skills(filter_unavailable=False)
+        if not entries:
+            return "当前没有可用技能。"
+
+        available_names = {
+            entry["name"]
+            for entry in self.list_skills(filter_unavailable=True)
+        }
+        source_labels = {
+            "claude": ".claude",
+            "workspace": "workspace",
+            "builtin": "builtin",
+        }
+        lines = [f"Skills ({len(entries)}):"]
+        for entry in sorted(entries, key=lambda item: (item.get("source", ""), item.get("name", ""))):
+            name = entry.get("name", "")
+            source = source_labels.get(entry.get("source", ""), entry.get("source", "unknown"))
+            description = self._get_skill_description(name) or "(no description)"
+            status = "" if name in available_names else " [unavailable]"
+            lines.append(f"- {name} ({source}){status}: {description}")
+        return "\n".join(lines)
+
     def _resolve_skill_path(self, name: str) -> Path | None:
-        """Return the SKILL.md path for *name* (workspace overrides builtin)."""
-        roots = [self.workspace_skills]
+        """Return the SKILL.md path for *name* using configured root priority."""
+        roots = [root for _source, root in self.extra_skill_roots]
+        roots.append(self.workspace_skills)
         if self.builtin_skills:
             roots.append(self.builtin_skills)
         for root in roots:

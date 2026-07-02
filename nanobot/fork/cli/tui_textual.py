@@ -73,7 +73,7 @@ try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal
-    from textual.events import Key
+    from textual.events import Key, Paste
     from textual.widgets import Input, RichLog, Static
     _TEXTUAL_AVAILABLE = True
 except ImportError:
@@ -86,6 +86,18 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+_TUI_LAG_LOG = Path(__file__).resolve().parents[2] / "tui_lag.log"
+
+
+def _append_tui_lag_log(message: str) -> None:
+    try:
+        _TUI_LAG_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _TUI_LAG_LOG.open("a", encoding="utf-8") as f:
+            f.write(message + "\n")
+    except Exception:
+        pass
 
 
 if _TEXTUAL_AVAILABLE:
@@ -459,6 +471,102 @@ if _TEXTUAL_AVAILABLE:
         def __init__(self, tui: "TextualTUI", **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self._tui_ref = tui
+            self._multiline_paste_tokens: list[dict[str, str]] = []
+
+        @staticmethod
+        def _normalize_paste_text(text: str) -> str:
+            return text.replace("\r\n", "\n").replace("\r", "\n")
+
+        @staticmethod
+        def _paste_line_count(text: str) -> int:
+            return text.count("\n") + 1
+
+        def _paste_display_token(self, text: str) -> str:
+            lines = self._paste_line_count(text)
+            return f"[已粘贴 {lines} 行]"
+
+        def _clear_multiline_paste_tokens(self) -> None:
+            self._multiline_paste_tokens = []
+
+        def _token_positions(self) -> list[tuple[int, dict[str, str]]]:
+            positions: list[tuple[int, dict[str, str]]] = []
+            start = 0
+            for token in self._multiline_paste_tokens:
+                index = self.value.find(token["display"], start)
+                if index < 0:
+                    return []
+                positions.append((index, token))
+                start = index + len(token["display"])
+            return positions
+
+        def _insert_multiline_token(self, text: str) -> None:
+            display = self._paste_display_token(text)
+            selection = self.selection
+            selection_start = min(selection.start, selection.end)
+            selection_end = max(selection.start, selection.end)
+            insert_at = selection_start
+            before_positions = self._token_positions()
+            self.replace(display, *selection)
+            self.cursor_position = insert_at + len(display)
+
+            new_token = {"display": display, "text": text}
+            inserted = False
+            tokens: list[dict[str, str]] = []
+            for position, token in before_positions:
+                token_end = position + len(token["display"])
+                if token_end > selection_start and position < selection_end:
+                    continue
+                if not inserted and position >= insert_at:
+                    tokens.append(new_token)
+                    inserted = True
+                tokens.append(token)
+            if not inserted:
+                tokens.append(new_token)
+            self._multiline_paste_tokens = tokens
+
+        def _insert_paste_text(self, text: str) -> None:
+            text = self._normalize_paste_text(text)
+            if not text:
+                return
+            if "\n" in text:
+                self._insert_multiline_token(text)
+                return
+            selection = self.selection
+            if selection.is_empty:
+                self.insert_text_at_cursor(text)
+            else:
+                self.replace(text, *selection)
+
+        def submit_value(self) -> str:
+            if not self._multiline_paste_tokens:
+                return self.value
+            positions = self._token_positions()
+            if len(positions) != len(self._multiline_paste_tokens):
+                return self.value
+            restored: list[str] = []
+            cursor = 0
+            for index, token in positions:
+                display = token["display"]
+                restored.append(self.value[cursor:index])
+                restored.append(token["text"])
+                cursor = index + len(display)
+            restored.append(self.value[cursor:])
+            return "".join(restored)
+
+        def sync_multiline_paste_tokens(self) -> None:
+            if (
+                self._multiline_paste_tokens
+                and len(self._token_positions()) != len(self._multiline_paste_tokens)
+            ):
+                self._clear_multiline_paste_tokens()
+
+        def _on_paste(self, event: Paste) -> None:
+            self._insert_paste_text(event.text)
+            event.prevent_default()
+            event.stop()
+
+        def action_paste(self) -> None:
+            self._insert_paste_text(self.app.clipboard)
 
         async def _on_key(self, event: Key) -> None:
             tui = self._tui_ref
@@ -490,17 +598,20 @@ if _TEXTUAL_AVAILABLE:
                 tui._refresh_popup()
                 event.prevent_default()
             elif action == PopupAction.COMPLETE:
+                self._clear_multiline_paste_tokens()
                 self.value = decision.value
                 self.cursor_position = len(decision.value)
                 event.prevent_default()
             elif action == PopupAction.HISTORY_BACK:
                 text = tui._history_backward()
                 if text is not None:
+                    self._clear_multiline_paste_tokens()
                     self.value = text
                     self.cursor_position = len(text)
                 event.prevent_default()
             elif action == PopupAction.HISTORY_FORWARD:
                 text = tui._history_forward()
+                self._clear_multiline_paste_tokens()
                 self.value = text if text is not None else ""
                 if text is not None:
                     self.cursor_position = len(text)
@@ -609,6 +720,9 @@ if _TEXTUAL_AVAILABLE:
             self._thinking_timer: Any = None
             self._thinking_frame = 0
             self._thinking_start_time: float = 0.0
+            self._lag_timer: Any = None
+            self._lag_last: float = 0.0
+            self._lag_warn_threshold_s = 0.5
 
         def _safe_call(self, fn: Any, *args: Any) -> None:
             """Schedule ``fn(*args)`` via ``call_later`` so it runs inside
@@ -662,10 +776,39 @@ if _TEXTUAL_AVAILABLE:
         def on_mount(self) -> None:
             self.query_one("#input").focus()
             self._write_welcome()
+            self._start_lag_watchdog()
             # After the first full render, re-focus + full layout refresh so
             # Windows Terminal updates its IME candidate window position to the
             # actual input cursor location instead of defaulting to top-left.
             self.call_after_refresh(self._refocus_input)
+
+        def _start_lag_watchdog(self) -> None:
+            import time
+
+            self._lag_last = time.monotonic()
+
+            def _tick() -> None:
+                now = time.monotonic()
+                elapsed = now - self._lag_last
+                self._lag_last = now
+                lag = elapsed - 0.25
+                if lag >= self._lag_warn_threshold_s:
+                    message = (
+                        f"{datetime.now().isoformat(timespec='seconds')} "
+                        f"Textual event loop lag detected: {lag * 1000:.0f}ms; "
+                        f"phase={self._tui._activity_phase}"
+                    )
+                    _append_tui_lag_log(message)
+                    try:
+                        logger.warning(
+                            "Textual event loop lag detected: {:.0f}ms; phase={}",
+                            lag * 1000,
+                            self._tui._activity_phase,
+                        )
+                    except Exception:
+                        pass
+
+            self._lag_timer = self.set_interval(0.25, _tick)
 
         def _refocus_input(self) -> None:
             inp = self.query_one("#input", Input)
@@ -690,6 +833,12 @@ if _TEXTUAL_AVAILABLE:
 
         def on_input_submitted(self, event: Input.Submitted) -> None:
             tui = self._tui
+            input_widget = event.input
+            input_text = (
+                input_widget.submit_value()
+                if isinstance(input_widget, _HistoryInput)
+                else event.value
+            )
             selected = (
                 tui._popup_items[tui._popup_idx][0]
                 if tui._popup_items and 0 <= tui._popup_idx < len(tui._popup_items)
@@ -700,9 +849,12 @@ if _TEXTUAL_AVAILABLE:
                 popup_mode=tui._popup_mode,
                 popup_has_items=bool(tui._popup_items),
                 popup_selected_value=selected,
-                input_text=event.value,
+                input_text=input_text,
             ))
             action, value = decision.action, decision.value
+            if isinstance(input_widget, _HistoryInput):
+                input_widget.sync_multiline_paste_tokens()
+                input_widget._clear_multiline_paste_tokens()
             event.input.clear()
             tui._history_pos = -1
 
@@ -737,6 +889,9 @@ if _TEXTUAL_AVAILABLE:
             # NOOP: nothing to do
 
         def on_input_changed(self, event: Input.Changed) -> None:
+            input_widget = event.input
+            if isinstance(input_widget, _HistoryInput):
+                input_widget.sync_multiline_paste_tokens()
             self._tui._on_input_changed(event.value)
 
         # ── actions ────────────────────────────────────────────────────────
@@ -1065,6 +1220,7 @@ class TextualTUI(TUIBase):
         # State
         self._topic: str = ""
         self._is_processing: bool = False
+        self._activity_phase: str = "idle"
         self._ctx_used: int = 0
         self._ctx_total: int = 0
         self._input_mode: str = "chat"  # "chat" | "new_topic"
@@ -1151,6 +1307,7 @@ class TextualTUI(TUIBase):
         the header is omitted so we don't get duplicate headers — instead a
         short "─ HH:MM:SS ─" separator marks the new segment.
         """
+        self._activity_phase = "write_response"
         render_as_text = (metadata or {}).get("render_as") == "text"
         if self._header_already_rendered:
             # Continuation of an already-headed turn — mark the new segment
@@ -1670,6 +1827,7 @@ class TextualTUI(TUIBase):
 
     def stream_start(self) -> None:
         import time
+        self._activity_phase = "stream_start"
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
         self._flushed_parts = []
@@ -1698,6 +1856,7 @@ class TextualTUI(TUIBase):
         self._app._safe_call(self._app.start_thinking_spinner)
 
     def tool_phase_start(self) -> None:
+        self._activity_phase = "tool_phase"
         self._cancel_idle_thinking()
         # Petrify the previous tool's spinner line into a static "→ tool" trace
         # before starting a new one, so chained tool calls stay visible.
@@ -1809,6 +1968,7 @@ class TextualTUI(TUIBase):
             self._idle_thinking_task = None
 
     def stream_delta(self, delta: str) -> None:
+        self._activity_phase = "stream_delta"
         self._cancel_idle_thinking()
         self._app.stop_thinking_spinner()
         self._app.stop_spinner()
@@ -1836,6 +1996,7 @@ class TextualTUI(TUIBase):
         self._schedule_idle_thinking()
 
     def flush_stream(self, metadata: dict | None = None) -> None:
+        self._activity_phase = "flush_stream"
         self._cancel_idle_thinking()
         self._app.stop_thinking_spinner()
         self._app.stop_spinner()
@@ -1942,7 +2103,12 @@ class TextualTUI(TUIBase):
 
     def set_is_processing(self, value: bool) -> None:
         self._is_processing = value
+        if not value:
+            self._activity_phase = "idle"
         self._update_status()
+
+    def set_activity_phase(self, phase: str) -> None:
+        self._activity_phase = phase or "idle"
 
     def update_context_usage(self, used: int, total: int) -> None:
         self._ctx_used = used

@@ -22,6 +22,7 @@ class TestIsDispatchableCommand:
     def test_exact_commands_match(self, router: CommandRouter) -> None:
         assert router.is_dispatchable_command("/new")
         assert router.is_dispatchable_command("/help")
+        assert router.is_dispatchable_command("/skills")
         assert router.is_dispatchable_command("/model")
         assert router.is_dispatchable_command("/dream")
         assert router.is_dispatchable_command("/dream-log")
@@ -118,6 +119,20 @@ class TestMidTurnCommandDispatchedDirectly:
         )
         result = await router.dispatch(ctx)
         assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_skills_dispatched_with_session_none(
+        self, router: CommandRouter, fake_loop: MagicMock, fake_msg: MagicMock,
+    ) -> None:
+        fake_loop.context.skills.format_listing.return_value = "Skills (1):\n- demo (.claude): Demo"
+        ctx = CommandContext(
+            msg=fake_msg, session=None,
+            key="test:chat1", raw="/skills", loop=fake_loop,
+        )
+        result = await router.dispatch(ctx)
+        assert result is not None
+        assert "demo (.claude)" in result.content
+        assert result.metadata == {"render_as": "text"}
 
     @pytest.mark.asyncio
     async def test_prefix_command_args_populated(self, router: CommandRouter) -> None:

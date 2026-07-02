@@ -84,7 +84,7 @@ class OpenAICodexProvider(LLMProvider):
                 )
             return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
         except Exception as e:
-            msg = f"Error calling Codex: {e}"
+            msg = f"Error calling Codex: {_format_codex_exception(e)}"
             retry_after = getattr(e, "retry_after", None) or self._extract_retry_after(msg)
             return LLMResponse(content=msg, finish_reason="error", retry_after=retry_after)
 
@@ -136,6 +136,13 @@ def _build_headers(account_id: str, token: str) -> dict[str, str]:
         "accept": "text/event-stream",
         "content-type": "application/json",
     }
+
+
+def _format_codex_exception(exc: BaseException) -> str:
+    detail = str(exc).strip()
+    if detail:
+        return detail
+    return type(exc).__name__
 
 
 class _CodexHTTPError(RuntimeError):

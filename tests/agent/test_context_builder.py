@@ -15,6 +15,68 @@ def _builder(tmp_path: Path, **kw) -> ContextBuilder:
     return ContextBuilder(workspace=tmp_path, **kw)
 
 
+def _write_skill(root: Path, name: str, description: str) -> Path:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True)
+    path = skill_dir / "SKILL.md"
+    path.write_text(
+        "\n".join([
+            "---",
+            f"description: {description}",
+            "---",
+            "",
+            f"# {name}",
+        ]),
+        encoding="utf-8",
+    )
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Skills roots
+# ---------------------------------------------------------------------------
+
+
+class TestSkillsRoots:
+    def test_workspace_claude_skills_loaded_when_data_dir_is_separate(self, tmp_path):
+        workspace = tmp_path / "project"
+        data_dir = tmp_path / "data"
+        claude_skill = _write_skill(
+            workspace / ".claude" / "skills",
+            "project_skill",
+            "Project-local Claude skill",
+        )
+        data_dir.mkdir(parents=True)
+
+        builder = ContextBuilder(workspace=workspace, data_dir=data_dir)
+        entries = builder.skills.list_skills(filter_unavailable=False)
+        project_entries = [entry for entry in entries if entry["name"] == "project_skill"]
+
+        assert project_entries == [{
+            "name": "project_skill",
+            "path": str(claude_skill),
+            "source": "claude",
+        }]
+        assert "Project-local Claude skill" in builder.skills.build_skills_summary()
+
+    def test_workspace_without_claude_dir_uses_data_dir_skills_only(self, tmp_path):
+        workspace = tmp_path / "project"
+        data_dir = tmp_path / "data"
+        data_skill = _write_skill(data_dir / "skills", "data_skill", "Nanobot data skill")
+        workspace.mkdir(parents=True)
+
+        builder = ContextBuilder(workspace=workspace, data_dir=data_dir)
+        entries = builder.skills.list_skills(filter_unavailable=False)
+        data_entries = [entry for entry in entries if entry["name"] == "data_skill"]
+
+        assert data_entries == [{
+            "name": "data_skill",
+            "path": str(data_skill),
+            "source": "workspace",
+        }]
+        assert all(entry["source"] != "claude" for entry in entries)
+
+
 # ---------------------------------------------------------------------------
 # _build_runtime_context (static)
 # ---------------------------------------------------------------------------

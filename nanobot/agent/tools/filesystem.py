@@ -1,5 +1,6 @@
 """File system tools: read, write, edit, list."""
 
+import asyncio
 import difflib
 import mimetypes
 import os
@@ -1018,13 +1019,19 @@ class ListDirTool(_FsTool):
             total = 0
 
             if recursive:
-                for item in sorted(dp.rglob("*")):
-                    if any(p in self._IGNORE_DIRS for p in item.parts):
-                        continue
-                    total += 1
-                    if len(items) < cap:
-                        rel = item.relative_to(dp)
-                        items.append(f"{rel}/" if item.is_dir() else str(rel))
+                def _scan_recursive() -> tuple[list[str], int]:
+                    found: list[str] = []
+                    count = 0
+                    for item in sorted(dp.rglob("*")):
+                        if any(p in self._IGNORE_DIRS for p in item.parts):
+                            continue
+                        count += 1
+                        if len(found) < cap:
+                            rel = item.relative_to(dp)
+                            found.append(f"{rel}/" if item.is_dir() else str(rel))
+                    return found, count
+
+                items, total = await asyncio.to_thread(_scan_recursive)
             else:
                 for item in sorted(dp.iterdir()):
                     if item.name in self._IGNORE_DIRS:

@@ -96,6 +96,31 @@ EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 _REASONING_SENTENCE_ENDINGS = (".", "!", "?", "。", "！", "？")
 _REASONING_FLUSH_CHARS = 60
 
+
+def _tool_result_summary_from_events(tool_events: object) -> str | None:
+    """Return a TUI completion summary for structured tool finish events."""
+    if not isinstance(tool_events, list):
+        return None
+    completed = [
+        event for event in tool_events
+        if isinstance(event, dict) and event.get("phase") in {"end", "error"}
+    ]
+    if not completed:
+        return None
+    errors = [
+        str(event.get("error") or "").strip()
+        for event in completed
+        if event.get("phase") == "error"
+    ]
+    errors = [err for err in errors if err]
+    if errors:
+        return f"Error: {errors[0]}"
+    return ""
+
+
+def _format_skills_command(skills_loader: Any) -> str:
+    return skills_loader.format_listing()
+
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
@@ -1281,11 +1306,17 @@ def agent(
                 )
                 tui.set_todos(s.todos)
                 if agent_loop.context_window_tokens:
-                    try:
-                        ctx_est, _ = agent_loop.memory_consolidator.estimate_session_prompt_tokens(s)
-                        tui.update_context_usage(ctx_est, agent_loop.context_window_tokens)
-                    except Exception:
-                        pass
+                    async def _estimate_context_usage(session=s) -> None:
+                        try:
+                            ctx_est, _ = await asyncio.to_thread(
+                                agent_loop.memory_consolidator.estimate_session_prompt_tokens,
+                                session,
+                            )
+                            tui.update_context_usage(ctx_est, agent_loop.context_window_tokens)
+                        except Exception:
+                            pass
+
+                    agent_loop._schedule_background(_estimate_context_usage())
                 # Fork(perf): warm this topic's lazy caches (skills/memory/BM25)
                 # in the background so the first turn doesn't pay cold-start cost.
                 # _load_topic runs inside the async run_interactive loop, so a
@@ -1297,6 +1328,7 @@ def agent(
             tui.set_commands([
                 ("/new", "新建话题"),
                 ("/resume", "切换/恢复话题"),
+                ("/skills", "List available skills"),
                 ("/todos", "查看当前话题的 todo 列表"),
                 ("/continue", "继续上次因达到 iteration 上限中断的任务"),
                 ("/commit_memory", "把 pending consolidation 写入 MEMORY.md"),
@@ -1362,6 +1394,11 @@ def agent(
 
             tui.set_on_cancel(_cancel_current)
 
+            def _set_activity_phase(phase: str) -> None:
+                setter = getattr(tui, "set_activity_phase", None)
+                if callable(setter):
+                    setter(phase)
+
             def _pre_submit(text: str) -> None:
                 if not is_processing:
                     tui.add_user_echo(text)
@@ -1373,6 +1410,7 @@ def agent(
                 _turn_cancelled[0] = False
                 is_processing = True
                 tui.set_is_processing(True)
+                _set_activity_phase("prepare_turn")
                 # If the previous task finished and all todos are completed,
                 # auto-clear them so the bar resets for the new task rather
                 # than carrying a stale "✓ all N done" badge across turns.
@@ -1395,6 +1433,7 @@ def agent(
                 # thinking animation is guaranteed to reach the screen before the
                 # bus receives the message and the LLM starts responding.
                 await asyncio.sleep(0.015)
+                _set_activity_phase("agent_processing")
                 await bus.publish_inbound(InboundMessage(
                     channel=cli_channel,
                     sender_id="user",
@@ -1407,6 +1446,7 @@ def agent(
                 nonlocal is_processing
                 is_processing = False
                 tui.set_is_processing(False)
+                _set_activity_phase("idle")
                 # Fork: stop any thinking/idle spinner on turn completion. The
                 # streaming path stops it via pop_stream, but the non-streaming
                 # reply path (add_response) had no such hook — an idle spinner
@@ -1449,6 +1489,10 @@ def agent(
                     return
 
                 # ── 话题管理命令 ──────────────────────────────────────────────
+                if text == "/skills":
+                    tui.add_system(_format_skills_command(agent_loop.context.skills))
+                    return
+
                 if text.startswith("/new"):
                     if is_processing:
                         tui.add_system("请等待当前响应完成后再新建话题。")
@@ -1617,11 +1661,17 @@ def agent(
                                     # 渲染出来。TUI 侧 add_reasoning/flush_reasoning
                                     # 方法仍保留,日后想恢复只需还原本分支。
                                     pass
-                                elif msg.content:
-                                    if msg.metadata.get("_tool_result"):
-                                        tui.add_tool_result(msg.content)
-                                    else:
-                                        tui.add_progress(msg.content)
+                                else:
+                                    summary = _tool_result_summary_from_events(
+                                        msg.metadata.get("_tool_events")
+                                    )
+                                    if summary is not None:
+                                        tui.add_tool_result(summary)
+                                    elif msg.content:
+                                        if msg.metadata.get("_tool_result"):
+                                            tui.add_tool_result(msg.content)
+                                        else:
+                                            tui.add_progress(msg.content)
                             continue
 
                         # Interactive question popup pushed by AskUserTool.

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.skills import SkillsLoader
+from nanobot.agent.skills import SkillsLoader, project_skill_roots
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
     build_assistant_message,
@@ -50,6 +50,7 @@ class ContextBuilder:
         self.skills = SkillsLoader(
             self.data_dir,
             disabled_skills=set(disabled_skills) if disabled_skills else None,
+            extra_skill_roots=project_skill_roots(self.workspace),
         )
         # fork: per-topic MemoryStore facade. ``None`` disables topic memory
         # entirely (build_system_prompt skips the topic section); fork callers

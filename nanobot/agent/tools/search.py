@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import os
 import re
@@ -232,7 +233,9 @@ class FindFilesTool(_SearchTool):
             root = target if target.is_dir() else target.parent
             matches: list[tuple[str, float]] = []
 
-            for candidate in self._iter_paths(target, include_dirs=include_dirs):
+            for idx, candidate in enumerate(self._iter_paths(target, include_dirs=include_dirs), start=1):
+                if idx % 128 == 0:
+                    await asyncio.sleep(0)
                 if candidate.is_dir() and not include_dirs:
                     continue
                 rel_path = candidate.relative_to(root).as_posix()
@@ -455,7 +458,9 @@ class GrepTool(_SearchTool):
             file_mtimes: dict[str, float] = {}
             root = target if target.is_dir() else target.parent
 
-            for file_path in self._iter_files(target):
+            for idx, file_path in enumerate(self._iter_files(target), start=1):
+                if idx % 32 == 0:
+                    await asyncio.sleep(0)
                 rel_path = file_path.relative_to(root).as_posix()
                 if glob and not _match_glob(rel_path, file_path.name, glob):
                     continue

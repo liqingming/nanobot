@@ -1181,6 +1181,8 @@ class AgentLoop:
             print(f"正在完成 {len(self._background_tasks)} 个后台任务（记忆整理等），请稍候…")
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
+        from nanobot.agent.tools.exec_session import DEFAULT_EXEC_SESSION_MANAGER
+        await DEFAULT_EXEC_SESSION_MANAGER.shutdown()
         if self._mcp_stacks:
             print("正在断开 MCP 连接…")
         for name, stack in self._mcp_stacks.items():
@@ -1522,25 +1524,31 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        _hist_kwargs: dict[str, Any] = {
-            "max_messages": self._max_messages,
-            "max_tokens": self._replay_token_budget(),
-            "include_timestamps": True,
-        }
-        ctx.history = ctx.session.get_history(**_hist_kwargs)
-        self._webui_turns.capture_title_context(
-            ctx.session_key,
-            ctx.msg,
-            self.llm_runtime(),
-        )
+        def _build_sync() -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+            _hist_kwargs: dict[str, Any] = {
+                "max_messages": self._max_messages,
+                "max_tokens": self._replay_token_budget(),
+                "include_timestamps": True,
+            }
+            history = ctx.session.get_history(**_hist_kwargs)
+            self._webui_turns.capture_title_context(
+                ctx.session_key,
+                ctx.msg,
+                self.llm_runtime(),
+            )
 
-        learning_ctx = self._build_learning_ctx(ctx.session_key)
-        ctx.initial_messages = self._build_initial_messages(
-            ctx.msg, ctx.session, ctx.history, ctx.pending_summary,
-            learning_ctx=learning_ctx,
-        )
-        ctx.user_persisted_early = self._persist_user_message_early(
-            ctx.msg, ctx.session
+            learning_ctx = self._build_learning_ctx(ctx.session_key)
+            initial_messages = self._build_initial_messages(
+                ctx.msg, ctx.session, history, ctx.pending_summary,
+                learning_ctx=learning_ctx,
+            )
+            user_persisted_early = self._persist_user_message_early(
+                ctx.msg, ctx.session
+            )
+            return history, initial_messages, user_persisted_early
+
+        ctx.history, ctx.initial_messages, ctx.user_persisted_early = (
+            await asyncio.to_thread(_build_sync)
         )
 
         if ctx.on_progress is None:

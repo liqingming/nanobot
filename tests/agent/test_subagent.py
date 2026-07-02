@@ -51,3 +51,32 @@ async def test_subagent_build_tools_isolates_file_read_state(tmp_path):
     second_result = await second_read.execute(path="note.txt")
     assert second_result.startswith("1| hello")
     assert "File unchanged" not in second_result
+
+
+def test_subagent_prompt_includes_workspace_claude_skills(tmp_path):
+    skill_dir = tmp_path / ".claude" / "skills" / "project_skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "\n".join([
+            "---",
+            "description: Project-local Claude skill",
+            "---",
+            "",
+            "# Project skill",
+        ]),
+        encoding="utf-8",
+    )
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    sm = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=MessageBus(),
+        model="test",
+        max_tool_result_chars=16_000,
+    )
+
+    prompt = sm._build_subagent_prompt()
+
+    assert "project_skill" in prompt
+    assert "Project-local Claude skill" in prompt

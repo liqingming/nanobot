@@ -319,12 +319,13 @@ class SubagentManager:
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder
-        from nanobot.agent.skills import SkillsLoader
+        from nanobot.agent.skills import SkillsLoader, project_skill_roots
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
         skills_summary = SkillsLoader(
             self.workspace,
             disabled_skills=self.disabled_skills,
+            extra_skill_roots=project_skill_roots(self.workspace),
         ).build_skills_summary()
         return render_template(
             "agent/subagent_system.md",

@@ -154,6 +154,7 @@ class TestRestartCommand:
         assert response is not None
         assert "/restart" in response.content
         assert "/status" in response.content
+        assert "/skills" in response.content
         assert response.metadata == {"render_as": "text"}
 
     @pytest.mark.asyncio

@@ -21,6 +21,7 @@ filesystem paths.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool
@@ -70,11 +71,16 @@ class LoadSkillTool(Tool):
         if not isinstance(name, str) or not name.strip():
             return "Error: 'name' must be a non-empty string"
         name = name.strip()
-        content = self._loader.load_skill(name)
+        content = await asyncio.to_thread(self._loader.load_skill, name)
         if content is None:
             # Help the LLM recover quickly when it picked a wrong name —
             # list what IS available so the next attempt can self-correct.
-            available = [s["name"] for s in self._loader.list_skills(filter_unavailable=False)]
+            available = await asyncio.to_thread(
+                lambda: [
+                    s["name"]
+                    for s in self._loader.list_skills(filter_unavailable=False)
+                ]
+            )
             return (
                 f"Error: skill '{name}' not found. "
                 f"Available skills: {', '.join(available) if available else '(none)'}"

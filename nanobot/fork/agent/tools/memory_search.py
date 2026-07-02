@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 from typing import Any
@@ -242,20 +243,24 @@ class SearchHistoryTool(Tool):
         return all_entries, combined_index
 
     async def execute(self, query: str, top_k: int = 5) -> str:
-        top_k = min(max(1, top_k), 20)
-        entries, index = self._load_index()
+        def _search() -> tuple[list[str] | None, Any, list[tuple[float, int]] | None]:
+            entries, index = self._load_index()
+            if entries is None:
+                return entries, index, None
+            scores = index.get_scores(_tokenize(query))
+            ranked = sorted(
+                ((score, i) for i, score in enumerate(scores)),
+                reverse=True,
+            )
+            return entries, index, ranked
 
+        top_k = min(max(1, top_k), 20)
+        entries, index, ranked = await asyncio.to_thread(_search)
         if entries is None:
             return "HISTORY.md is empty or does not exist."
 
-        scores = index.get_scores(_tokenize(query))
-        ranked = sorted(
-            ((score, i) for i, score in enumerate(scores)),
-            reverse=True,
-        )
-
         results: list[str] = []
-        for score, idx in ranked[:top_k]:
+        for score, idx in (ranked or [])[:top_k]:
             if score <= 0:
                 break
             results.append(f"[score={score:.2f}]\n{entries[idx]}")

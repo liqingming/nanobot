@@ -62,6 +62,29 @@ async def test_command_popup_enter_submits_selected_command(prompt_tui: PromptTU
 
 
 @pytest.mark.asyncio
+async def test_skills_command_enter_does_not_call_pre_submit(prompt_tui: PromptTUI) -> None:
+    submitted: list[str] = []
+    pre_submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    def on_pre_submit(text: str) -> None:
+        pre_submitted.append(text)
+
+    prompt_tui.set_on_submit(on_submit)
+    prompt_tui.set_on_pre_submit(on_pre_submit)
+    prompt_tui.set_commands([("/skills", "List available skills")])
+    prompt_tui._input_buffer.set_document(Document("/skills", 7))
+
+    prompt_tui._handle_enter_key()
+    await _drain()
+
+    assert submitted == ["/skills"]
+    assert pre_submitted == []
+
+
+@pytest.mark.asyncio
 async def test_new_topic_flow_routes_to_topic_callback(prompt_tui: PromptTUI) -> None:
     """End-to-end: /new triggers enter_new_topic_mode, typing a name + Enter
     must route to the topic callback, NOT submit as a chat message."""

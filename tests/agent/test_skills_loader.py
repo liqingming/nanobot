@@ -96,6 +96,27 @@ def test_list_skills_workspace_shadows_builtin_same_name(tmp_path: Path) -> None
     assert entries[0]["path"] == str(ws_path)
 
 
+def test_list_skills_extra_root_shadows_workspace_and_builtin(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    ws_path = _write_skill(workspace / "skills", "dup", body="# Workspace")
+    claude_path = _write_skill(tmp_path / ".claude" / "skills", "dup", body="# Claude")
+
+    builtin = tmp_path / "builtin"
+    _write_skill(builtin, "dup", body="# Builtin")
+
+    loader = SkillsLoader(
+        workspace,
+        builtin_skills_dir=builtin,
+        extra_skill_roots=[("claude", tmp_path / ".claude" / "skills")],
+    )
+    entries = loader.list_skills(filter_unavailable=False)
+
+    assert len(entries) == 1
+    assert entries[0] == {"name": "dup", "path": str(claude_path), "source": "claude"}
+    assert loader.load_skill("dup") == claude_path.read_text(encoding="utf-8")
+    assert ws_path.read_text(encoding="utf-8") != loader.load_skill("dup")
+
+
 def test_list_skills_merges_workspace_and_builtin(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     ws_skills = workspace / "skills"

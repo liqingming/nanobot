@@ -8,6 +8,7 @@ original bug we fixed by unifying Enter routing through decide_enter_action.
 from __future__ import annotations
 
 import pytest
+from textual.events import Paste
 
 from nanobot.fork.cli.tui_textual import _TEXTUAL_AVAILABLE, TextualTUI
 
@@ -148,6 +149,152 @@ async def test_normal_chat_message_routes_to_on_submit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_multiline_paste_is_submitted_as_one_message() -> None:
+    """Bracketed paste should display a token and submit the full payload."""
+    tui = TextualTUI()
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _press_text(pilot, "before ")
+        await pilot.pause()
+        inp = app.query_one("#input")
+        inp._on_paste(Paste("alpha\r\nbeta\ngamma"))
+        await pilot.pause()
+        await _press_text(pilot, " after")
+        await pilot.pause()
+
+        assert inp.value == "before [已粘贴 3 行] after"
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert submitted == ["before alpha\nbeta\ngamma after"]
+
+
+@pytest.mark.asyncio
+async def test_single_line_paste_stays_visible_in_input() -> None:
+    """Single-line paste should behave like ordinary input text."""
+    tui = TextualTUI()
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input")
+        inp._on_paste(Paste("hello from clipboard"))
+        await pilot.pause()
+
+        assert inp.value == "hello from clipboard"
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert submitted == ["hello from clipboard"]
+
+
+@pytest.mark.asyncio
+async def test_editing_multiline_paste_placeholder_drops_hidden_payload() -> None:
+    """Editing the paste token should submit the edited visible text instead."""
+    tui = TextualTUI()
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input")
+        inp._on_paste(Paste("alpha\nbeta"))
+        await pilot.pause()
+
+        inp.value = "manual edit"
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert submitted == ["manual edit"]
+
+
+@pytest.mark.asyncio
+async def test_multiline_paste_can_be_inserted_at_cursor() -> None:
+    """A multiline paste token should preserve text before and after it."""
+    tui = TextualTUI()
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _press_text(pilot, "hello world")
+        await pilot.pause()
+        inp = app.query_one("#input")
+        inp.cursor_position = len("hello ")
+        inp._on_paste(Paste("one\ntwo"))
+        await pilot.pause()
+
+        assert inp.value == "hello [已粘贴 2 行]world"
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert submitted == ["hello one\ntwoworld"]
+
+
+@pytest.mark.asyncio
+async def test_multiple_multiline_pastes_restore_in_display_order() -> None:
+    """Multiple paste tokens should restore to their own payloads."""
+    tui = TextualTUI()
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input")
+        inp._on_paste(Paste("a\nb"))
+        await pilot.pause()
+        await _press_text(pilot, " + ")
+        await pilot.pause()
+        inp._on_paste(Paste("c\nd\ne"))
+        await pilot.pause()
+
+        assert inp.value == "[已粘贴 2 行] + [已粘贴 3 行]"
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert submitted == ["a\nb + c\nd\ne"]
+
+
+@pytest.mark.asyncio
 async def test_command_popup_enter_submits_selected_command() -> None:
     """Typing /n and pressing Enter must submit the highlighted /new command."""
     tui = TextualTUI()
@@ -209,6 +356,35 @@ async def test_command_submit_does_not_echo_command_to_output() -> None:
 
         assert submitted == ["/new"]
         # Critical: pre_submit (which would echo the command) must NOT fire
+        assert pre_submitted == []
+
+
+@pytest.mark.asyncio
+async def test_skills_command_submit_does_not_start_pre_submit_spinner() -> None:
+    """The /skills command is local UI output, so Enter must not start a turn."""
+    tui = TextualTUI()
+    submitted: list[str] = []
+    pre_submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    def on_pre_submit(text: str) -> None:
+        pre_submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_on_pre_submit(on_pre_submit)
+    tui.set_commands([("/skills", "List available skills")])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _press_text(pilot, "/skills")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert submitted == ["/skills"]
         assert pre_submitted == []
 
 

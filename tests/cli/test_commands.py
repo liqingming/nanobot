@@ -9,7 +9,8 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.cli.commands import app
+from nanobot.agent.skills import SkillsLoader
+from nanobot.cli.commands import app, _format_skills_command
 from nanobot.config.paths import get_workspace_cache_dir
 from nanobot.config.schema import Config
 from nanobot.cron.types import CronJob, CronPayload
@@ -27,8 +28,54 @@ def _fake_provider():
     return p
 
 
+def _write_skill(root: Path, name: str, description: str) -> Path:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True)
+    path = skill_dir / "SKILL.md"
+    path.write_text(
+        "\n".join([
+            "---",
+            f"description: {description}",
+            "---",
+            "",
+            f"# {name}",
+        ]),
+        encoding="utf-8",
+    )
+    return path
+
+
 class _StopGatewayError(RuntimeError):
     pass
+
+
+def test_format_skills_command_empty(tmp_path: Path) -> None:
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+    loader = SkillsLoader(tmp_path / "workspace", builtin_skills_dir=builtin)
+
+    assert _format_skills_command(loader) == "当前没有可用技能。"
+
+
+def test_format_skills_command_lists_sources_and_descriptions(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    claude_path = _write_skill(tmp_path / ".claude" / "skills", "claude_skill", "Claude project skill")
+    _write_skill(workspace / "skills", "workspace_skill", "Workspace skill")
+    builtin = tmp_path / "builtin"
+    _write_skill(builtin, "builtin_skill", "Builtin skill")
+    loader = SkillsLoader(
+        workspace,
+        builtin_skills_dir=builtin,
+        extra_skill_roots=[("claude", tmp_path / ".claude" / "skills")],
+    )
+
+    output = _format_skills_command(loader)
+
+    assert "Skills (3):" in output
+    assert "- claude_skill (.claude): Claude project skill" in output
+    assert "- workspace_skill (workspace): Workspace skill" in output
+    assert "- builtin_skill (builtin): Builtin skill" in output
+    assert str(claude_path) not in output
 
 
 @pytest.fixture
