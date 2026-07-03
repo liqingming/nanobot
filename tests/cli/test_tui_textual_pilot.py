@@ -207,6 +207,38 @@ async def test_single_line_paste_stays_visible_in_input() -> None:
 
 
 @pytest.mark.asyncio
+async def test_shift_enter_inserts_newline_enter_submits() -> None:
+    """Shift+Enter should add a line break; Enter should submit the composer."""
+    tui = TextualTUI()
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _press_text(pilot, "alpha")
+        await pilot.pause()
+        await pilot.press("shift+enter")
+        await pilot.pause()
+        await _press_text(pilot, "beta")
+        await pilot.pause()
+
+        inp = app.query_one("#input")
+        assert inp.value == "alpha\nbeta"
+        assert submitted == []
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert submitted == ["alpha\nbeta"]
+
+
+@pytest.mark.asyncio
 async def test_editing_multiline_paste_placeholder_drops_hidden_payload() -> None:
     """Editing the paste token should submit the edited visible text instead."""
     tui = TextualTUI()

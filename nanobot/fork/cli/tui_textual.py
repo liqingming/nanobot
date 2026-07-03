@@ -74,7 +74,7 @@ try:
     from textual.binding import Binding
     from textual.containers import Horizontal
     from textual.events import Key, Paste
-    from textual.widgets import Input, RichLog, Static
+    from textual.widgets import RichLog, Static, TextArea
     _TEXTUAL_AVAILABLE = True
 except ImportError:
     _TEXTUAL_AVAILABLE = False
@@ -465,13 +465,29 @@ def _rich_to_ansi(render_fn: Callable[[Console], Any], width: int = 100) -> str:
 # ---------------------------------------------------------------------------
 
 if _TEXTUAL_AVAILABLE:
-    class _HistoryInput(Input):
+    class _ComposerInput(TextArea):
         """Input that delegates ↑/↓ to the TUI's history / popup state."""
 
         def __init__(self, tui: "TextualTUI", **kwargs: Any) -> None:
-            super().__init__(**kwargs)
+            super().__init__("", soft_wrap=True, tab_behavior="focus", compact=True, **kwargs)
             self._tui_ref = tui
             self._multiline_paste_tokens: list[dict[str, str]] = []
+
+        @property
+        def value(self) -> str:
+            return self.text
+
+        @value.setter
+        def value(self, text: str) -> None:
+            self.text = text
+
+        @property
+        def cursor_position(self) -> int:
+            return self._location_to_offset(self.cursor_location)
+
+        @cursor_position.setter
+        def cursor_position(self, offset: int) -> None:
+            self.move_cursor(self._offset_to_location(offset))
 
         @staticmethod
         def _normalize_paste_text(text: str) -> str:
@@ -484,6 +500,26 @@ if _TEXTUAL_AVAILABLE:
         def _paste_display_token(self, text: str) -> str:
             lines = self._paste_line_count(text)
             return f"[已粘贴 {lines} 行]"
+
+        def _location_to_offset(self, location: tuple[int, int]) -> int:
+            row, column = location
+            lines = self.value.split("\n")
+            row = max(0, min(row, len(lines) - 1))
+            column = max(0, min(column, len(lines[row])))
+            return sum(len(line) + 1 for line in lines[:row]) + column
+
+        def _offset_to_location(self, offset: int) -> tuple[int, int]:
+            text = self.value
+            offset = max(0, min(offset, len(text)))
+            row = 0
+            remaining = offset
+            for line in text.split("\n"):
+                if remaining <= len(line):
+                    return (row, remaining)
+                remaining -= len(line) + 1
+                row += 1
+            lines = text.split("\n")
+            return (len(lines) - 1, len(lines[-1]))
 
         def _clear_multiline_paste_tokens(self) -> None:
             self._multiline_paste_tokens = []
@@ -502,11 +538,14 @@ if _TEXTUAL_AVAILABLE:
         def _insert_multiline_token(self, text: str) -> None:
             display = self._paste_display_token(text)
             selection = self.selection
-            selection_start = min(selection.start, selection.end)
-            selection_end = max(selection.start, selection.end)
+            start_offset = self._location_to_offset(selection.start)
+            end_offset = self._location_to_offset(selection.end)
+            selection_start = min(start_offset, end_offset)
+            selection_end = max(start_offset, end_offset)
             insert_at = selection_start
             before_positions = self._token_positions()
-            self.replace(display, *selection)
+            result = self.replace(display, *selection)
+            self.move_cursor(result.end_location)
             self.cursor_position = insert_at + len(display)
 
             new_token = {"display": display, "text": text}
@@ -532,10 +571,11 @@ if _TEXTUAL_AVAILABLE:
                 self._insert_multiline_token(text)
                 return
             selection = self.selection
-            if selection.is_empty:
-                self.insert_text_at_cursor(text)
+            if selection.start == selection.end:
+                result = self.insert(text)
             else:
-                self.replace(text, *selection)
+                result = self.replace(text, *selection)
+            self.move_cursor(result.end_location)
 
         def submit_value(self) -> str:
             if not self._multiline_paste_tokens:
@@ -570,8 +610,18 @@ if _TEXTUAL_AVAILABLE:
 
         async def _on_key(self, event: Key) -> None:
             tui = self._tui_ref
+            if event.key in ("shift+enter", "shift_enter"):
+                result = self.replace("\n", *self.selection)
+                self.move_cursor(result.end_location)
+                event.prevent_default()
+                event.stop()
+                return
+            if event.key == "enter":
+                event.prevent_default()
+                event.stop()
+                self._tui_ref._app.submit_input(self)
+                return
             if event.key not in ("up", "down", "tab"):
-                # Enter falls through to Input.Submitted; other keys use defaults.
                 return
 
             selected = (
@@ -593,15 +643,18 @@ if _TEXTUAL_AVAILABLE:
                 tui._popup_idx = max(0, tui._popup_idx - 1)
                 tui._refresh_popup()
                 event.prevent_default()
+                event.stop()
             elif action == PopupAction.CYCLE_DOWN:
                 tui._popup_idx = min(len(tui._popup_items) - 1, tui._popup_idx + 1)
                 tui._refresh_popup()
                 event.prevent_default()
+                event.stop()
             elif action == PopupAction.COMPLETE:
                 self._clear_multiline_paste_tokens()
                 self.value = decision.value
                 self.cursor_position = len(decision.value)
                 event.prevent_default()
+                event.stop()
             elif action == PopupAction.HISTORY_BACK:
                 text = tui._history_backward()
                 if text is not None:
@@ -609,6 +662,7 @@ if _TEXTUAL_AVAILABLE:
                     self.value = text
                     self.cursor_position = len(text)
                 event.prevent_default()
+                event.stop()
             elif action == PopupAction.HISTORY_FORWARD:
                 text = tui._history_forward()
                 self._clear_multiline_paste_tokens()
@@ -616,6 +670,7 @@ if _TEXTUAL_AVAILABLE:
                 if text is not None:
                     self.cursor_position = len(text)
                 event.prevent_default()
+                event.stop()
             # PopupAction.IGNORE → don't call prevent_default, let the key flow normally
 
     # -----------------------------------------------------------------------
@@ -678,11 +733,13 @@ if _TEXTUAL_AVAILABLE:
         }
         #input {
             height: auto;
+            max-height: 6;
+            min-height: 1;
             border: none;
             padding: 0 1;
             background: #0c0c0c;
         }
-        Input {
+        TextArea {
             background: #0c0c0c;
         }
         #status {
@@ -770,7 +827,7 @@ if _TEXTUAL_AVAILABLE:
             with Horizontal(id="sep-row"):
                 yield Static("[dim cyan]" + "─" * 80 + "[/dim cyan]", id="sep", markup=True)
                 yield Static("", id="topic-bar")
-            yield _HistoryInput(self._tui, placeholder="You: ", id="input")
+            yield _ComposerInput(self._tui, placeholder="You: ", id="input")
             yield Static("", id="status")
 
         def on_mount(self) -> None:
@@ -811,7 +868,7 @@ if _TEXTUAL_AVAILABLE:
             self._lag_timer = self.set_interval(0.25, _tick)
 
         def _refocus_input(self) -> None:
-            inp = self.query_one("#input", Input)
+            inp = self.query_one("#input", _ComposerInput)
             inp.focus()
             self.refresh(layout=True)
 
@@ -831,14 +888,9 @@ if _TEXTUAL_AVAILABLE:
 
         # ── input callbacks ────────────────────────────────────────────────
 
-        def on_input_submitted(self, event: Input.Submitted) -> None:
+        def submit_input(self, input_widget: _ComposerInput) -> None:
             tui = self._tui
-            input_widget = event.input
-            input_text = (
-                input_widget.submit_value()
-                if isinstance(input_widget, _HistoryInput)
-                else event.value
-            )
+            input_text = input_widget.submit_value()
             selected = (
                 tui._popup_items[tui._popup_idx][0]
                 if tui._popup_items and 0 <= tui._popup_idx < len(tui._popup_items)
@@ -852,10 +904,9 @@ if _TEXTUAL_AVAILABLE:
                 input_text=input_text,
             ))
             action, value = decision.action, decision.value
-            if isinstance(input_widget, _HistoryInput):
-                input_widget.sync_multiline_paste_tokens()
-                input_widget._clear_multiline_paste_tokens()
-            event.input.clear()
+            input_widget.sync_multiline_paste_tokens()
+            input_widget._clear_multiline_paste_tokens()
+            input_widget.value = ""
             tui._history_pos = -1
 
             if action == EnterAction.NEW_TOPIC:
@@ -888,11 +939,11 @@ if _TEXTUAL_AVAILABLE:
                 return
             # NOOP: nothing to do
 
-        def on_input_changed(self, event: Input.Changed) -> None:
-            input_widget = event.input
-            if isinstance(input_widget, _HistoryInput):
+        def on_text_area_changed(self, event: TextArea.Changed) -> None:
+            input_widget = event.text_area
+            if isinstance(input_widget, _ComposerInput):
                 input_widget.sync_multiline_paste_tokens()
-            self._tui._on_input_changed(event.value)
+                self._tui._on_input_changed(input_widget.value)
 
         # ── actions ────────────────────────────────────────────────────────
 
@@ -910,7 +961,7 @@ if _TEXTUAL_AVAILABLE:
             self.exit()
 
         def action_eof_app(self) -> None:
-            if not self.query_one("#input", Input).value:
+            if not self.query_one("#input", _ComposerInput).value:
                 self.exit()
 
         def action_escape_app(self) -> None:
@@ -1120,13 +1171,13 @@ if _TEXTUAL_AVAILABLE:
 
         def set_input_placeholder(self, text: str) -> None:
             try:
-                self.query_one("#input", Input).placeholder = text
+                self.query_one("#input", _ComposerInput).placeholder = text
             except Exception:
                 pass
 
         def set_input_value(self, text: str) -> None:
             try:
-                inp = self.query_one("#input", Input)
+                inp = self.query_one("#input", _ComposerInput)
                 inp.value = text
                 inp.cursor_position = len(text)
             except Exception:
@@ -1233,6 +1284,7 @@ class TextualTUI(TUIBase):
         self._popup_idx: int = 0
         self._popup_on_select: Callable[[str], Awaitable[None]] | None = None
         self._popup_all_topics: list[str] = []
+        self._popup_all_items: list[tuple[str, str]] = []
 
         self._app = _NanobotApp(self)
 
@@ -1388,7 +1440,15 @@ class TextualTUI(TUIBase):
             return
         if self._popup_mode == "topic":
             query = text.lower()
-            filtered = [(t, t) for t in self._popup_all_topics if query in t.lower()]
+            if query:
+                source = self._popup_all_items or [(t, t) for t in self._popup_all_topics]
+                filtered = [
+                    (value, label)
+                    for value, label in source
+                    if query in label.lower()
+                ]
+            else:
+                filtered = list(self._popup_all_items) or [(t, t) for t in self._popup_all_topics]
             self._popup_items = filtered
             self._popup_idx = min(self._popup_idx, max(0, len(filtered) - 1))
             self._refresh_popup()
@@ -2178,8 +2238,9 @@ class TextualTUI(TUIBase):
         on_select: Callable[[str], Awaitable[None]],
     ) -> None:
         self._popup_all_topics = list(topics)
+        self._popup_all_items = [(t, t) for t in topics]
         self._popup_mode = "topic"
-        self._popup_items = [(t, t) for t in topics]
+        self._popup_items = list(self._popup_all_items)
         self._popup_idx = 0
         self._popup_on_select = on_select
         self._app.set_input_value("")
@@ -2256,6 +2317,7 @@ class TextualTUI(TUIBase):
         self._popup_items = popup_items
         self._popup_idx = 0
         self._popup_all_topics = [lbl for _, lbl in popup_items]
+        self._popup_all_items = list(popup_items)
 
         async def _on_selected(value: str) -> None:
             if value == self._CUSTOM_INPUT_SENTINEL:
@@ -2292,6 +2354,7 @@ class TextualTUI(TUIBase):
         self._popup_idx = 0
         self._popup_on_select = None
         self._popup_all_topics = []
+        self._popup_all_items = []
         self._app.update_popup([], False)
 
     def _cancel_question_flow(self) -> None:
