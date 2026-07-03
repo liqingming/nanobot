@@ -172,6 +172,10 @@ class TestMergeMessageContent:
 
 
 class TestLoadBootstrapFiles:
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+
     def test_no_bootstrap_files(self, tmp_path):
         builder = _builder(tmp_path)
         assert builder._load_bootstrap_files() == ""
@@ -200,6 +204,44 @@ class TestLoadBootstrapFiles:
         result = builder._load_bootstrap_files()
         for name in ContextBuilder.BOOTSTRAP_FILES:
             assert f"## {name}" in result
+
+    def test_loads_global_and_workspace_claude_md_before_agents(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        workspace = tmp_path / "project"
+        global_claude = home / ".claude" / "CLAUDE.md"
+        workspace_claude = workspace / "CLAUDE.md"
+        global_claude.parent.mkdir(parents=True)
+        workspace.mkdir()
+        global_claude.write_text("Global Claude rules.", encoding="utf-8")
+        workspace_claude.write_text("Workspace Claude rules.", encoding="utf-8")
+        (workspace / "AGENTS.md").write_text("Nanobot rules.", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", lambda: home)
+
+        builder = _builder(workspace)
+        result = builder._load_bootstrap_files()
+
+        assert "## ~/.claude/CLAUDE.md" in result
+        assert "Global Claude rules." in result
+        assert "## CLAUDE.md" in result
+        assert "Workspace Claude rules." in result
+        assert result.index("## ~/.claude/CLAUDE.md") < result.index("## CLAUDE.md")
+        assert result.index("## CLAUDE.md") < result.index("## AGENTS.md")
+
+    def test_workspace_claude_md_does_not_fallback_to_data_dir(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        workspace = tmp_path / "project"
+        data_dir = tmp_path / "data"
+        workspace.mkdir()
+        data_dir.mkdir()
+        (data_dir / "CLAUDE.md").write_text("Data dir Claude rules.", encoding="utf-8")
+        (workspace / "CLAUDE.md").write_text("Workspace Claude rules.", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", lambda: home)
+
+        builder = ContextBuilder(workspace=workspace, data_dir=data_dir)
+        result = builder._load_bootstrap_files()
+
+        assert "Workspace Claude rules." in result
+        assert "Data dir Claude rules." not in result
 
     def test_legacy_tools_md_is_not_bootstrapped(self, tmp_path):
         (tmp_path / "TOOLS.md").write_text("workspace tool notes", encoding="utf-8")

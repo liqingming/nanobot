@@ -237,8 +237,25 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         return _to_blocks(left) + _to_blocks(right)
 
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from data_dir (falling back to workspace)."""
+        """Load bootstrap files from Claude globals, workspace, and nanobot data."""
         parts = []
+        seen_paths: set[Path] = set()
+
+        for label, file_path in (
+            ("~/.claude/CLAUDE.md", Path.home() / ".claude" / "CLAUDE.md"),
+            ("CLAUDE.md", self.workspace / "CLAUDE.md"),
+        ):
+            if not file_path.exists():
+                continue
+            try:
+                resolved = file_path.resolve()
+            except OSError:
+                resolved = file_path
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            content = file_path.read_text(encoding="utf-8")
+            parts.append(f"## {label}\n\n{content}")
 
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.data_dir / filename
