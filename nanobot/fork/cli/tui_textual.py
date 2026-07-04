@@ -91,6 +91,24 @@ _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
 _TUI_LAG_LOG = Path(__file__).resolve().parents[2] / "tui_lag.log"
 
 
+def _compact_path_label(path: str, max_len: int = 48) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    normalized = text.replace("/", "\\")
+    if len(normalized) <= max_len:
+        return normalized
+    p = Path(text)
+    parts = p.parts
+    if len(parts) >= 3:
+        prefix = parts[0]
+        tail = "\\".join(parts[-2:])
+        compact = f"{prefix}...\\{tail}"
+        if len(compact) <= max_len:
+            return compact
+    return "..." + normalized[-max(1, max_len - 3):]
+
+
 def _append_tui_lag_log(message: str) -> None:
     try:
         _TUI_LAG_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -833,6 +851,7 @@ if _TEXTUAL_AVAILABLE:
         def on_mount(self) -> None:
             self.query_one("#input").focus()
             self._write_welcome()
+            self.update_topic_bar(self._tui._workspace_label, self._tui._topic)
             self._start_lag_watchdog()
             # After the first full render, re-focus + full layout refresh so
             # Windows Terminal updates its IME candidate window position to the
@@ -1131,11 +1150,23 @@ if _TEXTUAL_AVAILABLE:
             except Exception:
                 pass
 
-        def update_topic_bar(self, name: str) -> None:
+        def update_topic_bar(self, workspace: str, name: str) -> None:
             try:
                 bar = self.query_one("#topic-bar", Static)
-                bar.update(f"[dim cyan] {name} [/dim cyan]")
+                label = Text()
+                if workspace:
+                    label.append(" ")
+                    label.append(workspace, style="dim")
                 if name:
+                    if workspace:
+                        label.append("  ·  ", style="dim")
+                    else:
+                        label.append(" ")
+                    label.append(name, style="cyan")
+                if workspace or name:
+                    label.append(" ")
+                bar.update(label)
+                if workspace or name:
                     bar.add_class("visible")
                 else:
                     bar.remove_class("visible")
@@ -1215,6 +1246,7 @@ class TextualTUI(TUIBase):
         render_markdown: bool = True,
         history_file: str | None = None,
         model: str | None = None,
+        workspace: str | Path | None = None,
     ) -> None:
         if not _TEXTUAL_AVAILABLE:
             raise ImportError(
@@ -1224,6 +1256,7 @@ class TextualTUI(TUIBase):
         self._render_md = render_markdown
         self._history_file = Path(history_file) if history_file else None
         self._model = model
+        self._workspace_label = _compact_path_label(str(workspace or Path.cwd()))
 
         # Input history
         self._history: list[str] = self._load_history()
@@ -2254,7 +2287,7 @@ class TextualTUI(TUIBase):
 
     def set_topic(self, name: str) -> None:
         self._topic = name
-        self._app.update_topic_bar(name)
+        self._app.update_topic_bar(self._workspace_label, name)
         # app.title only updates Textual's Header widget, not the terminal tab.
         # Send OSC 0 directly via the driver to update the terminal/tab title.
         try:

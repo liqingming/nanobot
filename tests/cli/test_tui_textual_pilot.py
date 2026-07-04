@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 from textual.events import Paste
 
-from nanobot.fork.cli.tui_textual import _TEXTUAL_AVAILABLE, TextualTUI
+from nanobot.fork.cli.tui_textual import _TEXTUAL_AVAILABLE, TextualTUI, _compact_path_label
 
 pytestmark = pytest.mark.skipif(
     not _TEXTUAL_AVAILABLE, reason="textual library is not installed"
@@ -146,6 +146,49 @@ async def test_normal_chat_message_routes_to_on_submit() -> None:
         await pilot.pause()
 
         assert submitted == ["hello"]
+
+
+def test_compact_path_label_preserves_short_paths() -> None:
+    assert _compact_path_label(r"E:\learn\nanobot") == r"E:\learn\nanobot"
+
+
+def test_compact_path_label_shortens_long_paths() -> None:
+    label = _compact_path_label(
+        r"E:\very\long\workspace\path\with\many\segments\nanobot",
+        max_len=24,
+    )
+    assert label.startswith("E:")
+    assert "..." in label
+    assert label.endswith(r"segments\nanobot")
+
+
+@pytest.mark.asyncio
+async def test_topic_bar_shows_workspace_without_topic() -> None:
+    tui = TextualTUI(workspace=r"E:\learn\nanobot")
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        bar = app.query_one("#topic-bar")
+        renderable = bar.render()
+        text = getattr(renderable, "plain", str(renderable))
+        assert r"E:\learn\nanobot" in text
+        assert "·" not in text
+
+
+@pytest.mark.asyncio
+async def test_topic_bar_shows_workspace_and_topic() -> None:
+    tui = TextualTUI(workspace=r"E:\learn\nanobot")
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.set_topic("feature-diff")
+        await pilot.pause()
+        bar = app.query_one("#topic-bar")
+        renderable = bar.render()
+        text = getattr(renderable, "plain", str(renderable))
+        assert r"E:\learn\nanobot" in text
+        assert "feature-diff" in text
+        assert "·" in text
 
 
 @pytest.mark.asyncio

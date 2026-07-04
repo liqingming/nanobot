@@ -7,7 +7,7 @@ Selection order:
 Usage::
 
     from nanobot.fork.cli.tui_factory import create_tui
-    tui = create_tui(render_markdown=True, history_file=..., model=...)
+    tui = create_tui(render_markdown=True, history_file=..., model=..., workspace=...)
     await tui.run_async()
 """
 from __future__ import annotations
@@ -26,6 +26,7 @@ def create_tui(
     history_file: str | None = None,
     model: str | None = None,
     backend: str = "textual",
+    workspace: str | os.PathLike[str] | None = None,
 ) -> "TUIBase":
     # Environment variable overrides config value
     backend = os.environ.get(_ENV_KEY, backend).strip().lower()
@@ -36,6 +37,7 @@ def create_tui(
             render_markdown=render_markdown,
             history_file=history_file,
             model=model,
+            workspace=workspace,
         )
 
     # Default: original prompt_toolkit backend

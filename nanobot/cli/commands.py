@@ -1273,6 +1273,7 @@ def agent(
                 history_file=history_file,
                 model=config.agents.defaults.model,
                 backend=config.agents.defaults.tui_backend,
+                workspace=agent_loop.workspace,
             )
 
             # Mutable topic state — fresh session by default; user picks via startup popup
