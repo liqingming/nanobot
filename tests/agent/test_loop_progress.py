@@ -273,7 +273,7 @@ class TestToolEventProgress:
         assert finish["result"] == "file.txt"
 
     @pytest.mark.asyncio
-    async def test_bus_progress_forwards_file_edit_events_for_websocket_only(self, tmp_path: Path) -> None:
+    async def test_bus_progress_forwards_file_edit_events_for_websocket_and_cli(self, tmp_path: Path) -> None:
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
@@ -297,6 +297,17 @@ class TestToolEventProgress:
         ))
         assert on_progress_accepts_file_edit_events(websocket_progress) is True
         await websocket_progress("", file_edit_events=edit_events)
+        outbound = await bus.consume_outbound()
+        assert outbound.metadata["_file_edit_events"] == edit_events
+
+        cli_progress = await loop._build_bus_progress_callback(InboundMessage(
+            channel="cli",
+            sender_id="u1",
+            chat_id="chat-cli",
+            content="edit",
+        ))
+        assert on_progress_accepts_file_edit_events(cli_progress) is True
+        await cli_progress("", file_edit_events=edit_events)
         outbound = await bus.consume_outbound()
         assert outbound.metadata["_file_edit_events"] == edit_events
 

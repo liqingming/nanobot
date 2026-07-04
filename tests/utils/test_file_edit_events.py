@@ -61,6 +61,13 @@ def test_write_file_start_predicts_and_end_calibrates_exact_diff(tmp_path: Path)
     assert end["status"] == "done"
     assert end["approximate"] is False
     assert (end["added"], end["deleted"]) == (2, 1)
+    assert "--- a/notes.txt" in end["diff"]
+    assert "+++ b/notes.txt" in end["diff"]
+    assert "-old" in end["diff"]
+    assert "+new" in end["diff"]
+    assert "+extra" in end["diff"]
+    assert end["diff_total_lines"] >= 5
+    assert end["diff_truncated"] is False
 
 
 def test_binary_file_is_reported_but_not_counted(tmp_path: Path) -> None:
@@ -80,6 +87,7 @@ def test_binary_file_is_reported_but_not_counted(tmp_path: Path) -> None:
     event = build_file_edit_end_event(tracker)
     assert event["binary"] is True
     assert (event["added"], event["deleted"]) == (0, 0)
+    assert "diff" not in event
 
 
 def test_apply_patch_prepares_trackers_for_each_touched_file(tmp_path: Path) -> None:

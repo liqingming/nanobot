@@ -13,6 +13,7 @@ TRACKED_FILE_EDIT_TOOLS = frozenset({"write_file", "edit_file", "apply_patch"})
 _MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
 _LIVE_EMIT_INTERVAL_S = 0.18
 _LIVE_EMIT_LINE_STEP = 24
+_MAX_DIFF_LINES = 200
 
 
 @dataclass(slots=True)
@@ -120,6 +121,34 @@ def line_diff_stats(before: str | None, after: str | None) -> tuple[int, int]:
         if tag in ("replace", "insert"):
             added += j2 - j1
     return added, deleted
+
+
+def unified_diff_preview(
+    before: str | None,
+    after: str | None,
+    *,
+    path: str,
+    max_lines: int = _MAX_DIFF_LINES,
+) -> dict[str, Any] | None:
+    """Return a bounded unified diff payload for text file edits."""
+    if before is None or after is None or before == after:
+        return None
+    diff_lines = list(difflib.unified_diff(
+        before.replace("\r\n", "\n").splitlines(keepends=True),
+        after.replace("\r\n", "\n").splitlines(keepends=True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        lineterm="",
+    ))
+    if not diff_lines:
+        return None
+    total = len(diff_lines)
+    visible = diff_lines[:max(0, max_lines)]
+    return {
+        "diff": "\n".join(line.rstrip("\n") for line in visible),
+        "diff_total_lines": total,
+        "diff_truncated": total > len(visible),
+    }
 
 
 def _text_line_count(text: str) -> int:
@@ -281,17 +310,23 @@ def build_file_edit_end_event(
 ) -> dict[str, Any]:
     after = read_file_snapshot(tracker.path)
     counted = False
+    before_text: str | None = None
+    after_text: str | None = None
     if tracker.before.countable and after.countable:
         added, deleted = line_diff_stats(tracker.before.text, after.text)
+        before_text = tracker.before.text
+        after_text = after.text
         counted = True
     else:
         predicted_after = _predict_after_text(tracker.tool, params or {}, tracker.before)
         if tracker.before.countable and predicted_after is not None:
             added, deleted = line_diff_stats(tracker.before.text, predicted_after)
+            before_text = tracker.before.text
+            after_text = predicted_after
             counted = True
         else:
             added, deleted = 0, 0
-    return _event_payload(
+    payload = _event_payload(
         tracker,
         phase="end",
         status="done",
@@ -300,6 +335,10 @@ def build_file_edit_end_event(
         approximate=False,
         binary=(after.binary or after.oversized or after.unreadable) and not counted,
     )
+    diff = unified_diff_preview(before_text, after_text, path=tracker.display_path)
+    if diff is not None:
+        payload.update(diff)
+    return payload
 
 
 def build_file_edit_error_event(

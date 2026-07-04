@@ -229,8 +229,8 @@ def build_bus_progress_callback(
             )
         )
 
-    if msg.channel == "websocket":
-        async def _websocket_progress(
+    if msg.channel in {"websocket", "cli"}:
+        async def _structured_progress(
             content: str,
             *,
             tool_hint: bool = False,
@@ -248,7 +248,7 @@ def build_bus_progress_callback(
                 reasoning_end=reasoning_end,
             )
 
-        return _websocket_progress
+        return _structured_progress
 
     async def _bus_progress(
         content: str,

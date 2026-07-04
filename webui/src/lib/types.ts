@@ -112,6 +112,9 @@ export interface UIFileEdit {
   binary?: boolean;
   error?: string;
   pending?: boolean;
+  diff?: string;
+  diff_total_lines?: number;
+  diff_truncated?: boolean;
 }
 
 export interface ChatSummary {

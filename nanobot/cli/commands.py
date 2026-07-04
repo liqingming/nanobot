@@ -1661,6 +1661,10 @@ def agent(
                                     # 渲染出来。TUI 侧 add_reasoning/flush_reasoning
                                     # 方法仍保留,日后想恢复只需还原本分支。
                                     pass
+                                elif msg.metadata.get("_file_edit_events"):
+                                    tui.add_file_edit_events(
+                                        msg.metadata.get("_file_edit_events") or []
+                                    )
                                 else:
                                     summary = _tool_result_summary_from_events(
                                         msg.metadata.get("_tool_events")

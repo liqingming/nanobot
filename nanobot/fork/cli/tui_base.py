@@ -101,6 +101,10 @@ class TUIBase(ABC):
         """
         return None
 
+    def add_file_edit_events(self, events: list[dict[str, Any]]) -> None:
+        """Render structured file edit progress events."""
+        return None
+
     def stop_thinking(self) -> None:
         """Stop any in-flight thinking / idle spinner. Called on turn completion
         so the spinner never outlives the turn — the streaming path stops it via

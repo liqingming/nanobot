@@ -1879,6 +1879,108 @@ class TextualTUI(TUIBase):
         # a "thinking..." spinner in #live so the user knows we're waiting.
         self._schedule_idle_thinking()
 
+    _FILE_DIFF_VISIBLE_LINES = 40
+
+    def add_file_edit_events(self, events: list[dict[str, Any]]) -> None:
+        if not events:
+            return
+        rendered = [self._format_file_edit_event(event) for event in events]
+        rendered = [block for block in rendered if block is not None]
+        if not rendered:
+            return
+        self._petrify_tool_placeholder()
+        for block in rendered:
+            self._write_file_edit_block(block)
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            self._tool_placeholder_line = len(out.lines)
+        except Exception:
+            pass
+        self._schedule_idle_thinking()
+
+    def _format_file_edit_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        if not isinstance(event, dict):
+            return None
+        phase = event.get("phase")
+        status = event.get("status")
+        if phase not in {"end", "error"} and status not in {"done", "error"}:
+            return None
+        path = str(event.get("path") or event.get("absolute_path") or "").strip()
+        if not path and event.get("pending"):
+            path = "(pending file)"
+        if not path:
+            return None
+        added = int(event.get("added") or 0)
+        deleted = int(event.get("deleted") or 0)
+        diff = event.get("diff") if isinstance(event.get("diff"), str) else ""
+        total_lines = int(event.get("diff_total_lines") or 0)
+        if total_lines <= 0 and diff:
+            total_lines = len(diff.splitlines())
+        return {
+            "path": path,
+            "added": max(0, added),
+            "deleted": max(0, deleted),
+            "status": "error" if status == "error" or phase == "error" else "done",
+            "binary": bool(event.get("binary")),
+            "error": str(event.get("error") or ""),
+            "diff": diff,
+            "diff_total_lines": max(0, total_lines),
+            "diff_truncated": bool(event.get("diff_truncated")),
+        }
+
+    def _write_file_edit_block(self, block: dict[str, Any]) -> None:
+        from rich.text import Text as _RText
+
+        added = block["added"]
+        deleted = block["deleted"]
+        status = block["status"]
+        path = block["path"]
+        header = _RText()
+        header.append(self._TOOL_INDENT, style="")
+        marker = "✗" if status == "error" else "Δ"
+        header.append(
+            f"{marker} ",
+            style=self.THEME_ERROR if status == "error" else self.THEME_MARKER,
+        )
+        header.append(path, style=self.THEME_HINT)
+        if block["binary"]:
+            header.append("  binary", style=self.THEME_MUTED)
+        elif added or deleted:
+            header.append("  ", style="")
+            header.append(f"+{added}", style="green")
+            header.append(" / ", style=self.THEME_MUTED)
+            header.append(f"-{deleted}", style="red")
+        if block["error"]:
+            header.append(f"  {block['error']}", style=self.THEME_ERROR)
+        self._log_write(header)
+
+        diff = block["diff"]
+        if not diff:
+            return
+        lines = diff.splitlines()
+        visible = lines[: self._FILE_DIFF_VISIBLE_LINES]
+        for line in visible:
+            text = _RText()
+            text.append(self._TOOL_INDENT + "  ", style="")
+            if line.startswith("+") and not line.startswith("+++"):
+                text.append(line, style="green")
+            elif line.startswith("-") and not line.startswith("---"):
+                text.append(line, style="red")
+            elif line.startswith("@@"):
+                text.append(line, style="cyan")
+            else:
+                text.append(line, style=self.THEME_MUTED)
+            self._log_write(text)
+        hidden = max(0, block["diff_total_lines"] - len(visible))
+        if hidden or block["diff_truncated"]:
+            suffix = "，diff 已截断" if block["diff_truncated"] else ""
+            self._log_write(
+                Text(
+                    f"{self._TOOL_INDENT}  ... 已折叠 {hidden} 行{suffix}",
+                    style=self.THEME_MUTED,
+                )
+            )
+
     def add_system(self, text: str) -> None:
         self._log_write(f"[dim]{text}[/dim]")
         self._last_sep = False

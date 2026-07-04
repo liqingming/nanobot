@@ -206,6 +206,39 @@ async def test_single_line_paste_stays_visible_in_input() -> None:
         assert submitted == ["hello from clipboard"]
 
 
+def test_file_edit_diff_block_folds_long_diff(monkeypatch) -> None:
+    tui = TextualTUI()
+    written: list[str] = []
+
+    def capture(*items) -> None:
+        for item in items:
+            written.append(getattr(item, "plain", str(item)))
+
+    monkeypatch.setattr(tui, "_log_write", capture)
+    diff_lines = ["--- a/app.py", "+++ b/app.py", "@@ -1,45 +1,45 @@"]
+    diff_lines.extend(f"-old {idx}" for idx in range(21))
+    diff_lines.extend(f"+new {idx}" for idx in range(21))
+
+    block = tui._format_file_edit_event({
+        "phase": "end",
+        "status": "done",
+        "path": "app.py",
+        "added": 21,
+        "deleted": 21,
+        "diff": "\n".join(diff_lines),
+        "diff_total_lines": len(diff_lines),
+    })
+
+    assert block is not None
+    tui._write_file_edit_block(block)
+
+    text = "\n".join(written)
+    assert "Δ app.py  +21 / -21" in text
+    assert "--- a/app.py" in text
+    assert "+++ b/app.py" in text
+    assert "已折叠 5 行" in text
+
+
 @pytest.mark.asyncio
 async def test_shift_enter_inserts_newline_enter_submits() -> None:
     """Shift+Enter should add a line break; Enter should submit the composer."""
