@@ -361,7 +361,7 @@ def test_save_uses_atomic_replace_and_keeps_existing_file_on_replace_error(make_
     def _raise_replace(_src, _dst):
         raise OSError("replace failed")
 
-    monkeypatch.setattr(msteams_module.os, "replace", _raise_replace)
+    monkeypatch.setattr(msteams_module, "replace_file_with_retry", _raise_replace)
     ch._save_refs()
 
     persisted = json.loads(refs_path.read_text(encoding="utf-8"))

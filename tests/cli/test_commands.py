@@ -10,7 +10,13 @@ from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.agent.skills import SkillsLoader
-from nanobot.cli.commands import app, _format_skills_command
+from nanobot.cli.commands import (
+    app,
+    _format_skills_command,
+    _format_topic_cache_size,
+    _format_topic_popup_label,
+    _topic_cache_size_bytes,
+)
 from nanobot.config.paths import get_workspace_cache_dir
 from nanobot.config.schema import Config
 from nanobot.cron.types import CronJob, CronPayload
@@ -55,6 +61,29 @@ def test_format_skills_command_empty(tmp_path: Path) -> None:
     loader = SkillsLoader(tmp_path / "workspace", builtin_skills_dir=builtin)
 
     assert _format_skills_command(loader) == "当前没有可用技能。"
+
+
+def test_format_topic_popup_label_includes_cache_size() -> None:
+    assert _format_topic_cache_size(850) == "850 B"
+    assert _format_topic_cache_size(12_400) == "12 KB"
+    assert _format_topic_cache_size(None) == "? B"
+    assert _format_topic_popup_label("feature", 1_250) == "feature  [1.2 KB]"
+
+
+def test_topic_cache_size_bytes_includes_session_and_topic_memory(tmp_path: Path) -> None:
+    session_path = tmp_path / "sessions" / "cli_topic.jsonl"
+    session_path.parent.mkdir()
+    session_path.write_bytes(b"session-data")
+    topic_dir = tmp_path / "memory" / "topics" / "cli_topic"
+    topic_dir.mkdir(parents=True)
+    (topic_dir / "MEMORY.md").write_bytes(b"memory")
+    (topic_dir / "history.jsonl").write_bytes(b"history")
+
+    assert _topic_cache_size_bytes(
+        data_dir=tmp_path,
+        session_key="cli:topic",
+        session_path=str(session_path),
+    ) == len(b"session-data") + len(b"memory") + len(b"history")
 
 
 def test_format_skills_command_lists_sources_and_descriptions(tmp_path: Path) -> None:

@@ -39,6 +39,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_workspace_path
 from nanobot.config.schema import Base
+from nanobot.utils.atomic_write import replace_file_with_retry
 
 MSTEAMS_AVAILABLE = (
     importlib.util.find_spec("jwt") is not None
@@ -707,7 +708,7 @@ class MSTeamsChannel(BaseChannel):
                 f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, path)
+            replace_file_with_retry(tmp_path, path)
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 with suppress(OSError):

@@ -77,7 +77,7 @@ class SafeFileHistory(FileHistory):
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
 from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config
-from nanobot.utils.helpers import sync_workspace_templates
+from nanobot.utils.helpers import safe_filename, sync_workspace_templates
 from nanobot.utils.restart import (
     consume_restart_notice_from_env,
     format_restart_completed_message,
@@ -120,6 +120,60 @@ def _tool_result_summary_from_events(tool_events: object) -> str | None:
 
 def _format_skills_command(skills_loader: Any) -> str:
     return skills_loader.format_listing()
+
+
+def _format_topic_cache_size(size_bytes: int | None) -> str:
+    if size_bytes is None or size_bytes < 0:
+        return "? B"
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    value = size_bytes / 1024
+    if value < 1024:
+        return f"{value:.1f} KB" if value < 10 else f"{value:.0f} KB"
+    value /= 1024
+    if value < 1024:
+        return f"{value:.1f} MB" if value < 10 else f"{value:.0f} MB"
+    value /= 1024
+    return f"{value:.1f} GB" if value < 10 else f"{value:.0f} GB"
+
+
+def _topic_memory_dir(data_dir: Path, session_key: str) -> Path:
+    safe_key = safe_filename(session_key.replace(":", "_"))
+    return data_dir / "memory" / "topics" / safe_key
+
+
+def _path_tree_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for item in path.rglob("*"):
+        if not item.is_file():
+            continue
+        try:
+            total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _topic_cache_size_bytes(
+    *,
+    data_dir: Path,
+    session_key: str,
+    session_path: str | None = None,
+) -> int:
+    total = _path_tree_size(Path(session_path)) if session_path else 0
+    total += _path_tree_size(_topic_memory_dir(data_dir, session_key))
+    return total
+
+
+def _format_topic_popup_label(topic: str, size_bytes: int | None) -> str:
+    return f"{topic}  [{_format_topic_cache_size(size_bytes)}]"
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -1336,6 +1390,22 @@ def agent(
                 ("/exit", "退出 nanobot"),
             ])
 
+            def _topic_popup_items(session_infos: list[dict[str, Any]]) -> list[tuple[str, str]]:
+                items: list[tuple[str, str]] = []
+                prefix = f"{cli_channel}:"
+                for info in session_infos:
+                    key = str(info.get("key") or "")
+                    if not key.startswith(prefix):
+                        continue
+                    name = key[len(prefix):]
+                    size = _topic_cache_size_bytes(
+                        data_dir=agent_loop.context.data_dir,
+                        session_key=key,
+                        session_path=str(info.get("path") or "") or None,
+                    )
+                    items.append((name, _format_topic_popup_label(name, size)))
+                return items
+
             # Show startup topic picker if existing sessions are available
             async def _startup_picker() -> None:
                 await asyncio.sleep(0.05)
@@ -1347,16 +1417,17 @@ def agent(
                     if s["key"].startswith(prefix)
                 ]
                 if topics:
-                    options = ["[ 新建话题 ]"] + topics
-                    async def _on_startup_select(name: str) -> None:
+                    options = [("[ 新建话题 ]", "[ 新建话题 ]")]
+                    options.extend(_topic_popup_items(sessions_list))
+                    def _on_startup_select(name: str):
                         if name == "[ 新建话题 ]":
                             async def _confirm_new_topic(typed: str) -> None:
                                 new_name = typed or datetime.now().strftime("topic_%Y%m%d_%H%M%S")
                                 await _switch_topic(new_name)
                                 tui.add_system(f"已创建话题: {new_name}")
                             tui.enter_new_topic_mode(_confirm_new_topic)
-                        else:
-                            await _switch_topic(name)
+                            return None
+                        return _switch_topic(name)
                     tui.show_topic_popup(options, _on_startup_select)
 
             asyncio.create_task(_startup_picker())
@@ -1595,7 +1666,10 @@ def agent(
                             await _switch_topic(name)
                             tui.add_system(f"已切换到话题: {name}")
 
-                        tui.show_topic_popup(topics, _on_topic_select)
+                        tui.show_topic_popup(
+                            _topic_popup_items(sessions_list),
+                            _on_topic_select,
+                        )
                     return
                 # ─────────────────────────────────────────────────────────────
 

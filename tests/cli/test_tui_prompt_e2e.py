@@ -13,7 +13,7 @@ import asyncio
 import pytest
 from prompt_toolkit.document import Document
 
-from nanobot.fork.cli.tui import PromptTUI
+from nanobot.fork.cli.tui import PromptTUI, _PopupMenuControl
 
 
 async def _drain() -> None:
@@ -145,6 +145,25 @@ def test_tab_does_nothing_when_no_popup(prompt_tui: PromptTUI) -> None:
     prompt_tui._input_buffer.set_document(Document("hello", 5))
     prompt_tui._handle_tab_key()
     assert prompt_tui._input_buffer.text == "hello"  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_topic_popup_can_show_cache_label_but_select_topic_value(prompt_tui: PromptTUI) -> None:
+    selected: list[str] = []
+
+    async def on_select(value: str) -> None:
+        selected.append(value)
+
+    prompt_tui.show_topic_popup([("topic-a", "topic-a  [1.2 KB]")], on_select)
+
+    assert prompt_tui._popup_items == [("topic-a", "topic-a  [1.2 KB]")]
+    content = _PopupMenuControl(prompt_tui).create_content(width=80, height=10)
+    line = "".join(fragment for _, fragment in content.get_line(0))
+    assert "topic-a  [1.2 KB]" in line
+    prompt_tui._handle_enter_key()
+    await _drain()
+
+    assert selected == ["topic-a"]
 
 
 def test_up_cycles_popup_when_visible(prompt_tui: PromptTUI) -> None:

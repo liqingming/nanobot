@@ -178,6 +178,17 @@ def test_webui_title_update_uses_captured_llm_runtime(
     assert captured["model"] == "turn-model"
 
 
+def test_set_runtime_checkpoint_save_failure_is_best_effort() -> None:
+    loop = _mk_loop()
+    loop.sessions = MagicMock()
+    loop.sessions.save.side_effect = PermissionError("temporarily locked")
+    session = Session(key="test:checkpoint-save-failure")
+
+    loop._set_runtime_checkpoint(session, {"phase": "awaiting_model"})
+
+    loop.sessions.save.assert_called_once_with(session)
+    assert loop._RUNTIME_CHECKPOINT_KEY not in session.metadata
+
 def test_save_turn_skips_multimodal_user_when_only_runtime_context() -> None:
     loop = _mk_loop()
     session = Session(key="test:runtime-only")

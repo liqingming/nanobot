@@ -3,6 +3,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from nanobot.session.manager import Session, SessionManager
 
@@ -71,6 +72,29 @@ class TestAtomicSave:
 
         assert not tmp_path_file.exists()
 
+    def test_save_retries_transient_permission_error_on_replace(self, tmp_path: Path):
+        mgr = SessionManager(tmp_path)
+        session = Session(key="test:retry")
+        session.add_message("user", "hello")
+        import os
+        original_replace = os.replace
+        attempts = 0
+
+        def flaky_replace(src: str | Path, dst: str | Path) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError("temporarily locked")
+            original_replace(src, dst)
+
+        with patch("nanobot.utils.atomic_write.os.replace", side_effect=flaky_replace), \
+             patch("nanobot.utils.atomic_write.time.sleep") as sleep:
+            mgr.save(session)
+
+        assert attempts == 3
+        assert sleep.call_count == 2
+        loaded = mgr.get_or_create("test:retry")
+        assert loaded.messages[0]["content"] == "hello"
     def test_overwrite_preserves_latest_data(self, tmp_path: Path):
         mgr = SessionManager(tmp_path)
         session = Session(key="test:overwrite")

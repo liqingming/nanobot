@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 import tiktoken
 from loguru import logger
 
+from nanobot.utils.atomic_write import replace_file_with_retry
+
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.session.manager import Session
@@ -400,7 +402,7 @@ class MemoryStore:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, self.history_file)
+            replace_file_with_retry(tmp_path, self.history_file)
 
             # fsync the directory so the rename is durable.
             # On Windows, opening a directory with O_RDONLY raises

@@ -109,6 +109,18 @@ def _compact_path_label(path: str, max_len: int = 48) -> str:
     return "..." + normalized[-max(1, max_len - 3):]
 
 
+def _normalize_topic_items(topics: list[str | tuple[str, str]]) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for item in topics:
+        if isinstance(item, tuple) and len(item) == 2:
+            value, label = item
+            items.append((str(value), str(label)))
+        else:
+            text = str(item)
+            items.append((text, text))
+    return items
+
+
 def _append_tui_lag_log(message: str) -> None:
     try:
         _TUI_LAG_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -486,6 +498,8 @@ if _TEXTUAL_AVAILABLE:
     class _ComposerInput(TextArea):
         """Input that delegates ↑/↓ to the TUI's history / popup state."""
 
+        _LARGE_PASTE_CHARS = 5 * 1024
+
         def __init__(self, tui: "TextualTUI", **kwargs: Any) -> None:
             super().__init__("", soft_wrap=True, tab_behavior="focus", compact=True, **kwargs)
             self._tui_ref = tui
@@ -517,7 +531,9 @@ if _TEXTUAL_AVAILABLE:
 
         def _paste_display_token(self, text: str) -> str:
             lines = self._paste_line_count(text)
-            return f"[已粘贴 {lines} 行]"
+            if lines > 1:
+                return f"[pasted {lines} lines]"
+            return f"[pasted {len(text)} chars]"
 
         def _location_to_offset(self, location: tuple[int, int]) -> int:
             row, column = location
@@ -585,7 +601,7 @@ if _TEXTUAL_AVAILABLE:
             text = self._normalize_paste_text(text)
             if not text:
                 return
-            if "\n" in text:
+            if "\n" in text or len(text) > self._LARGE_PASTE_CHARS:
                 self._insert_multiline_token(text)
                 return
             selection = self.selection
@@ -938,7 +954,9 @@ if _TEXTUAL_AVAILABLE:
                 cb = tui._popup_on_select
                 tui.hide_popup()
                 if cb:
-                    asyncio.ensure_future(cb(value))
+                    result = cb(value)
+                    if isinstance(result, Awaitable):
+                        asyncio.ensure_future(result)
                 return
             if action == EnterAction.COMMAND_SUBMIT:
                 tui.hide_popup()
@@ -1459,12 +1477,12 @@ class TextualTUI(TUIBase):
                 if mode == "command":
                     lines.append(f"[reverse]{prefix}{value:<12}  {label}[/reverse]")
                 else:
-                    lines.append(f"[reverse]{prefix}{value}[/reverse]")
+                    lines.append(f"[reverse]{prefix}{label or value}[/reverse]")
             else:
                 if mode == "command":
                     lines.append(f"[dim]{prefix}{value:<12}  {label}[/dim]")
                 else:
-                    lines.append(f"[dim]{prefix}{value}[/dim]")
+                    lines.append(f"[dim]{prefix}{label or value}[/dim]")
         self._app.update_popup(lines, True)
 
     def _on_input_changed(self, text: str) -> None:
@@ -2369,11 +2387,12 @@ class TextualTUI(TUIBase):
 
     def show_topic_popup(
         self,
-        topics: list[str],
+        topics: list[str | tuple[str, str]],
         on_select: Callable[[str], Awaitable[None]],
     ) -> None:
-        self._popup_all_topics = list(topics)
-        self._popup_all_items = [(t, t) for t in topics]
+        items = _normalize_topic_items(topics)
+        self._popup_all_topics = [value for value, _ in items]
+        self._popup_all_items = items
         self._popup_mode = "topic"
         self._popup_items = list(self._popup_all_items)
         self._popup_idx = 0

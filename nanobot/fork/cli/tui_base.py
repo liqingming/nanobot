@@ -140,7 +140,7 @@ class TUIBase(ABC):
     @abstractmethod
     def show_topic_popup(
         self,
-        topics: list[str],
+        topics: list[str | tuple[str, str]],
         on_select: Callable[[str], Awaitable[None]],
     ) -> None: ...
 

@@ -55,6 +55,10 @@ from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+from nanobot.utils.session_runtime_log import (
+    append_session_runtime_log,
+    exception_fields,
+)
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -121,6 +125,7 @@ class TurnContext:
     turn_latency_ms: int | None = None
 
     trace: list[StateTraceEntry] = field(default_factory=list)
+    runtime_log_path: Path | None = None
 
 
 class AgentLoop:
@@ -929,6 +934,29 @@ class AgentLoop:
             return items
 
         active_session_key = session.key if session else session_key
+        runtime_log_path = (
+            self.sessions.get_session_runtime_log_path(active_session_key)
+            if active_session_key else None
+        )
+
+        def _event_logger(event: str, fields: dict[str, Any]) -> None:
+            append_session_runtime_log(
+                runtime_log_path,
+                event,
+                session_key=active_session_key,
+                **fields,
+            )
+
+        append_session_runtime_log(
+            runtime_log_path,
+            "agent_loop.run.start",
+            session_key=active_session_key,
+            model=self.model,
+            channel=channel,
+            chat_id=chat_id,
+            initial_messages=len(initial_messages),
+            max_iterations=self.max_iterations,
+        )
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         try:
             result = await self.runner.run(AgentRunSpec(
@@ -963,6 +991,7 @@ class AgentLoop:
                     session.key if session is not None else session_key,
                     metadata=(session.metadata if session is not None else None),
                 ),
+                event_logger=_event_logger,
             ))
         finally:
             reset_file_states(file_state_token)
@@ -977,6 +1006,15 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
+        append_session_runtime_log(
+            runtime_log_path,
+            "agent_loop.run.end",
+            session_key=active_session_key,
+            stop_reason=result.stop_reason,
+            tools_used=result.tools_used,
+            usage=result.usage,
+            final_preview=(result.final_content or "")[:300],
+        )
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 
     async def run(self) -> None:
@@ -1146,8 +1184,14 @@ class AgentLoop:
                             exc_info=True,
                         )
                     raise
-                except Exception:
+                except Exception as exc:
                     logger.exception("Error processing message for session {}", session_key)
+                    append_session_runtime_log(
+                        self.sessions.get_session_runtime_log_path(session_key),
+                        "dispatch.exception",
+                        session_key=session_key,
+                        **exception_fields(exc),
+                    )
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
                         content="Sorry, I encountered an error.",
@@ -1362,6 +1406,17 @@ class AgentLoop:
             on_stream=on_stream,
             on_stream_end=on_stream_end,
             pending_queue=pending_queue,
+            runtime_log_path=self.sessions.get_session_runtime_log_path(key),
+        )
+        append_session_runtime_log(
+            ctx.runtime_log_path,
+            "turn.start",
+            turn_id=ctx.turn_id,
+            session_key=ctx.session_key,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content_preview=msg.content[:300],
+            media_count=len(msg.media or []),
         )
 
         while ctx.state is not TurnState.DONE:
@@ -1371,9 +1426,15 @@ class AgentLoop:
                 raise RuntimeError(f"Missing state handler for {ctx.state}")
 
             t0 = time.perf_counter()
+            append_session_runtime_log(
+                ctx.runtime_log_path,
+                "turn.state.start",
+                turn_id=ctx.turn_id,
+                state=ctx.state.name,
+            )
             try:
                 event = await handler(ctx)
-            except Exception:
+            except Exception as exc:
                 duration = (time.perf_counter() - t0) * 1000
                 ctx.trace.append(
                     StateTraceEntry(
@@ -1383,6 +1444,14 @@ class AgentLoop:
                         event="",
                         error="exception",
                     )
+                )
+                append_session_runtime_log(
+                    ctx.runtime_log_path,
+                    "turn.state.exception",
+                    turn_id=ctx.turn_id,
+                    state=ctx.state.name,
+                    duration_ms=round(duration, 1),
+                    **exception_fields(exc),
                 )
                 raise
 
@@ -1402,6 +1471,14 @@ class AgentLoop:
                 duration,
                 event,
             )
+            append_session_runtime_log(
+                ctx.runtime_log_path,
+                "turn.state.end",
+                turn_id=ctx.turn_id,
+                state=ctx.state.name,
+                duration_ms=round(duration, 1),
+                transition_event=event,
+            )
 
             next_state = self._TRANSITIONS.get((ctx.state, event))
             if next_state is None:
@@ -1415,6 +1492,15 @@ class AgentLoop:
             "[turn {}] Turn completed after {} states",
             ctx.turn_id,
             len(ctx.trace),
+        )
+        append_session_runtime_log(
+            ctx.runtime_log_path,
+            "turn.end",
+            turn_id=ctx.turn_id,
+            session_key=ctx.session_key,
+            states=len(ctx.trace),
+            stop_reason=ctx.stop_reason,
+            latency_ms=ctx.turn_latency_ms,
         )
         return ctx.outbound
 
@@ -1803,7 +1889,11 @@ class AgentLoop:
     def _set_runtime_checkpoint(self, session: Session, payload: dict[str, Any]) -> None:
         """Persist the latest in-flight turn state into session metadata."""
         session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
-        self.sessions.save(session)
+        try:
+            self.sessions.save(session)
+        except Exception:
+            session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+            logger.warning("Failed to persist runtime checkpoint for session {}", session.key, exc_info=True)
 
     def _mark_pending_user_turn(self, session: Session) -> None:
         session.metadata[self._PENDING_USER_TURN_KEY] = True

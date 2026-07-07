@@ -126,6 +126,39 @@ async def test_new_topic_via_explicit_api_routes_correctly() -> None:
 
 
 @pytest.mark.asyncio
+async def test_startup_new_topic_selection_routes_name_to_topic_callback() -> None:
+    """Startup picker new-topic selection must arm new_topic before typing."""
+    tui = TextualTUI()
+    submitted: list[str] = []
+    topic_callbacks: list[str] = []
+
+    async def confirm_topic(name: str) -> None:
+        topic_callbacks.append(name)
+
+    def on_startup_select(name: str) -> None:
+        if name == "[ 新建话题 ]":
+            tui.enter_new_topic_mode(confirm_topic)
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.show_topic_popup([("[ 新建话题 ]", "[ 新建话题 ]")], on_startup_select)
+        await pilot.pause()
+
+        await pilot.press("enter")
+        await _press_text(pilot, "startup_topic")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert topic_callbacks == ["startup_topic"]
+        assert submitted == []
+
+@pytest.mark.asyncio
 async def test_normal_chat_message_routes_to_on_submit() -> None:
     """Sanity check: normal typing + Enter still reaches on_submit."""
     tui = TextualTUI()
@@ -192,6 +225,31 @@ async def test_topic_bar_shows_workspace_and_topic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_topic_popup_can_show_cache_label_but_select_topic_value() -> None:
+    tui = TextualTUI()
+    selected: list[str] = []
+
+    async def on_select(value: str) -> None:
+        selected.append(value)
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.show_topic_popup([("topic-a", "topic-a  [1.2 KB]")], on_select)
+        await pilot.pause()
+        assert tui._popup_items == [("topic-a", "topic-a  [1.2 KB]")]
+        popup = app.query_one("#popup")
+        renderable = popup.render()
+        text = getattr(renderable, "plain", str(renderable))
+        assert "topic-a  [1.2 KB]" in text
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert selected == ["topic-a"]
+
+
+@pytest.mark.asyncio
 async def test_multiline_paste_is_submitted_as_one_message() -> None:
     """Bracketed paste should display a token and submit the full payload."""
     tui = TextualTUI()
@@ -214,7 +272,7 @@ async def test_multiline_paste_is_submitted_as_one_message() -> None:
         await _press_text(pilot, " after")
         await pilot.pause()
 
-        assert inp.value == "before [已粘贴 3 行] after"
+        assert inp.value == "before [pasted 3 lines] after"
 
         await pilot.press("enter")
         await pilot.pause()
@@ -248,6 +306,33 @@ async def test_single_line_paste_stays_visible_in_input() -> None:
 
         assert submitted == ["hello from clipboard"]
 
+
+@pytest.mark.asyncio
+async def test_large_single_line_paste_uses_hidden_payload() -> None:
+    """Large pastes should not flood the input widget but must submit fully."""
+    tui = TextualTUI()
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_commands([])
+
+    app = tui._app
+    payload = "x" * (5 * 1024 + 1)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input")
+        inp._on_paste(Paste(payload))
+        await pilot.pause()
+
+        assert inp.value == f"[pasted {len(payload)} chars]"
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert submitted == [payload]
 
 def test_file_edit_diff_block_folds_long_diff(monkeypatch) -> None:
     tui = TextualTUI()
@@ -363,7 +448,7 @@ async def test_multiline_paste_can_be_inserted_at_cursor() -> None:
         inp._on_paste(Paste("one\ntwo"))
         await pilot.pause()
 
-        assert inp.value == "hello [已粘贴 2 行]world"
+        assert inp.value == "hello [pasted 2 lines]world"
 
         await pilot.press("enter")
         await pilot.pause()
@@ -394,7 +479,7 @@ async def test_multiple_multiline_pastes_restore_in_display_order() -> None:
         inp._on_paste(Paste("c\nd\ne"))
         await pilot.pause()
 
-        assert inp.value == "[已粘贴 2 行] + [已粘贴 3 行]"
+        assert inp.value == "[pasted 2 lines] + [pasted 3 lines]"
 
         await pilot.press("enter")
         await pilot.pause()

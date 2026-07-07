@@ -13,6 +13,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
+from nanobot.utils.atomic_write import replace_file_with_retry
 from nanobot.utils.helpers import (
     ensure_dir,
     estimate_message_tokens,
@@ -347,6 +348,14 @@ class SessionManager:
         """Get the file path for a session."""
         return self.sessions_dir / f"{self.safe_key(key)}.jsonl"
 
+    def get_session_dir(self, key: str) -> Path:
+        """Get the per-session artifact directory."""
+        return ensure_dir(self.sessions_dir / self.safe_key(key))
+
+    def get_session_runtime_log_path(self, key: str) -> Path:
+        """Get the per-session runtime log path."""
+        return self.get_session_dir(key) / "runtime.log"
+
     def _get_legacy_session_path(self, key: str) -> Path:
         """Legacy global session path (~/.nanobot/sessions/)."""
         return self.legacy_sessions_dir / f"{self.safe_key(key)}.jsonl"
@@ -528,7 +537,7 @@ class SessionManager:
                     f.flush()
                     os.fsync(f.fileno())
 
-            os.replace(tmp_path, path)
+            replace_file_with_retry(tmp_path, path)
 
             if fsync:
                 # fsync the directory so the rename is durable.
@@ -578,6 +587,7 @@ class SessionManager:
             return False
         try:
             path.unlink()
+            shutil.rmtree(self.get_session_dir(key), ignore_errors=True)
             return True
         except OSError as e:
             logger.warning("Failed to delete session file {}: {}", path, e)

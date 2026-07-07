@@ -14,6 +14,8 @@ from typing import Any, Callable, Coroutine, Literal
 from filelock import FileLock
 from loguru import logger
 
+from nanobot.utils.atomic_write import replace_file_with_retry
+
 from nanobot.cron.types import (
     CronJob,
     CronJobState,
@@ -311,7 +313,7 @@ class CronService:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, path)
+            replace_file_with_retry(tmp_path, path)
             # fsync the parent directory so the rename itself is durable.
             # Skip on Windows where opening a directory raises PermissionError;
             # NTFS journals metadata synchronously so this is a no-op there.

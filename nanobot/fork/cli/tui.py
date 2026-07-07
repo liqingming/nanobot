@@ -58,6 +58,18 @@ from nanobot.fork.cli.tui_keys import (
     decide_popup_key,
 )
 
+
+def _normalize_topic_items(topics: list[str | tuple[str, str]]) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for item in topics:
+        if isinstance(item, tuple) and len(item) == 2:
+            value, label = item
+            items.append((str(value), str(label)))
+        else:
+            text = str(item)
+            items.append((text, text))
+    return items
+
 _HISTORY_SKIP = {"exit", "quit", "/exit", "/quit", ":q"}
 
 
@@ -270,7 +282,7 @@ class _PopupMenuControl(UIControl):
                 pad = max(0, 12 - dw)
                 body = f"{prefix}{value}{' ' * pad}  {label}"
             else:
-                body = f"{prefix}{value}"
+                body = f"{prefix}{label or value}"
             tail = " " * max(0, width - 1 - _wcswidth(body))
             return [(style, body + tail)]
 
@@ -341,6 +353,7 @@ class PromptTUI(TUIBase):
         self._popup_idx: int = 0
         self._popup_on_select: Callable[[str], Awaitable[None]] | None = None
         self._popup_all_topics: list[str] = []
+        self._popup_all_items: list[tuple[str, str]] = []
         self._setup(history_file)
 
     # ── Session history restore ────────────────────────────────────────────
@@ -791,9 +804,11 @@ class PromptTUI(TUIBase):
         if action == EnterAction.TOPIC_SELECT:
             cb = self._popup_on_select
             self.hide_popup()
-            self._input_buffer.reset()          # topic selected, not typed — skip history
+            self._input_buffer.reset()          # topic selected, not typed - skip history
             if cb:
-                asyncio.ensure_future(cb(value))
+                result = cb(value)
+                if isinstance(result, Awaitable):
+                    asyncio.ensure_future(result)
             return
         if action == EnterAction.COMMAND_SUBMIT:
             self.hide_popup()
@@ -881,13 +896,15 @@ class PromptTUI(TUIBase):
 
     def show_topic_popup(
         self,
-        topics: list[str],
+        topics: list[str | tuple[str, str]],
         on_select: Callable[[str], Awaitable[None]],
     ) -> None:
         """Show an interactive topic picker above the input field."""
-        self._popup_all_topics = list(topics)
+        items = _normalize_topic_items(topics)
+        self._popup_all_topics = [value for value, _ in items]
+        self._popup_all_items = items
         self._popup_mode = "topic"
-        self._popup_items = [(t, t) for t in topics]
+        self._popup_items = items
         self._popup_idx = 0
         self._popup_on_select = on_select
         self._input_buffer.reset()
@@ -900,6 +917,7 @@ class PromptTUI(TUIBase):
         self._popup_idx = 0
         self._popup_on_select = None
         self._popup_all_topics = []
+        self._popup_all_items = []
         self._invalidate()
 
     def _popup_height(self) -> int:
@@ -922,7 +940,12 @@ class PromptTUI(TUIBase):
         text = self._input_buffer.text
         if self._popup_mode == "topic":
             query = text.lower()
-            filtered = [(t, t) for t in self._popup_all_topics if query in t.lower()]
+            source = self._popup_all_items or [(t, t) for t in self._popup_all_topics]
+            filtered = [
+                (value, label)
+                for value, label in source
+                if query in value.lower() or query in label.lower()
+            ]
             self._popup_items = filtered
             self._popup_idx = min(self._popup_idx, max(0, len(filtered) - 1))
             self._invalidate()

@@ -17,7 +17,7 @@ import os
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -106,6 +106,7 @@ class AgentRunSpec:
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
     llm_timeout_s: float | None = None
+    event_logger: Callable[[str, dict[str, Any]], None] | None = None
 
 
 @dataclass(slots=True)
@@ -127,6 +128,15 @@ class AgentRunner:
 
     def __init__(self, provider: LLMProvider):
         self.provider = provider
+
+    @staticmethod
+    def _log_event(spec: AgentRunSpec, event: str, **fields: Any) -> None:
+        if spec.event_logger is None:
+            return
+        try:
+            spec.event_logger(event, fields)
+        except Exception:
+            return
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
@@ -274,6 +284,12 @@ class AgentRunner:
         injection_cycles = 0
 
         for iteration in range(spec.max_iterations):
+            self._log_event(
+                spec,
+                "runner.iteration.start",
+                iteration=iteration,
+                messages=len(messages),
+            )
             try:
                 # Keep the persisted conversation untouched. Context governance
                 # may repair or compact historical messages for the model, but
@@ -306,6 +322,15 @@ class AgentRunner:
             context.usage = dict(raw_usage)
             context.tool_calls = list(response.tool_calls)
             self._accumulate_usage(usage, raw_usage)
+            self._log_event(
+                spec,
+                "runner.model.response",
+                iteration=iteration,
+                finish_reason=response.finish_reason,
+                should_execute_tools=response.should_execute_tools,
+                tool_calls=[tc.name for tc in response.tool_calls],
+                usage=raw_usage,
+            )
 
             reasoning_text, cleaned_content = extract_reasoning(
                 response.reasoning_content,
@@ -352,6 +377,16 @@ class AgentRunner:
                     workspace_violation_counts,
                 )
                 tool_events.extend(new_events)
+                self._log_event(
+                    spec,
+                    "runner.tools.completed",
+                    iteration=iteration,
+                    events=new_events,
+                    fatal_error=(
+                        f"{type(fatal_error).__name__}: {fatal_error}"
+                        if fatal_error is not None else None
+                    ),
+                )
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
                 await hook.after_execute_tools(context)
@@ -719,6 +754,16 @@ class AgentRunner:
         # LLM timeout here, or healthy long reasoning streams can be killed just
         # because total elapsed time exceeded NANOBOT_LLM_TIMEOUT_S.
         outer_timeout_s = None if (wants_streaming or wants_progress_streaming) else timeout_s
+        self._log_event(
+            spec,
+            "runner.model.request",
+            model=spec.model,
+            messages=len(messages),
+            tools=len(kwargs.get("tools") or []),
+            streaming=wants_streaming,
+            progress_streaming=wants_progress_streaming,
+            timeout_s=outer_timeout_s,
+        )
         try:
             response = (
                 await coro if outer_timeout_s is None
@@ -733,6 +778,12 @@ class AgentRunner:
                     "Tool call did not complete.",
                 )
         except asyncio.TimeoutError:
+            self._log_event(
+                spec,
+                "runner.model.timeout",
+                timeout_s=outer_timeout_s,
+                streaming=wants_streaming or wants_progress_streaming,
+            )
             if outer_timeout_s is None:
                 return LLMResponse(
                     content="Error calling LLM: stream stalled",
@@ -744,6 +795,12 @@ class AgentRunner:
                 finish_reason="error",
                 error_kind="timeout",
             )
+        self._log_event(
+            spec,
+            "runner.model.request.done",
+            finish_reason=response.finish_reason,
+            error_kind=response.error_kind,
+        )
         if progress_state and progress_state.get("reasoning_open"):
             await hook.emit_reasoning_end()
         return response
@@ -790,6 +847,13 @@ class AgentRunner:
         workspace_violation_counts: dict[str, int],
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         batches = self._partition_tool_batches(spec, tool_calls)
+        self._log_event(
+            spec,
+            "runner.tools.start",
+            count=len(tool_calls),
+            batches=[len(batch) for batch in batches],
+            tools=[tc.name for tc in tool_calls],
+        )
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
@@ -833,6 +897,13 @@ class AgentRunner:
             external_lookup_counts,
         )
         if lookup_error:
+            self._log_event(
+                spec,
+                "runner.tool.blocked",
+                tool=tool_call.name,
+                call_id=tool_call.id,
+                reason="repeated external lookup",
+            )
             event = {
                 "name": tool_call.name,
                 "status": "error",
@@ -849,6 +920,13 @@ class AgentRunner:
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
         if prep_error:
+            self._log_event(
+                spec,
+                "runner.tool.prepare_error",
+                tool=tool_call.name,
+                call_id=tool_call.id,
+                error=prep_error,
+            )
             event = {
                 "name": tool_call.name,
                 "status": "error",
@@ -891,6 +969,13 @@ class AgentRunner:
                 ) for file_edit_tracker in file_edit_trackers],
             )
         try:
+            self._log_event(
+                spec,
+                "runner.tool.start",
+                tool=tool_call.name,
+                call_id=tool_call.id,
+                arguments=params,
+            )
             if tool is not None:
                 result = await tool.execute(**params)
             else:
@@ -898,6 +983,14 @@ class AgentRunner:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
+            self._log_event(
+                spec,
+                "runner.tool.exception",
+                tool=tool_call.name,
+                call_id=tool_call.id,
+                exception_type=type(exc).__name__,
+                exception=str(exc),
+            )
             if file_edit_trackers and progress_callback is not None:
                 await invoke_file_edit_progress(
                     progress_callback,
@@ -927,6 +1020,13 @@ class AgentRunner:
             return payload, event, None
 
         if isinstance(result, str) and result.startswith("Error"):
+            self._log_event(
+                spec,
+                "runner.tool.error_result",
+                tool=tool_call.name,
+                call_id=tool_call.id,
+                result=result,
+            )
             if file_edit_trackers and progress_callback is not None:
                 await invoke_file_edit_progress(
                     progress_callback,
@@ -968,6 +1068,13 @@ class AgentRunner:
             detail = "(empty)"
         elif len(detail) > 120:
             detail = detail[:120] + "..."
+        self._log_event(
+            spec,
+            "runner.tool.done",
+            tool=tool_call.name,
+            call_id=tool_call.id,
+            detail=detail,
+        )
         return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
 
     # SSRF is a hard security block at the tool boundary, but the agent turn

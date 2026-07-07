@@ -16,6 +16,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.config.paths import get_webui_dir
+from nanobot.utils.atomic_write import replace_file_with_retry
 
 WEBUI_SIDEBAR_STATE_SCHEMA_VERSION = 1
 _MAX_STATE_FILE_BYTES = 256 * 1024
@@ -180,7 +181,7 @@ def write_webui_sidebar_state(raw: dict[str, Any]) -> dict[str, Any]:
         f.write(b"\n")
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    replace_file_with_retry(tmp, path)
     try:
         dir_fd = os.open(path.parent, os.O_RDONLY)
     except OSError:
