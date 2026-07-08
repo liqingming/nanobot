@@ -1006,14 +1006,19 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
+        run_end_fields: dict[str, Any] = {
+            "session_key": active_session_key,
+            "stop_reason": result.stop_reason,
+            "tools_used": result.tools_used,
+            "usage": result.usage,
+            "final_preview": (result.final_content or "")[:300],
+        }
+        if result.stop_reason in {"error", "tool_error"}:
+            run_end_fields["final_error"] = result.final_content or result.error or ""
         append_session_runtime_log(
             runtime_log_path,
             "agent_loop.run.end",
-            session_key=active_session_key,
-            stop_reason=result.stop_reason,
-            tools_used=result.tools_used,
-            usage=result.usage,
-            final_preview=(result.final_content or "")[:300],
+            **run_end_fields,
         )
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
 
@@ -1531,6 +1536,10 @@ class AgentLoop:
                 meta["_no_content"] = True
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
+        if stop_reason in {"error", "tool_error"}:
+            meta["_error"] = True
+            meta["render_as"] = "error"
+            meta["stop_reason"] = stop_reason
 
         return OutboundMessage(
             channel=msg.channel,

@@ -30,6 +30,20 @@ def compact_value(value: Any, *, max_chars: int = _MAX_FIELD_CHARS) -> Any:
     return value
 
 
+
+_FULL_TEXT_FIELDS = frozenset({"final_error", "error_content", "error_detail", "traceback"})
+
+
+def compact_log_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    compacted: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key in _FULL_TEXT_FIELDS:
+            compacted[key] = compact_value(value, max_chars=20000)
+        else:
+            compacted[key] = compact_value(value)
+    return compacted
+
+
 def exception_fields(exc: BaseException) -> dict[str, str]:
     return {
         "exception_type": type(exc).__name__,
@@ -48,7 +62,7 @@ def append_session_runtime_log(path: Path | None, event_name: str, **fields: Any
         record = {
             "ts": datetime.now().isoformat(timespec="milliseconds"),
             "event": event_name,
-            **compact_value(fields),
+            **compact_log_fields(fields),
         }
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")

@@ -1839,6 +1839,18 @@ def agent(
                                 pass
                             continue
 
+                        if msg.metadata.get("_error"):
+                            try:
+                                tui.pop_stream()
+                                tui.flush_accumulator()
+                            except Exception:
+                                pass
+                            content = msg.content or "nanobot task failed. See this topic's runtime.log for details."
+                            tui.add_response(content, dict(msg.metadata or {}))
+                            if is_processing:
+                                await _turn_complete()
+                            continue
+
                         # Non-streaming response (or unsolicited push from cron etc.)
                         if msg.content:
                             tui.add_response(msg.content, dict(msg.metadata or {}))

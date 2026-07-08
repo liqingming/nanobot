@@ -55,12 +55,19 @@ async def test_llm_error_not_appended_to_session_messages():
     )
 
     provider = MagicMock(spec=LLMProvider)
+    error_content = "429 rate limit exceeded " + "x" * 3000
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
-        content="429 rate limit exceeded", finish_reason="error", tool_calls=[], usage={},
+        content=error_content,
+        finish_reason="error",
+        tool_calls=[],
+        usage={},
+        error_kind="server_error",
+        error_code="server_error",
     ))
     tools = MagicMock()
     tools.get_definitions.return_value = []
 
+    events: list[tuple[str, dict]] = []
     runner = AgentRunner(provider)
     result = await runner.run(AgentRunSpec(
         initial_messages=[{"role": "user", "content": "hello"}],
@@ -68,15 +75,22 @@ async def test_llm_error_not_appended_to_session_messages():
         model="test-model",
         max_iterations=5,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        event_logger=lambda event, fields: events.append((event, fields)),
     ))
 
     assert result.stop_reason == "error"
-    assert result.final_content == "429 rate limit exceeded"
+    assert result.final_content == error_content
     assistant_msgs = [m for m in result.messages if m.get("role") == "assistant"]
     assert all("429" not in (m.get("content") or "") for m in assistant_msgs), \
         "Error content should not appear in session messages"
     assert assistant_msgs[-1]["content"] == _PERSISTED_MODEL_ERROR_PLACEHOLDER
 
+    request_done = [fields for event, fields in events if event == "runner.model.request.done"][-1]
+    response_event = [fields for event, fields in events if event == "runner.model.response"][-1]
+    assert request_done["error_content"] == error_content
+    assert request_done["error_code"] == "server_error"
+    assert response_event["error_content"] == error_content
+    assert response_event["error_kind"] == "server_error"
 
 @pytest.mark.asyncio
 async def test_runner_tool_error_sets_final_content():

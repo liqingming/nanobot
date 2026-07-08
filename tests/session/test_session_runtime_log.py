@@ -32,3 +32,20 @@ def test_append_session_runtime_log_writes_jsonl(tmp_path: Path) -> None:
     assert record["turn_id"] == "cli:topic:1"
     assert record["transition_event"] == "ok"
     assert record["long_text"].endswith("[truncated]")
+
+
+def test_append_session_runtime_log_keeps_error_fields_longer(tmp_path: Path) -> None:
+    log_path = tmp_path / "sessions" / "cli_topic" / "runtime.log"
+    error_text = "server_error:" + "x" * 5000
+
+    append_session_runtime_log(
+        log_path,
+        "agent_loop.run.end",
+        stop_reason="error",
+        final_error=error_text,
+        final_preview=error_text[:300],
+    )
+
+    record = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert record["final_error"] == error_text
+    assert len(record["final_error"]) > 2000

@@ -1444,7 +1444,9 @@ class TextualTUI(TUIBase):
         short "─ HH:MM:SS ─" separator marks the new segment.
         """
         self._activity_phase = "write_response"
-        render_as_text = (metadata or {}).get("render_as") == "text"
+        render_as = (metadata or {}).get("render_as")
+        render_as_text = render_as == "text"
+        render_as_error = render_as == "error"
         if self._header_already_rendered:
             # Continuation of an already-headed turn — mark the new segment
             # with a lightweight timestamp so it isn't glued to the previous one.
@@ -1456,11 +1458,14 @@ class TextualTUI(TUIBase):
                 self._log_write(f"[{self.THEME_MUTED}]─ {short_ts} ─[/{self.THEME_MUTED}]")
                 self._log_write("")
         else:
-            self._log_write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
+            header_style = "red bold" if render_as_error else "cyan"
+            self._log_write(f"[{header_style}]{__logo__} nanobot[/] [dim]{ts}[/dim]")
             self._log_write("")
         self._header_already_rendered = False  # consume flag
         self._suppress_segment_sep = False  # consume flag
-        if self._render_md and not render_as_text and content.strip():
+        if render_as_error:
+            self._log_write(Text(content, style=self.THEME_ERROR))
+        elif self._render_md and not render_as_text and content.strip():
             self._log_write(terminal_markdown(content))
         else:
             self._log_write(Text(content))

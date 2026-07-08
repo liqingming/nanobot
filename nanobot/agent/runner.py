@@ -322,14 +322,20 @@ class AgentRunner:
             context.usage = dict(raw_usage)
             context.tool_calls = list(response.tool_calls)
             self._accumulate_usage(usage, raw_usage)
+            response_log_fields: dict[str, Any] = {
+                "iteration": iteration,
+                "finish_reason": response.finish_reason,
+                "should_execute_tools": response.should_execute_tools,
+                "tool_calls": [tc.name for tc in response.tool_calls],
+                "usage": raw_usage,
+            }
+            if response.finish_reason == "error":
+                response_log_fields["error_content"] = response.content or ""
+                response_log_fields["error_kind"] = response.error_kind
             self._log_event(
                 spec,
                 "runner.model.response",
-                iteration=iteration,
-                finish_reason=response.finish_reason,
-                should_execute_tools=response.should_execute_tools,
-                tool_calls=[tc.name for tc in response.tool_calls],
-                usage=raw_usage,
+                **response_log_fields,
             )
 
             reasoning_text, cleaned_content = extract_reasoning(
@@ -795,11 +801,23 @@ class AgentRunner:
                 finish_reason="error",
                 error_kind="timeout",
             )
+        model_done_fields: dict[str, Any] = {
+            "finish_reason": response.finish_reason,
+            "error_kind": response.error_kind,
+        }
+        if response.finish_reason == "error":
+            model_done_fields.update({
+                "error_content": response.content or "",
+                "error_status_code": response.error_status_code,
+                "error_type": response.error_type,
+                "error_code": response.error_code,
+                "error_retry_after_s": response.error_retry_after_s,
+                "error_should_retry": response.error_should_retry,
+            })
         self._log_event(
             spec,
             "runner.model.request.done",
-            finish_reason=response.finish_reason,
-            error_kind=response.error_kind,
+            **model_done_fields,
         )
         if progress_state and progress_state.get("reasoning_open"):
             await hook.emit_reasoning_end()

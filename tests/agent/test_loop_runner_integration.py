@@ -173,6 +173,9 @@ async def test_streamed_flag_not_set_on_llm_error(tmp_path):
     assert "503" in result.content
     assert not result.metadata.get("_streamed"), \
         "_streamed must not be set when stop_reason is error"
+    assert result.metadata.get("_error") is True
+    assert result.metadata.get("render_as") == "error"
+    assert result.metadata.get("stop_reason") == "error"
 
 
 @pytest.mark.asyncio

@@ -427,12 +427,17 @@ class PromptTUI(TUIBase):
 
     def _render_response(self, content: str, metadata: dict | None = None, ts: str | None = None) -> str:
         ts = ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        render_as_text = (metadata or {}).get("render_as") == "text"
+        render_as = (metadata or {}).get("render_as")
+        render_as_text = render_as == "text"
+        render_as_error = render_as == "error"
 
         def _fn(c: Console) -> None:
             c.print()
-            c.print(f"[cyan]{__logo__} nanobot[/cyan] [dim]{ts}[/dim]")
-            if self._render_md and not render_as_text and content.strip():
+            header_style = "red bold" if render_as_error else "cyan"
+            c.print(f"[{header_style}]{__logo__} nanobot[/] [dim]{ts}[/dim]")
+            if render_as_error:
+                c.print(Text(content, style="red"))
+            elif self._render_md and not render_as_text and content.strip():
                 c.print(terminal_markdown(content))
             else:
                 c.print(Text(content))
