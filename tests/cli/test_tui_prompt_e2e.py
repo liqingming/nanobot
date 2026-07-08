@@ -244,3 +244,19 @@ def test_pagedown_clamps_at_zero(prompt_tui: PromptTUI) -> None:
     prompt_tui._scroll_offset = 5
     prompt_tui._handle_pagedown_key()
     assert prompt_tui._scroll_offset == 0
+
+
+def test_stream_delta_preserves_manual_scroll_offset(prompt_tui: PromptTUI) -> None:
+    prompt_tui._scroll_offset = 7
+    prompt_tui.stream_delta("hello")
+    assert prompt_tui._scroll_offset == 7
+
+
+def test_flush_stream_preserves_manual_scroll_offset(prompt_tui: PromptTUI) -> None:
+    prompt_tui._stream_ts = "2026-07-08 12:00:00"
+    prompt_tui._stream_buf = "hello"
+    prompt_tui._scroll_offset = 7
+
+    prompt_tui.flush_stream()
+
+    assert prompt_tui._scroll_offset == 7

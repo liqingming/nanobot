@@ -869,3 +869,49 @@ async def test_normal_submit_does_not_pollute_history_for_slash_text() -> None:
         # SUBMIT was the action (no popup match), but /xyz starts with / → skip history
         assert tui._history == history_before
         assert submitted == ["/xyz"]
+
+
+@pytest.mark.asyncio
+async def test_output_write_preserves_manual_scroll_position() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        out = app.query_one("#output")
+        for i in range(80):
+            out.write(f"history {i}")
+        out.scroll_end(animate=False)
+        await pilot.pause()
+        assert out.scroll_offset.y == out.max_scroll_y
+
+        out.scroll_to(y=max(0, out.max_scroll_y - 10), animate=False)
+        await pilot.pause()
+        manual_y = out.scroll_offset.y
+        assert manual_y < out.max_scroll_y
+
+        out.write("new streamed line")
+        await pilot.pause()
+
+        assert out.scroll_offset.y == manual_y
+
+
+@pytest.mark.asyncio
+async def test_output_write_follows_when_already_at_bottom() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        out = app.query_one("#output")
+        for i in range(80):
+            out.write(f"history {i}")
+        out.scroll_end(animate=False)
+        await pilot.pause()
+
+        out.write("new streamed line")
+        await pilot.pause()
+
+        assert out.scroll_offset.y == out.max_scroll_y

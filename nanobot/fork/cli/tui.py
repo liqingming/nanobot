@@ -768,8 +768,15 @@ class PromptTUI(TUIBase):
 
     # ── Scroll helpers ─────────────────────────────────────────────────────
 
+    def _is_following_bottom(self) -> bool:
+        return self._scroll_offset <= 0
+
     def _pin_to_bottom(self) -> None:
         self._scroll_offset = 0
+
+    def _pin_to_bottom_if_following(self, following: bool) -> None:
+        if following:
+            self._pin_to_bottom()
 
     def _invalidate(self) -> None:
         if self._app is not None:
@@ -1046,9 +1053,10 @@ class PromptTUI(TUIBase):
         if not self._reasoning_buf.strip():
             self._reasoning_buf = ""
             return
+        following = self._is_following_bottom()
         self._append_block(self._render_reasoning_block(self._reasoning_buf))
         self._reasoning_buf = ""
-        self._pin_to_bottom()
+        self._pin_to_bottom_if_following(following)
         self._invalidate()
 
     def _render_reasoning_block(self, buf: str) -> str:
@@ -1063,12 +1071,13 @@ class PromptTUI(TUIBase):
 
     def add_progress(self, text: str) -> None:
         """Show the current tool being executed (with rotation animation)."""
+        following = self._is_following_bottom()
         self._tool_hint = text
         self._stream_cache = self._render_tool_executing()
         if self._tool_task is None:
             self._tool_frame = 0
             self._tool_task = asyncio.ensure_future(self._animate_tool_executing())
-        self._pin_to_bottom()
+        self._pin_to_bottom_if_following(following)
         self._invalidate()
 
     def add_system(self, text: str) -> None:
@@ -1093,6 +1102,7 @@ class PromptTUI(TUIBase):
 
     def tool_phase_start(self) -> None:
         """Switch to tool-execution phase: stop thinking animation, start tool rotation."""
+        following = self._is_following_bottom()
         # No flush_reasoning here — same rationale as stream_delta. If the LLM
         # is still emitting reasoning while tools run, let it accumulate and
         # flush on _reasoning_end / pop_stream.
@@ -1107,12 +1117,13 @@ class PromptTUI(TUIBase):
             self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_cache = self._render_tool_executing()
         self._stream_cache_key = 0
-        self._pin_to_bottom()
+        self._pin_to_bottom_if_following(following)
         self._invalidate()
         self._tool_task = asyncio.ensure_future(self._animate_tool_executing())
 
     def stream_delta(self, delta: str) -> None:
         """Append a streaming delta and refresh the output pane."""
+        following = self._is_following_bottom()
         # Do NOT flush reasoning here — reasoning models interleave
         # reasoning_delta with content_delta; flushing mid-stream injects a
         # history block on every content chunk, disrupting the live render.
@@ -1124,11 +1135,12 @@ class PromptTUI(TUIBase):
         if key != self._stream_cache_key:
             self._stream_cache = self._render_stream_snapshot()
             self._stream_cache_key = key
-        self._pin_to_bottom()
+        self._pin_to_bottom_if_following(following)
         self._invalidate()
 
     def flush_stream(self, metadata: dict | None = None) -> None:
         """Finalize the current stream: render to history and clear buffer."""
+        following = self._is_following_bottom()
         self._cancel_thinking()
         self._cancel_tool_task()
         if self._stream_buf.strip():
@@ -1139,7 +1151,7 @@ class PromptTUI(TUIBase):
         self._stream_cache = ""
         self._stream_cache_key = 0
         # _stream_ts intentionally kept so live area stays visible for tool phase
-        self._pin_to_bottom()
+        self._pin_to_bottom_if_following(following)
         self._invalidate()
 
     def pop_stream(self) -> str:

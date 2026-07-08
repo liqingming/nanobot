@@ -149,14 +149,29 @@ if _TEXTUAL_AVAILABLE:
 
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
+            if hasattr(self, "auto_scroll"):
+                self.auto_scroll = False
             self._sel_start: tuple[int, int] | None = None  # content-space row, cell column
             self._sel_end: tuple[int, int] | None = None
             self._selecting: bool = False
             self._sel_moved: bool = False  # True once mouse moves during drag
             self._user_ranges: list[tuple[int, int]] = []  # gray-bg row ranges
 
-        # ── selection helpers ──────────────────────────────────────────────
+        def is_at_bottom(self, threshold: int = 0) -> bool:
+            """Return True when the viewport is at, or very near, the newest line."""
+            try:
+                return self.scroll_offset.y >= max(0, self.max_scroll_y - threshold)
+            except Exception:
+                return True
 
+        def write(self, *args: Any, follow: bool | None = None, **kwargs: Any) -> Any:
+            should_follow = self.is_at_bottom() if follow is None else follow
+            result = super().write(*args, **kwargs)
+            if should_follow:
+                self.scroll_end(animate=False)
+            return result
+
+        # ── selection helpers ──────────────────────────────────────────────
         def _selection_points(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
             if self._sel_start is None or self._sel_end is None:
                 return None
@@ -1789,7 +1804,8 @@ class TextualTUI(TUIBase):
             # viewport "not at bottom". stream_delta only renders live when
             # sc_y >= mx_y, so without this the response stops streaming and
             # only appears in one shot at flush_stream/add_response.
-            out.scroll_end(animate=False)
+            if out.is_at_bottom():
+                out.scroll_end(animate=False)
         except Exception:
             pass
 

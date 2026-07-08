@@ -88,7 +88,7 @@ app = typer.Typer(
     name="nanobot",
     context_settings={"help_option_names": ["-h", "--help"]},
     help=f"{__logo__} nanobot - Personal AI Assistant",
-    no_args_is_help=True,
+    no_args_is_help=False,
 )
 
 console = Console()
@@ -465,15 +465,25 @@ def version_callback(value: bool):
         raise typer.Exit()
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
     version: bool = typer.Option(
         None, "--version", "-v", callback=version_callback, is_eager=True
     ),
 ):
     """nanobot - Personal AI Assistant."""
-    pass
-
+    if ctx.invoked_subcommand is not None:
+        return
+    agent(
+        message=None,
+        session_id="cli:direct",
+        workspace=None,
+        config=None,
+        markdown=True,
+        logs=False,
+    )
+    raise typer.Exit()
 
 # ============================================================================
 # Onboard / Setup

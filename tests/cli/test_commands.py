@@ -1848,3 +1848,40 @@ def test_channels_login_requires_channel_name() -> None:
     result = runner.invoke(app, ["channels", "login"])
 
     assert result.exit_code == 2
+
+
+def test_root_help_still_shows_help_and_does_not_start_agent(monkeypatch):
+    called = False
+
+    def fake_agent(**_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("nanobot.cli.commands.agent", fake_agent)
+
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "Usage" in _strip_ansi(result.stdout)
+    assert called is False
+
+
+def test_root_without_args_starts_agent_with_defaults(monkeypatch):
+    called = {}
+
+    def fake_agent(**kwargs):
+        called.update(kwargs)
+
+    monkeypatch.setattr("nanobot.cli.commands.agent", fake_agent)
+
+    result = runner.invoke(app, [])
+
+    assert result.exit_code == 0
+    assert called == {
+        "message": None,
+        "session_id": "cli:direct",
+        "workspace": None,
+        "config": None,
+        "markdown": True,
+        "logs": False,
+    }
