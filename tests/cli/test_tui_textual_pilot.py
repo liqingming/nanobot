@@ -33,6 +33,58 @@ async def _press_text(pilot, text: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_argument_command_selection_enters_edit_mode_without_submit() -> None:
+    tui = TextualTUI()
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_commands([("/model", "Switch model preset", "edit")])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _press_text(pilot, "/mo")
+        await pilot.pause()
+        assert tui._popup_mode == "command"
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        inp = app.query_one("#input")
+        assert inp.value == "/model "
+        assert submitted == []
+        assert tui._popup_mode == "hidden"
+
+
+@pytest.mark.asyncio
+async def test_submit_command_selection_still_submits_immediately() -> None:
+    tui = TextualTUI()
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_commands([("/status", "Show status", "submit")])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _press_text(pilot, "/sta")
+        await pilot.pause()
+        assert tui._popup_mode == "command"
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert submitted == ["/status"]
+        assert tui._popup_mode == "hidden"
+
+
+@pytest.mark.asyncio
 async def test_new_topic_full_flow_routes_to_topic_callback() -> None:
     """End-to-end: /new + Enter + name + Enter → topic callback, not on_submit."""
     tui = TextualTUI()
@@ -915,3 +967,102 @@ async def test_output_write_follows_when_already_at_bottom() -> None:
         await pilot.pause()
 
         assert out.scroll_offset.y == out.max_scroll_y
+
+
+def _output_log_text(out) -> str:
+    parts: list[str] = []
+    for line in out.lines:
+        for segment in getattr(line, "_segments", []):
+            parts.append(segment[0])
+        parts.append("\n")
+    return "".join(parts)
+
+
+@pytest.mark.asyncio
+async def test_welcome_shows_reasoning_effort() -> None:
+    tui = TextualTUI(model="gpt-5.5", reasoning_effort="high")
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        out = app.query_one("#output")
+
+        text = _output_log_text(out)
+        assert "gpt-5.5" in text
+        assert "reasoning: high" in text
+
+
+@pytest.mark.asyncio
+async def test_stream_delta_renders_after_debounce() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        out = app.query_one("#output")
+        tui.stream_start()
+        await pilot.pause()
+
+        tui.stream_delta("debounced hello")
+        await pilot.pause(0.02)
+        assert "debounced hello" not in _output_log_text(out)
+
+        await pilot.pause(0.12)
+        assert "debounced hello" in _output_log_text(out)
+
+
+@pytest.mark.asyncio
+async def test_stream_start_follows_latest_when_user_sends_from_history_position() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        out = app.query_one("#output")
+        for i in range(80):
+            out.write(f"history {i}")
+        tui.stream_start()
+        await pilot.pause()
+        out.scroll_to(y=max(0, out.max_scroll_y - 10), animate=False)
+        out.mark_user_scroll()
+        await pilot.pause()
+        manual_y = out.scroll_offset.y
+        assert manual_y < out.max_scroll_y
+
+        tui.stream_start()
+        await pilot.pause()
+        assert out.scroll_offset.y == out.max_scroll_y
+
+        tui.stream_delta("fresh reply")
+        await pilot.pause(0.12)
+
+        assert "fresh reply" in _output_log_text(out)
+        assert out.scroll_offset.y == out.max_scroll_y
+
+
+@pytest.mark.asyncio
+async def test_stream_delta_debounce_respects_manual_scroll_window() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        out = app.query_one("#output")
+        for i in range(80):
+            out.write(f"history {i}")
+        tui.stream_start()
+        await pilot.pause()
+        out.scroll_to(y=max(0, out.max_scroll_y - 10), animate=False)
+        out.mark_user_scroll()
+        await pilot.pause()
+        manual_y = out.scroll_offset.y
+
+        tui.stream_delta("hidden while scrolling")
+        await pilot.pause(0.12)
+
+        assert out.scroll_offset.y == manual_y
+        assert "hidden while scrolling" not in _output_log_text(out)

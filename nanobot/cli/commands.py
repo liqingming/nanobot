@@ -51,6 +51,7 @@ from nanobot.cli.markdown import terminal_markdown
 
 from nanobot import __logo__, __version__
 from nanobot.agent.loop import AgentLoop
+from nanobot.command.builtin import BUILTIN_COMMAND_SPECS
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -626,12 +627,42 @@ def _onboard_plugins(config_path: Path) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _model_display(config: Config) -> tuple[str, str]:
-    """Return (resolved_model_name, preset_tag) for display strings."""
+def _model_display(config: Config) -> tuple[str, str, str | None]:
+    """Return (resolved_model_name, preset_tag, reasoning_effort) for display strings."""
     resolved = config.resolve_preset()
     name = config.agents.defaults.model_preset
     tag = f" (preset: {name})" if name else ""
-    return resolved.model, tag
+    return resolved.model, tag, resolved.reasoning_effort
+
+
+def _todos_all_completed(todos: list[dict[str, Any]]) -> bool:
+    return bool(todos) and all(t.get("status") == "completed" for t in todos)
+
+
+def _should_hide_stale_todos_on_new_turn(todos: list[dict[str, Any]]) -> bool:
+    return bool(todos) and not _todos_all_completed(todos)
+
+
+def _tui_command_palette() -> list[tuple[str, str, str]]:
+    items = [
+        (spec.command, spec.description, "edit" if spec.arg_hint else "submit")
+        for spec in BUILTIN_COMMAND_SPECS
+    ]
+    items.extend([
+        ("/resume", "Switch or resume a CLI topic.", "submit"),
+        ("/todos", "Show or clear the current topic todo list.", "submit"),
+        ("/continue", "Continue the last interrupted task.", "submit"),
+        ("/commit_memory", "Promote or preview pending memory consolidation.", "submit"),
+        ("/exit", "Exit nanobot.", "submit"),
+    ])
+    seen: set[str] = set()
+    deduped: list[tuple[str, str, str]] = []
+    for command, description, action in items:
+        if command in seen:
+            continue
+        seen.add(command)
+        deduped.append((command, description, action))
+    return deduped
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -740,10 +771,12 @@ def serve(
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1) from exc
 
-    model_name, preset_tag = _model_display(runtime_config)
+    model_name, preset_tag, reasoning_effort = _model_display(runtime_config)
     console.print(f"{__logo__} Starting OpenAI-compatible API server")
     console.print(f"  [cyan]Endpoint[/cyan] : http://{host}:{port}/v1/chat/completions")
     console.print(f"  [cyan]Model[/cyan]    : {model_name}{preset_tag}")
+    if reasoning_effort:
+        console.print(f"  [cyan]Reasoning[/cyan]: {reasoning_effort}")
     console.print("  [cyan]Session[/cyan]  : api:default")
     console.print(f"  [cyan]Timeout[/cyan]  : {timeout}s")
     if host in {"0.0.0.0", "::"}:
@@ -1335,7 +1368,8 @@ def agent(
             tui = create_tui(
                 render_markdown=markdown,
                 history_file=history_file,
-                model=config.agents.defaults.model,
+                model=agent_loop.model,
+                reasoning_effort=getattr(agent_loop.provider.generation, "reasoning_effort", None),
                 backend=config.agents.defaults.tui_backend,
                 workspace=agent_loop.workspace,
             )
@@ -1390,15 +1424,7 @@ def agent(
                     agent_loop.warmup_caches(f"{cli_channel}:{name}")
                 )
 
-            tui.set_commands([
-                ("/new", "新建话题"),
-                ("/resume", "切换/恢复话题"),
-                ("/skills", "List available skills"),
-                ("/todos", "查看当前话题的 todo 列表"),
-                ("/continue", "继续上次因达到 iteration 上限中断的任务"),
-                ("/commit_memory", "把 pending consolidation 写入 MEMORY.md"),
-                ("/exit", "退出 nanobot"),
-            ])
+            tui.set_commands(_tui_command_palette())
 
             def _topic_popup_items(session_infos: list[dict[str, Any]]) -> list[tuple[str, str]]:
                 items: list[tuple[str, str]] = []
@@ -1447,6 +1473,7 @@ def agent(
             pending_queue: list[str] = []
             _pre_submitted: list[bool] = [False]
             _turn_cancelled: list[bool] = [False]
+            _todo_bar_waiting_for_new_plan: list[bool] = [False]
 
             # Override signals so Ctrl+C / SIGTERM cleanly exit the TUI
             def _tui_signal(signum, frame):  # noqa: ARG001
@@ -1493,17 +1520,22 @@ def agent(
                 is_processing = True
                 tui.set_is_processing(True)
                 _set_activity_phase("prepare_turn")
-                # If the previous task finished and all todos are completed,
-                # auto-clear them so the bar resets for the new task rather
-                # than carrying a stale "✓ all N done" badge across turns.
+                # Hide stale todos at the start of a fresh user turn. Keep the
+                # persisted list intact so the model still sees prior context;
+                # TodoWriteTool will make the bar visible again when it publishes
+                # a new plan for this turn.
+                _todo_bar_waiting_for_new_plan[0] = False
                 try:
                     s = agent_loop.sessions.get_or_create(
                         f"{cli_channel}:{topic_state['chat_id']}"
                     )
-                    if s.todos and all(t.get("status") == "completed" for t in s.todos):
+                    if _todos_all_completed(s.todos):
                         s.todos = []
                         agent_loop.sessions.save(s)
                         tui.set_todos([])
+                    elif _should_hide_stale_todos_on_new_turn(s.todos):
+                        tui.set_todos([])
+                        _todo_bar_waiting_for_new_plan[0] = True
                 except Exception:
                     pass
                 if _pre_submitted[0]:
@@ -1541,11 +1573,13 @@ def agent(
                         + usage.get("cache_read_input_tokens", 0)
                     )
                     tui.update_context_usage(ctx_used, agent_loop.context_window_tokens)
-                # Refresh the todo bar (diff messages are pushed live by TodoWriteTool
-                # via the bus, not aggregated here).
+                # Refresh the todo bar unless this turn never produced a fresh
+                # TodoWrite update. In that case keep the old plan hidden so a
+                # stale in-progress badge does not reappear above the input.
                 try:
                     s = agent_loop.sessions.get_or_create(f"{cli_channel}:{topic_state['chat_id']}")
-                    tui.set_todos(s.todos)
+                    if not _todo_bar_waiting_for_new_plan[0]:
+                        tui.set_todos(s.todos)
                 except Exception:
                     pass
                 if pending_queue:
@@ -1558,6 +1592,7 @@ def agent(
                 new_key = f"{cli_channel}:{name}"
                 if old_key != new_key:
                     agent_loop.clear_session_learning(old_key)
+                _todo_bar_waiting_for_new_plan[0] = False
                 topic_state["chat_id"] = name
                 tui.reset_history()
                 _load_topic(name)
@@ -1638,6 +1673,7 @@ def agent(
                     if arg == "clear":
                         s.todos = []
                         agent_loop.sessions.save(s)
+                        _todo_bar_waiting_for_new_plan[0] = False
                         tui.set_todos([])
                         tui.add_system("已清空当前话题的 todo 列表。")
                         return
@@ -1797,6 +1833,7 @@ def agent(
                                 s = agent_loop.sessions.get_or_create(
                                     f"{cli_channel}:{topic_state['chat_id']}"
                                 )
+                                _todo_bar_waiting_for_new_plan[0] = False
                                 tui.set_todos(s.todos)
                             except Exception:
                                 pass
@@ -1979,8 +2016,10 @@ def status():
     if config_path.exists():
         from nanobot.providers.registry import PROVIDERS
 
-        _model, _preset_tag = _model_display(config)
+        _model, _preset_tag, _reasoning_effort = _model_display(config)
         console.print(f"Model: {_model}{_preset_tag}")
+        if _reasoning_effort:
+            console.print(f"Reasoning: {_reasoning_effort}")
 
         # Check API keys from registry
         for spec in PROVIDERS:

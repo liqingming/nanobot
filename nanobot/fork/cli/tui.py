@@ -308,9 +308,11 @@ class PromptTUI(TUIBase):
         render_markdown: bool = True,
         history_file: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._render_md = render_markdown
         self._model = model
+        self._reasoning_effort = reasoning_effort
         self._output_lines: list[str] = []   # completed ANSI blocks
         # Fork(perf): cache of "".join(_output_lines), keyed by list length. Every
         # _invalidate/redraw (and each stream delta) called _get_output_text which
@@ -348,6 +350,7 @@ class PromptTUI(TUIBase):
         self._new_topic_cb: Callable[[str], Awaitable[None]] | None = None
         # Command / topic popup state
         self._all_commands: list[tuple[str, str]] = []
+        self._command_edit_values: set[str] = set()
         self._popup_mode: str = "hidden"    # "hidden" | "command" | "topic"
         self._popup_items: list[tuple[str, str]] = []   # (value, label) visible items
         self._popup_idx: int = 0
@@ -462,7 +465,8 @@ class PromptTUI(TUIBase):
         def _fn(c: Console) -> None:
             c.print()
             model_str = f"  [dim]{self._model}[/dim]" if self._model else ""
-            c.print(f"  [cyan bold]{__logo__} nanobot[/cyan bold]  [dim]v{__version__}[/dim]{model_str}")
+            effort_str = f"  [dim]reasoning: {self._reasoning_effort}[/dim]" if self._reasoning_effort else ""
+            c.print(f"  [cyan bold]{__logo__} nanobot[/cyan bold]  [dim]v{__version__}[/dim]{model_str}{effort_str}")
             c.print()
             c.print(f"  [dim]{rule}[/dim]")
             c.print()
@@ -819,6 +823,11 @@ class PromptTUI(TUIBase):
             return
         if action == EnterAction.COMMAND_SUBMIT:
             self.hide_popup()
+            if value in self._command_edit_values:
+                editable = value + " "
+                self._input_buffer.set_document(Document(editable, len(editable)))
+                self._update_popup()
+                return
             # Save the full command (not the partial typed text) to history
             self._input_buffer.set_document(Document(value, len(value)))
             self._input_buffer.reset(append_to_history=False)
@@ -897,9 +906,18 @@ class PromptTUI(TUIBase):
         self._input_buffer.reset()
         self._invalidate()
 
-    def set_commands(self, commands: list[tuple[str, str]]) -> None:
+    def set_commands(self, commands: list[tuple[str, str] | tuple[str, str, str]]) -> None:
         """Register available commands for the popup completion menu."""
-        self._all_commands = commands
+        normalized: list[tuple[str, str]] = []
+        edit_values: set[str] = set()
+        for item in commands:
+            command, description = item[0], item[1]
+            action = item[2] if len(item) > 2 else "submit"
+            normalized.append((command, description))
+            if action == "edit":
+                edit_values.add(command)
+        self._all_commands = normalized
+        self._command_edit_values = edit_values
 
     def show_topic_popup(
         self,

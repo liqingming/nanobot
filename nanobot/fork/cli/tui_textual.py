@@ -164,6 +164,14 @@ if _TEXTUAL_AVAILABLE:
             except Exception:
                 return True
 
+        def mark_user_scroll(self) -> None:
+            """Compatibility hook for tests and callers that track manual scrolling."""
+            return None
+
+        def user_is_scrolling(self) -> bool:
+            """Return True when the viewport is intentionally away from the bottom."""
+            return not self.is_at_bottom()
+
         def write(self, *args: Any, follow: bool | None = None, **kwargs: Any) -> Any:
             should_follow = self.is_at_bottom() if follow is None else follow
             result = super().write(*args, **kwargs)
@@ -926,7 +934,8 @@ if _TEXTUAL_AVAILABLE:
             out = self.query_one("#output", _OutputLog)
             tui = self._tui
             out.write(f"[cyan bold]{__logo__} nanobot[/cyan bold]  [dim]v{__version__}[/dim]"
-                      + (f"  [dim]{tui._model}[/dim]" if tui._model else ""))
+                      + (f"  [dim]{tui._model}[/dim]" if tui._model else "")
+                      + (f"  [dim]reasoning: {tui._reasoning_effort}[/dim]" if tui._reasoning_effort else ""))
             out.write("")
             out.write("[bold]快捷键[/bold]")
             out.write("  [cyan]PageUp / PageDown[/cyan]   滚动历史记录")
@@ -975,6 +984,11 @@ if _TEXTUAL_AVAILABLE:
                 return
             if action == EnterAction.COMMAND_SUBMIT:
                 tui.hide_popup()
+                if value in tui._command_edit_values:
+                    input_widget.value = value + " "
+                    input_widget.move_cursor(input_widget._offset_to_location(len(input_widget.value)))
+                    tui._on_input_changed(input_widget.value)
+                    return
                 # Commands must NOT echo to output (no add_user_echo / pre_submit)
                 # and must NOT be saved to input history.
                 if tui._on_submit:
@@ -1279,6 +1293,7 @@ class TextualTUI(TUIBase):
         render_markdown: bool = True,
         history_file: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         workspace: str | Path | None = None,
     ) -> None:
         if not _TEXTUAL_AVAILABLE:
@@ -1289,6 +1304,7 @@ class TextualTUI(TUIBase):
         self._render_md = render_markdown
         self._history_file = Path(history_file) if history_file else None
         self._model = model
+        self._reasoning_effort = reasoning_effort
         self._workspace_label = _compact_path_label(str(workspace or Path.cwd()))
 
         # Input history
@@ -1324,6 +1340,7 @@ class TextualTUI(TUIBase):
         self._tool_placeholder_line_backup: int | None = None
         self._turn_start_time: float = 0.0  # monotonic timestamp when the current LLM turn started (stream_start)
         self._tool_start_time: float = 0.0  # monotonic timestamp when the current tool started (add_progress)
+        self._stream_render_task: Any = None  # debounce task for live stream rendering
         # State for show_question_popup (sequential multi-question prompt)
         self._question_queue: list[dict] = []
         self._question_answers: dict[str, str] = {}
@@ -1345,6 +1362,7 @@ class TextualTUI(TUIBase):
 
         # Popup state
         self._all_commands: list[tuple[str, str]] = []
+        self._command_edit_values: set[str] = set()
         self._popup_mode: str = "hidden"
         self._popup_items: list[tuple[str, str]] = []
         self._popup_idx: int = 0
@@ -2076,6 +2094,7 @@ class TextualTUI(TUIBase):
             # Match the idle thinking style — _tick will overwrite this with
             # the same format on each frame anyway.
             out.write(Text("  ⠋ 思考中...", style="grey50"))
+            out.scroll_end(animate=False)
         except Exception:
             self._stream_header_line = 0
             self._tool_placeholder_line = 0
@@ -2196,6 +2215,42 @@ class TextualTUI(TUIBase):
         except RuntimeError:
             self._idle_thinking_task = None
 
+    def _cancel_stream_render(self) -> None:
+        task = self._stream_render_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._stream_render_task = None
+
+    def _render_stream_live(self) -> None:
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            if out.user_is_scrolling() and not out.is_at_bottom():
+                return
+            if not out.is_at_bottom():
+                return
+            out.truncate_to(self._tool_placeholder_line)
+            out.write(Text(self._stream_buf))
+        except Exception:
+            pass
+
+    def _schedule_stream_render(self, delay: float = 0.075) -> None:
+        task = self._stream_render_task
+        if task is not None and not task.done():
+            return
+
+        async def _wait_then_render() -> None:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            self._stream_render_task = None
+            self._app._safe_call(self._render_stream_live)
+
+        try:
+            self._stream_render_task = asyncio.ensure_future(_wait_then_render())
+        except RuntimeError:
+            self._stream_render_task = None
+
     def stream_delta(self, delta: str) -> None:
         self._activity_phase = "stream_delta"
         self._cancel_idle_thinking()
@@ -2208,18 +2263,7 @@ class TextualTUI(TUIBase):
         if self._tool_hint:
             self._petrify_tool_placeholder()
         self._stream_buf += delta
-        try:
-            out = self._app.query_one("#output", _OutputLog)
-            sc_y = out.scroll_offset.y
-            mx_y = out.max_scroll_y
-            # Only update in-place when the user is at the bottom.  If they have
-            # scrolled up, skip the truncate so we don't clobber their viewport;
-            # flush_stream will write the final content when streaming completes.
-            if sc_y >= mx_y:
-                out.truncate_to(self._tool_placeholder_line)
-                out.write(Text(self._stream_buf))
-        except Exception:
-            pass
+        self._schedule_stream_render()
         # If no further delta arrives in the next 500ms, show a "still thinking"
         # spinner in #live so the user sees feedback during LLM reasoning gaps.
         self._schedule_idle_thinking()
@@ -2227,6 +2271,7 @@ class TextualTUI(TUIBase):
     def flush_stream(self, metadata: dict | None = None) -> None:
         self._activity_phase = "flush_stream"
         self._cancel_idle_thinking()
+        self._cancel_stream_render()
         self._app.stop_thinking_spinner()
         self._app.stop_spinner()
         self._app.clear_live()
@@ -2266,6 +2311,7 @@ class TextualTUI(TUIBase):
 
     def pop_stream(self) -> str:
         self._cancel_idle_thinking()
+        self._cancel_stream_render()
         self._app.stop_thinking_spinner()
         self._app.stop_spinner()
         buf = self._stream_buf
@@ -2398,8 +2444,17 @@ class TextualTUI(TUIBase):
         self._app.set_input_placeholder(placeholder)
         self._app.set_input_value("")
 
-    def set_commands(self, commands: list[tuple[str, str]]) -> None:
-        self._all_commands = commands
+    def set_commands(self, commands: list[tuple[str, str] | tuple[str, str, str]]) -> None:
+        normalized: list[tuple[str, str]] = []
+        edit_values: set[str] = set()
+        for item in commands:
+            command, description = item[0], item[1]
+            action = item[2] if len(item) > 2 else "submit"
+            normalized.append((command, description))
+            if action == "edit":
+                edit_values.add(command)
+        self._all_commands = normalized
+        self._command_edit_values = edit_values
 
     def show_topic_popup(
         self,

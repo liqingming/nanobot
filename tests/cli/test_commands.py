@@ -15,6 +15,9 @@ from nanobot.cli.commands import (
     _format_skills_command,
     _format_topic_cache_size,
     _format_topic_popup_label,
+    _should_hide_stale_todos_on_new_turn,
+    _todos_all_completed,
+    _tui_command_palette,
     _topic_cache_size_bytes,
 )
 from nanobot.config.paths import get_workspace_cache_dir
@@ -402,6 +405,50 @@ def test_config_explicit_ollama_provider_uses_default_localhost_api_base():
 
     assert config.get_provider_name() == "ollama"
     assert config.get_api_base() == "http://localhost:11434/v1"
+
+
+def test_tui_command_palette_includes_all_builtin_commands():
+    from nanobot.command.builtin import BUILTIN_COMMAND_SPECS
+
+    commands = {item[0] for item in _tui_command_palette()}
+
+    assert {spec.command for spec in BUILTIN_COMMAND_SPECS} <= commands
+
+
+def test_tui_command_palette_includes_cli_local_commands():
+    commands = {item[0] for item in _tui_command_palette()}
+
+    assert {"/resume", "/todos", "/continue", "/commit_memory", "/exit"} <= commands
+
+
+def test_tui_command_palette_marks_argument_commands_for_edit():
+    actions = {command: action for command, _description, action in _tui_command_palette()}
+
+    assert actions["/model"] == "edit"
+    assert actions["/history"] == "edit"
+    assert actions["/goal"] == "edit"
+    assert actions["/pairing"] == "edit"
+    assert actions["/dream-log"] == "edit"
+    assert actions["/dream-restore"] == "edit"
+    assert actions["/status"] == "submit"
+
+
+def test_should_hide_stale_todos_on_new_turn_for_unfinished_plan():
+    todos = [
+        {"content": "old active", "status": "in_progress"},
+        {"content": "old pending", "status": "pending"},
+    ]
+
+    assert _should_hide_stale_todos_on_new_turn(todos) is True
+
+
+def test_should_not_hide_stale_todos_when_all_completed():
+    todos = [
+        {"content": "done", "status": "completed"},
+    ]
+
+    assert _todos_all_completed(todos) is True
+    assert _should_hide_stale_todos_on_new_turn(todos) is False
 
 
 def test_config_accepts_camel_case_explicit_provider_name_for_coding_plan():

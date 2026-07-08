@@ -7,7 +7,7 @@ Selection order:
 Usage::
 
     from nanobot.fork.cli.tui_factory import create_tui
-    tui = create_tui(render_markdown=True, history_file=..., model=..., workspace=...)
+    tui = create_tui(render_markdown=True, history_file=..., model=..., reasoning_effort=..., workspace=...)
     await tui.run_async()
 """
 from __future__ import annotations
@@ -25,6 +25,7 @@ def create_tui(
     render_markdown: bool = True,
     history_file: str | None = None,
     model: str | None = None,
+    reasoning_effort: str | None = None,
     backend: str = "textual",
     workspace: str | os.PathLike[str] | None = None,
 ) -> "TUIBase":
@@ -37,6 +38,7 @@ def create_tui(
             render_markdown=render_markdown,
             history_file=history_file,
             model=model,
+            reasoning_effort=reasoning_effort,
             workspace=workspace,
         )
 
@@ -46,4 +48,5 @@ def create_tui(
         render_markdown=render_markdown,
         history_file=history_file,
         model=model,
+        reasoning_effort=reasoning_effort,
     )

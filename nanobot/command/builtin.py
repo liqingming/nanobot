@@ -97,12 +97,14 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "Show Dream log",
         "Show what the last Dream consolidation changed.",
         "book-open",
+        "[sha]",
     ),
     BuiltinCommandSpec(
         "/dream-restore",
         "Restore memory",
         "Revert memory to a previous Dream snapshot.",
         "undo-2",
+        "[sha]",
     ),
     BuiltinCommandSpec(
         "/help",
