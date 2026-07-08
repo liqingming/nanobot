@@ -304,3 +304,52 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
     args = mgr._announce_result.await_args.args
     assert args[3] == "Task completed but no final response was generated."
     assert args[5] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_auto_recovers_transient_model_error(tmp_path):
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    error_response = LLMResponse(
+        content="503 server error from model",
+        finish_reason="error",
+        tool_calls=[],
+        usage={},
+    )
+    provider.chat_with_retry = AsyncMock(return_value=error_response)
+    provider.chat_stream_with_retry = AsyncMock(return_value=error_response)
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    await loop._dispatch(InboundMessage(
+        channel="cli",
+        sender_id="user",
+        chat_id="test",
+        content="do the task",
+        metadata={"_wants_stream": True},
+    ))
+    if loop._background_tasks:
+        await asyncio.gather(*list(loop._background_tasks), return_exceptions=True)
+
+    outbound = [
+        await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        for _ in range(bus.outbound_size)
+    ]
+    error_out = next(msg for msg in outbound if msg.metadata.get("_error"))
+    notice_out = next(msg for msg in outbound if msg.metadata.get("_system_message"))
+    recovery_in = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+
+    assert error_out.metadata.get("_error") is True
+    assert error_out.metadata.get("stop_reason") == "error"
+    assert notice_out.metadata.get("_system_message") is True
+    assert "自动恢复任务" in notice_out.content
+    assert recovery_in.content == "请继续上次因模型服务错误中断的任务。"
+    assert recovery_in.metadata.get("_auto_recovery") is True
+    assert recovery_in.metadata.get("_auto_recover_attempt") == 1
+    assert recovery_in.session_key == "cli:test"

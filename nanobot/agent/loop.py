@@ -70,6 +70,8 @@ if TYPE_CHECKING:
 
 
 UNIFIED_SESSION_KEY = "unified:default"
+_AUTO_RECOVER_MAX_ATTEMPTS = 2
+_AUTO_RECOVER_MESSAGE = "请继续上次因模型服务错误中断的任务。"
 
 class TurnState(Enum):
     RESTORE = auto()
@@ -1097,6 +1099,72 @@ class AgentLoop:
                 else None
             )
 
+    def _should_auto_recover_model_error(
+        self,
+        msg: InboundMessage,
+        response: OutboundMessage,
+    ) -> bool:
+        """Return True when a model error should start an automatic continuation turn."""
+        metadata = response.metadata or {}
+        if metadata.get("stop_reason") != "error":
+            return False
+        if msg.metadata.get("_auto_recovery"):
+            try:
+                if int(msg.metadata.get("_auto_recover_attempt") or 0) >= _AUTO_RECOVER_MAX_ATTEMPTS:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if msg.channel not in {"cli", "websocket"}:
+            return False
+        return LLMProvider._is_transient_error(response.content or "")
+
+    async def _publish_auto_recovery_message(
+        self,
+        msg: InboundMessage,
+        response: OutboundMessage,
+        session_key: str,
+    ) -> None:
+        try:
+            await asyncio.sleep(0)
+            current_attempt = int(msg.metadata.get("_auto_recover_attempt") or 0)
+        except (TypeError, ValueError):
+            current_attempt = 0
+        next_attempt = current_attempt + 1
+        if next_attempt > _AUTO_RECOVER_MAX_ATTEMPTS:
+            return
+
+        notice = (
+            "模型服务返回临时错误，nanobot 正在自动恢复任务 "
+            f"({next_attempt}/{_AUTO_RECOVER_MAX_ATTEMPTS})。"
+        )
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=notice,
+            metadata={**dict(msg.metadata or {}), "_system_message": True},
+        ))
+        append_session_runtime_log(
+            self.sessions.get_session_runtime_log_path(session_key),
+            "turn.auto_recover.scheduled",
+            session_key=session_key,
+            attempt=next_attempt,
+            max_attempts=_AUTO_RECOVER_MAX_ATTEMPTS,
+            error_preview=(response.content or "")[:500],
+        )
+        recovery_metadata = dict(msg.metadata or {})
+        recovery_metadata["_auto_recovery"] = True
+        recovery_metadata["_auto_recover_attempt"] = next_attempt
+        recovery_metadata.pop("_error", None)
+        recovery_metadata.pop("render_as", None)
+        recovery_metadata.pop("stop_reason", None)
+        recovery_metadata.pop("latency_ms", None)
+        await self.bus.publish_inbound(dataclasses.replace(
+            msg,
+            content=_AUTO_RECOVER_MESSAGE,
+            metadata=recovery_metadata,
+            media=[],
+            session_key_override=session_key,
+        ))
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
         session_key = self._effective_session_key(msg)
@@ -1151,6 +1219,10 @@ class AgentLoop:
                     )
                     if response is not None:
                         await self.bus.publish_outbound(response)
+                        if self._should_auto_recover_model_error(msg, response):
+                            self._schedule_background(
+                                self._publish_auto_recovery_message(msg, response, session_key)
+                            )
                     elif msg.channel == "cli":
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
