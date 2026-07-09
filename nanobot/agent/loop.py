@@ -19,7 +19,7 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
-from nanobot.agent.progress_hook import AgentProgressHook
+from nanobot.fork.agent.progress_hook import ForkAgentProgressHook as AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states

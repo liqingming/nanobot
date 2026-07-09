@@ -92,8 +92,8 @@ class AskUserTool(Tool):
                 "questions": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 5,
-                    "description": "One to five questions to ask in sequence.",
+                    "maxItems": 10,
+                    "description": "One to ten questions to ask in sequence.",
                     "items": {
                         "type": "object",
                         "properties": {

@@ -88,6 +88,45 @@ class TestToolEventProgress:
         ]
 
     @pytest.mark.asyncio
+    async def test_streaming_tool_call_emits_pre_tool_content_when_no_delta(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="custom_tool", arguments={"path": "foo.txt"})
+        calls = iter([
+            LLMResponse(content="我先读取相关文件确认上下文。", tool_calls=[tool_call]),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+
+        async def chat_stream_with_retry(**_kwargs):
+            return next(calls)
+
+        loop.provider.chat_stream_with_retry = chat_stream_with_retry
+        loop.provider.chat_with_retry = AsyncMock()
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.prepare_call = MagicMock(return_value=(None, {"path": "foo.txt"}, None))
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        progress: list[tuple[str, bool]] = []
+        streamed: list[str] = []
+
+        async def on_progress(content: str, *, tool_hint: bool = False, **_kwargs) -> None:
+            progress.append((content, tool_hint))
+
+        async def on_stream(delta: str) -> None:
+            streamed.append(delta)
+
+        final_content, _, _, _, _ = await loop._run_agent_loop(
+            [],
+            on_progress=on_progress,
+            on_stream=on_stream,
+            on_stream_end=AsyncMock(),
+        )
+
+        assert final_content == "Done"
+        assert streamed == []
+        assert progress[0] == ("我先读取相关文件确认上下文。", False)
+        assert progress[1][1] is True
+
+    @pytest.mark.asyncio
     async def test_write_file_emits_file_edit_progress(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         target = tmp_path / "foo.txt"

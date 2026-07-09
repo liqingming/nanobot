@@ -39,7 +39,7 @@ When the user explicitly specifies a target file path (e.g., "写入这个文件
 
 ### 调用规范
 
-- `questions`: 1–5 个问题列表，每个：
+- `questions`: 1–10 个问题列表，每个：
   - `question`: 完整问句
   - `header`: 短标签（≤12 字符），如 "存储位置"
   - `options`: 2–6 个选项，每个 `{label, description}`

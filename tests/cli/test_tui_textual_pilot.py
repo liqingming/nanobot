@@ -854,11 +854,8 @@ async def test_show_question_popup_multiple_questions_sequential() -> None:
 
 
 @pytest.mark.asyncio
-async def test_idle_thinking_spinner_starts_after_stream_delta() -> None:
-    """After a stream_delta, if no further delta arrives within ~500ms,
-    the idle thinking spinner should start in #live without crashing on
-    shutdown (regression test for the active_app LookupError).
-    """
+async def test_idle_thinking_spinner_only_starts_after_long_stream_gap() -> None:
+    """Short token gaps should stay stable, but long provider silences need feedback."""
     tui = TextualTUI()
     tui.set_commands([])
 
@@ -868,12 +865,15 @@ async def test_idle_thinking_spinner_starts_after_stream_delta() -> None:
         tui.stream_start()
         await pilot.pause()
         tui.stream_delta("hello")
-        # Wait long enough for _schedule_idle_thinking's 500ms timer to fire
-        # and start_spinner's set_interval to create a Timer.
         await pilot.pause(0.7)
-        # No assertion on visual state — the regression is "shutdown crashes
-        # because active_app is missing on the Timer's context". If app exits
-        # cleanly past this block, the bug is fixed.
+        assert tui._idle_placeholder_visible is False
+
+        await pilot.pause(1.6)
+        assert tui._idle_placeholder_visible is True
+
+        tui.stream_delta(" world")
+        await pilot.pause(0.1)
+        assert tui._idle_placeholder_visible is False
 
 
 @pytest.mark.asyncio
@@ -889,6 +889,10 @@ async def test_idle_thinking_after_tool_completes_does_not_crash() -> None:
         await pilot.pause()
         tui.stream_start()
         await pilot.pause()
+        tui.stream_delta("准备写入文件。")
+        await pilot.pause(0.1)
+        tui.flush_stream()
+        await pilot.pause()
         tui.tool_phase_start()
         await pilot.pause(0.1)
         tui.add_progress("read_file(\"x\")")
@@ -896,6 +900,40 @@ async def test_idle_thinking_after_tool_completes_does_not_crash() -> None:
         tui.add_tool_result("3 lines, 50 chars")
         # The add_tool_result path schedules another idle_thinking — let it fire
         await pilot.pause(0.7)
+
+
+@pytest.mark.asyncio
+async def test_clear_idle_thinking_removes_stale_placeholder_before_progress() -> None:
+    """Todo/system progress should replace stale idle thinking, not stack under it."""
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.stream_start()
+        await pilot.pause()
+        tui.stream_delta("准备写入文件。")
+        await pilot.pause(0.1)
+        tui.flush_stream()
+        await pilot.pause()
+        tui.tool_phase_start()
+        await pilot.pause(0.1)
+        tui.add_progress("todo_write")
+        await pilot.pause(0.1)
+        tui.add_tool_result("3 todos · 1/3 done")
+        await pilot.pause(0.7)
+        assert tui._idle_placeholder_visible is True
+
+        tui.clear_idle_thinking()
+        tui.add_system("📊 进度: 1/3")
+        await pilot.pause(0.7)
+
+        out = app.query_one("#output")
+        text = _output_log_text(out)
+        assert tui._idle_placeholder_visible is False
+        assert "📊 进度: 1/3" in text
+        assert "思考中" not in text
 
 
 @pytest.mark.asyncio
