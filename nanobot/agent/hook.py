@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -26,6 +28,36 @@ class AgentHookContext:
     final_content: str | None = None
     stop_reason: str | None = None
     error: str | None = None
+    session_key: str | None = None
+
+
+@dataclass(slots=True)
+class AgentRunHookContext:
+    """Run-level state snapshot exposed to runner hooks."""
+
+    messages: list[dict[str, Any]]
+    final_content: str | None = None
+    tools_used: list[str] = field(default_factory=list)
+    usage: dict[str, int] = field(default_factory=dict)
+    stop_reason: str | None = None
+    error: str | None = None
+    tool_events: list[dict[str, str]] = field(default_factory=list)
+    had_injections: bool = False
+    exception: BaseException | None = None
+
+
+@dataclass(slots=True)
+class AgentTurnHookContext:
+    """Turn-local inputs available when constructing per-turn hooks."""
+
+    on_progress: Callable[..., Awaitable[None]] | None = None
+    workspace: Path | None = None
+    channel: str = "cli"
+    chat_id: str = "direct"
+    message_id: str | None = None
+    session_key: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    ephemeral: bool = False
 
 
 class AgentHook:
@@ -36,6 +68,18 @@ class AgentHook:
 
     def wants_streaming(self) -> bool:
         return False
+
+    async def before_run(self, context: AgentRunHookContext) -> None:
+        pass
+
+    async def after_run(self, context: AgentRunHookContext) -> None:
+        pass
+
+    async def on_error(self, context: AgentRunHookContext) -> None:
+        pass
+
+    async def on_finally(self, context: AgentRunHookContext) -> None:
+        pass
 
     async def before_iteration(self, context: AgentHookContext) -> None:
         pass
@@ -54,6 +98,34 @@ class AgentHook:
         ``context.tool_results`` and ``context.tool_events`` are populated."""
         pass
 
+    async def before_execute_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+    ) -> None:
+        pass
+
+    async def after_execute_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+        result: Any,
+    ) -> None:
+        pass
+
+    async def on_execute_tool_error(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+        error: Any,
+    ) -> None:
+        pass
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         pass
 
@@ -70,6 +142,9 @@ class AgentHook:
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         return content
+
+
+AgentTurnHookFactory = Callable[[AgentTurnHookContext], AgentHook | None]
 
 
 class CompositeHook(AgentHook):
@@ -103,6 +178,18 @@ class CompositeHook(AgentHook):
     async def before_iteration(self, context: AgentHookContext) -> None:
         await self._for_each_hook_safe("before_iteration", context)
 
+    async def before_run(self, context: AgentRunHookContext) -> None:
+        await self._for_each_hook_safe("before_run", context)
+
+    async def after_run(self, context: AgentRunHookContext) -> None:
+        await self._for_each_hook_safe("after_run", context)
+
+    async def on_error(self, context: AgentRunHookContext) -> None:
+        await self._for_each_hook_safe("on_error", context)
+
+    async def on_finally(self, context: AgentRunHookContext) -> None:
+        await self._for_each_hook_safe("on_finally", context)
+
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
         await self._for_each_hook_safe("on_stream", context, delta)
 
@@ -111,6 +198,49 @@ class CompositeHook(AgentHook):
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         await self._for_each_hook_safe("before_execute_tools", context)
+
+    async def before_execute_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+    ) -> None:
+        await self._for_each_hook_safe("before_execute_tool", context, tool_call, tool, params)
+
+    async def after_execute_tool(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+        result: Any,
+    ) -> None:
+        await self._for_each_hook_safe(
+            "after_execute_tool",
+            context,
+            tool_call,
+            tool,
+            params,
+            result,
+        )
+
+    async def on_execute_tool_error(
+        self,
+        context: AgentHookContext,
+        tool_call: ToolCallRequest,
+        tool: Any,
+        params: Any,
+        error: Any,
+    ) -> None:
+        await self._for_each_hook_safe(
+            "on_execute_tool_error",
+            context,
+            tool_call,
+            tool,
+            params,
+            error,
+        )
 
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         await self._for_each_hook_safe("emit_reasoning", reasoning_content)
@@ -139,15 +269,35 @@ class SDKCaptureHook(AgentHook):
 
     The runner mutates ``context.messages`` in place across iterations, so the
     snapshot is refreshed on every ``after_iteration`` call; the last call
-    reflects the end-of-turn state the SDK caller cares about.
+    reflects the end-of-turn state the SDK caller cares about.  The run-level
+    snapshot is authoritative when available and covers paths without a final
+    per-iteration callback.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.tools_used: list[str] = []
         self.messages: list[dict[str, Any]] = []
+        self.usage: dict[str, int] = {}
+        self.stop_reason: str | None = None
+        self.error: str | None = None
+        self.tool_events: list[dict[str, str]] = []
+        self.had_injections: bool = False
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         for call in context.tool_calls:
             self.tools_used.append(call.name)
         self.messages = list(context.messages)
+        self.usage = dict(context.usage)
+        self.stop_reason = context.stop_reason
+        self.error = context.error
+        self.tool_events = list(context.tool_events)
+
+    async def after_run(self, context: AgentRunHookContext) -> None:
+        self.tools_used = list(context.tools_used)
+        self.messages = list(context.messages)
+        self.usage = dict(context.usage)
+        self.stop_reason = context.stop_reason
+        self.error = context.error
+        self.tool_events = list(context.tool_events)
+        self.had_injections = context.had_injections

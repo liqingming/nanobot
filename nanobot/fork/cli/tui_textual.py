@@ -2174,7 +2174,6 @@ class TextualTUI(TUIBase):
         elapsed counter can restart on a second placeholder.
         """
         self._cancel_idle_thinking()
-
     def stop_thinking(self) -> None:
         """TUIBase hook: stop the idle/thinking spinner on turn completion so it
         never outlives the turn. The non-streaming reply path has no pop_stream

@@ -16,7 +16,7 @@ Example valid usage:
 ## Windows Compatibility
 
 nanobot explicitly supports Windows. Key differences to keep in mind:
-- `ExecTool` uses `cmd /c` on Windows instead of `sh -c` (`shell.py`).
+- `ExecTool` defaults to PowerShell on Windows (`pwsh` when available, otherwise Windows PowerShell); pass `shell="cmd"` for cmd.exe syntax or cmd built-ins (`shell.py`).
 - `cli/commands.py` forces `sys.stdout`/`stderr` to UTF-8 on startup to handle emoji and multilingual input.
 - MCP stdio server commands are normalized for Windows path separators (`mcp.py`).
 - Always use `pathlib.Path` for path manipulation; do not assume `/` separators.
@@ -30,10 +30,6 @@ Tool descriptions, skills, and replayed session history also shape model behavio
 ## Context Pollution Persists
 
 Anything written into memory, session history, or prompt inputs can be replayed into future LLM calls. Metadata such as timestamps, local media paths, tool-call echoes, and raw fallback dumps must be bounded and sanitized before they become examples for the model to imitate.
-
-## Heartbeat Virtual Tool Call
-
-The heartbeat service (`heartbeat/service.py`) does not parse free-text LLM output. Instead, it injects a virtual `heartbeat` tool with `action: skip | run` into the conversation. Phase 1 is a structured decision; Phase 2 executes only on `run`. When adding new periodic background checks, follow this virtual-tool-call pattern rather than string matching.
 
 ## Skills as Extension Point
 

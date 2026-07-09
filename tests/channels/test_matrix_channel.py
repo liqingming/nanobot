@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,19 +10,23 @@ pytest.importorskip("nh3")
 pytest.importorskip("mistune")
 from nio import RoomSendResponse, SyncError
 
-from nanobot.channels.matrix import _build_matrix_text_content
-
 import nanobot.channels.matrix as matrix_module
 from nanobot.bus.events import OutboundMessage
+from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.matrix import (
     MATRIX_HTML_FORMAT,
     TYPING_NOTICE_TIMEOUT_MS,
     MatrixChannel,
+    MatrixConfig,
+    _build_matrix_text_content,
 )
-from nanobot.channels.matrix import MatrixConfig
 
 _ROOM_SEND_UNSET = object()
+
+
+def test_default_e2ee_matches_platform_support() -> None:
+    assert MatrixConfig().e2ee_enabled is (sys.platform != "win32")
 
 
 class _DummyTask:
@@ -51,7 +56,18 @@ class _FakeAsyncClient:
         self.stop_sync_forever_called = False
         self.join_calls: list[str] = []
         self.callbacks: list[tuple[object, object]] = []
+        self.to_device_callbacks: list[tuple[object, object]] = []
         self.response_callbacks: list[tuple[object, object]] = []
+        self.key_verifications: dict[str, object] = {}
+        self.operation_calls: list[str] = []
+        self.accept_key_verification_calls: list[str] = []
+        self.confirm_short_auth_string_calls: list[str] = []
+        self.send_to_device_messages_calls = 0
+        self.to_device_calls: list[object] = []
+        self.accept_key_verification_response: object | None = None
+        self.confirm_short_auth_string_response: object | None = None
+        self.send_to_device_messages_response: list[object] = []
+        self.to_device_response: object | None = None
         self.rooms: dict[str, object] = {}
         self.room_send_calls: list[dict[str, object]] = []
         self.typing_calls: list[tuple[str, bool, int]] = []
@@ -71,6 +87,9 @@ class _FakeAsyncClient:
     def add_event_callback(self, callback, event_type) -> None:
         self.callbacks.append((callback, event_type))
 
+    def add_to_device_callback(self, callback, event_type) -> None:
+        self.to_device_callbacks.append((callback, event_type))
+
     def add_response_callback(self, callback, response_type) -> None:
         self.response_callbacks.append((callback, response_type))
 
@@ -82,6 +101,26 @@ class _FakeAsyncClient:
 
     async def join(self, room_id: str) -> None:
         self.join_calls.append(room_id)
+
+    async def accept_key_verification(self, transaction_id: str):
+        self.operation_calls.append(f"accept:{transaction_id}")
+        self.accept_key_verification_calls.append(transaction_id)
+        return self.accept_key_verification_response
+
+    async def confirm_short_auth_string(self, transaction_id: str):
+        self.operation_calls.append(f"confirm:{transaction_id}")
+        self.confirm_short_auth_string_calls.append(transaction_id)
+        return self.confirm_short_auth_string_response
+
+    async def send_to_device_messages(self):
+        self.operation_calls.append("send_pending")
+        self.send_to_device_messages_calls += 1
+        return self.send_to_device_messages_response
+
+    async def to_device(self, message):
+        self.operation_calls.append("to_device")
+        self.to_device_calls.append(message)
+        return self.to_device_response
 
     async def room_send(
         self,
@@ -167,6 +206,62 @@ class _FakeAsyncClient:
         return None
 
 
+class _FakeSas:
+    def __init__(self, *, verified: bool = False) -> None:
+        self.share_key_called = False
+        self.get_mac_called = False
+        self.verified = verified
+
+    def share_key(self):
+        self.share_key_called = True
+        return {"type": "share_key"}
+
+    def get_mac(self):
+        self.get_mac_called = True
+        return {"type": "mac"}
+
+
+class _FakeKeyVerificationStart:
+    def __init__(
+        self,
+        *,
+        sender: str = "@alice:matrix.org",
+        transaction_id: str = "tx1",
+        short_authentication_string: list[str] | None = None,
+    ) -> None:
+        self.sender = sender
+        self.transaction_id = transaction_id
+        self.short_authentication_string = short_authentication_string or ["emoji"]
+
+
+class _FakeKeyVerificationKey:
+    def __init__(
+        self,
+        *,
+        sender: str = "@alice:matrix.org",
+        transaction_id: str = "tx1",
+    ) -> None:
+        self.sender = sender
+        self.transaction_id = transaction_id
+
+
+class _FakeKeyVerificationMac:
+    def __init__(
+        self,
+        *,
+        sender: str = "@alice:matrix.org",
+        transaction_id: str = "tx1",
+    ) -> None:
+        self.sender = sender
+        self.transaction_id = transaction_id
+
+
+def _patch_key_verification_events(monkeypatch) -> None:
+    monkeypatch.setattr(matrix_module, "KeyVerificationStart", _FakeKeyVerificationStart)
+    monkeypatch.setattr(matrix_module, "KeyVerificationKey", _FakeKeyVerificationKey)
+    monkeypatch.setattr(matrix_module, "KeyVerificationMac", _FakeKeyVerificationMac)
+
+
 def _make_config(**kwargs) -> MatrixConfig:
     kwargs.setdefault("allow_from", ["*"])
     return MatrixConfig(
@@ -203,13 +298,14 @@ async def test_start_skips_load_store_when_device_id_missing(
         "nanobot.channels.matrix.asyncio.create_task", _fake_create_task
     )
 
-    channel = MatrixChannel(_make_config(device_id=""), MessageBus())
+    channel = MatrixChannel(_make_config(device_id="", e2ee_enabled=True), MessageBus())
     await channel.start()
 
     assert len(clients) == 1
     assert clients[0].config.encryption_enabled is True
     assert clients[0].load_store_called is False
     assert len(clients[0].callbacks) == 3
+    assert clients[0].to_device_callbacks == []
     assert len(clients[0].response_callbacks) == 3
 
     await channel.stop()
@@ -226,6 +322,133 @@ async def test_register_event_callbacks_uses_media_base_filter() -> None:
     assert len(client.callbacks) == 3
     assert client.callbacks[1][0] == channel._on_media_message
     assert client.callbacks[1][1] == matrix_module.MATRIX_MEDIA_EVENT_FILTER
+
+
+def test_register_to_device_callbacks_when_sas_verification_enabled() -> None:
+    channel = MatrixChannel(_make_config(e2ee_enabled=True, sas_verification=True), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    channel._register_to_device_callbacks()
+
+    assert client.to_device_callbacks == [
+        (channel._on_key_verification_event, (matrix_module.KeyVerificationEvent,))
+    ]
+
+
+def test_register_to_device_callbacks_skips_when_e2ee_disabled() -> None:
+    channel = MatrixChannel(
+        _make_config(e2ee_enabled=False, sas_verification=True),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    channel._register_to_device_callbacks()
+
+    assert client.to_device_callbacks == []
+
+
+@pytest.mark.asyncio
+async def test_sas_verification_start_accepts_allowed_sender(monkeypatch) -> None:
+    _patch_key_verification_events(monkeypatch)
+    channel = MatrixChannel(
+        _make_config(
+            allow_from=["@alice:matrix.org"],
+            e2ee_enabled=True,
+            sas_verification=True,
+        ),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    sas = _FakeSas()
+    client.key_verifications["tx1"] = sas
+    channel.client = client
+
+    await channel._handle_key_verification_event(_FakeKeyVerificationStart())
+
+    assert client.accept_key_verification_calls == ["tx1"]
+    assert sas.share_key_called is False
+    assert client.to_device_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sas_verification_ignores_denied_sender(monkeypatch) -> None:
+    _patch_key_verification_events(monkeypatch)
+    channel = MatrixChannel(
+        _make_config(
+            allow_from=["@alice:matrix.org"],
+            e2ee_enabled=True,
+            sas_verification=True,
+        ),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    client.key_verifications["tx1"] = _FakeSas()
+    channel.client = client
+
+    await channel._handle_key_verification_event(
+        _FakeKeyVerificationStart(sender="@mallory:matrix.org")
+    )
+
+    assert client.accept_key_verification_calls == []
+    assert client.to_device_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sas_verification_ignores_when_disabled(monkeypatch) -> None:
+    _patch_key_verification_events(monkeypatch)
+    channel = MatrixChannel(
+        _make_config(allow_from=["@alice:matrix.org"], sas_verification=False),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    client.key_verifications["tx1"] = _FakeSas()
+    channel.client = client
+
+    await channel._handle_key_verification_event(_FakeKeyVerificationStart())
+
+    assert client.accept_key_verification_calls == []
+    assert client.to_device_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sas_verification_key_confirms_allowed_sender(monkeypatch) -> None:
+    _patch_key_verification_events(monkeypatch)
+    channel = MatrixChannel(
+        _make_config(
+            allow_from=["@alice:matrix.org"],
+            e2ee_enabled=True,
+            sas_verification=True,
+        ),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    await channel._handle_key_verification_event(_FakeKeyVerificationKey())
+
+    assert client.send_to_device_messages_calls == 1
+    assert client.confirm_short_auth_string_calls == ["tx1"]
+    assert client.operation_calls == ["send_pending", "confirm:tx1"]
+
+
+@pytest.mark.asyncio
+async def test_sas_verification_mac_does_not_resend_mac(monkeypatch) -> None:
+    _patch_key_verification_events(monkeypatch)
+    channel = MatrixChannel(
+        _make_config(allow_from=["@alice:matrix.org"], sas_verification=True),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    sas = _FakeSas(verified=True)
+    client.key_verifications["tx1"] = sas
+    channel.client = client
+
+    await channel._handle_key_verification_event(_FakeKeyVerificationMac())
+
+    assert sas.get_mac_called is False
+    assert client.to_device_calls == []
 
 
 def test_media_event_filter_does_not_match_text_events() -> None:
@@ -693,6 +916,13 @@ async def test_on_media_message_downloads_attachment_and_sets_metadata(
     client.download_bytes = b"image"
     channel.client = client
 
+    async def _download_media_bytes(mxc_url: str, limit_bytes: int) -> bytes:
+        client.download_calls.append(mxc_url)
+        assert limit_bytes >= len(client.download_bytes)
+        return client.download_bytes
+
+    monkeypatch.setattr(channel, "_download_media_bytes", _download_media_bytes)
+
     handled: list[dict[str, object]] = []
 
     async def _fake_handle_message(**kwargs) -> None:
@@ -857,8 +1087,13 @@ async def test_on_media_message_handles_download_error(monkeypatch, tmp_path) ->
 
     channel = MatrixChannel(_make_config(), MessageBus())
     client = _FakeAsyncClient("", "", "", None)
-    client.download_response = matrix_module.DownloadError("download failed")
     channel.client = client
+
+    async def _download_media_bytes(mxc_url: str, _limit_bytes: int):
+        client.download_calls.append(mxc_url)
+        return None
+
+    monkeypatch.setattr(channel, "_download_media_bytes", _download_media_bytes)
 
     handled: list[dict[str, object]] = []
 
@@ -873,7 +1108,7 @@ async def test_on_media_message_handles_download_error(monkeypatch, tmp_path) ->
         body="photo.png",
         url="mxc://example.org/mediaid",
         event_id="$event3",
-        source={"content": {"msgtype": "m.image"}},
+        source={"content": {"msgtype": "m.image", "info": {"size": 5}}},
     )
 
     await channel._on_media_message(room, event)
@@ -898,6 +1133,13 @@ async def test_on_media_message_decrypts_encrypted_media(monkeypatch, tmp_path) 
     client = _FakeAsyncClient("", "", "", None)
     client.download_bytes = b"cipher"
     channel.client = client
+
+    async def _download_media_bytes(mxc_url: str, limit_bytes: int) -> bytes:
+        client.download_calls.append(mxc_url)
+        assert limit_bytes >= len(client.download_bytes)
+        return client.download_bytes
+
+    monkeypatch.setattr(channel, "_download_media_bytes", _download_media_bytes)
 
     handled: list[dict[str, object]] = []
 
@@ -942,6 +1184,13 @@ async def test_on_media_message_handles_decrypt_error(monkeypatch, tmp_path) -> 
     client.download_bytes = b"cipher"
     channel.client = client
 
+    async def _download_media_bytes(mxc_url: str, limit_bytes: int) -> bytes:
+        client.download_calls.append(mxc_url)
+        assert limit_bytes >= len(client.download_bytes)
+        return client.download_bytes
+
+    monkeypatch.setattr(channel, "_download_media_bytes", _download_media_bytes)
+
     handled: list[dict[str, object]] = []
 
     async def _fake_handle_message(**kwargs) -> None:
@@ -958,7 +1207,7 @@ async def test_on_media_message_handles_decrypt_error(monkeypatch, tmp_path) -> 
         key={"k": "key"},
         hashes={"sha256": "hash"},
         iv="iv",
-        source={"content": {"msgtype": "m.file"}},
+        source={"content": {"msgtype": "m.file", "info": {"size": 6}}},
     )
 
     await channel._on_media_message(room, event)
@@ -971,7 +1220,7 @@ async def test_on_media_message_handles_decrypt_error(monkeypatch, tmp_path) -> 
 
 @pytest.mark.asyncio
 async def test_send_clears_typing_after_send() -> None:
-    channel = MatrixChannel(_make_config(), MessageBus())
+    channel = MatrixChannel(_make_config(e2ee_enabled=True), MessageBus())
     client = _FakeAsyncClient("", "", "", None)
     channel.client = client
 
@@ -1291,7 +1540,7 @@ async def test_send_progress_keeps_typing_keepalive_running() -> None:
             channel="matrix",
             chat_id="!room:matrix.org",
             content="working...",
-            metadata={"_progress": True, "_progress_kind": "reasoning"},
+            event=ProgressEvent(content="working..."),
         )
     )
 
@@ -1313,7 +1562,7 @@ async def test_send_empty_content_does_not_call_room_send() -> None:
             channel="matrix",
             chat_id="!room:matrix.org",
             content="",
-            metadata={"_progress": True},
+            event=ProgressEvent(),
         )
     )
 
@@ -1332,7 +1581,7 @@ async def test_send_whitespace_only_content_does_not_call_room_send() -> None:
             channel="matrix",
             chat_id="!room:matrix.org",
             content="   \n\n  ",
-            metadata={"_progress": True},
+            event=ProgressEvent(content="   \n\n  "),
         )
     )
 
@@ -1652,7 +1901,7 @@ async def test_send_delta_stream_end_replaces_existing_message() -> None:
         last_edit=100.0,
     )
 
-    await channel.send_delta("!room:matrix.org", "", {"_stream_end": True})
+    await channel.send_delta("!room:matrix.org", "", stream_end=True)
 
     assert "!room:matrix.org" not in channel._stream_bufs
     assert client.typing_calls[-1] == ("!room:matrix.org", False, TYPING_NOTICE_TIMEOUT_MS)
@@ -1662,6 +1911,36 @@ async def test_send_delta_stream_end_replaces_existing_message() -> None:
         "rel_type": "m.replace",
         "event_id": "event-1",
     }
+
+
+@pytest.mark.asyncio
+async def test_send_delta_keeps_same_room_stream_ids_independent(monkeypatch) -> None:
+    channel = MatrixChannel(_make_config(), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    event_ids = ["event-a", "event-b"]
+
+    async def _send_room_content(room_id, content):
+        client.room_send_calls.append({"room_id": room_id, "content": content})
+        return SimpleNamespace(event_id=event_ids.pop(0) if event_ids else "event-final")
+
+    monkeypatch.setattr(channel, "_send_room_content", _send_room_content)
+
+    await channel.send_delta("!room:matrix.org", "A", stream_id="stream-a")
+    await channel.send_delta("!room:matrix.org", "B", stream_id="stream-b")
+    await channel.send_delta("!room:matrix.org", "1", stream_id="stream-a")
+    await channel.send_delta("!room:matrix.org", "2", stream_id="stream-b")
+
+    await channel.send_delta("!room:matrix.org", "", stream_id="stream-a", stream_end=True)
+    await channel.send_delta("!room:matrix.org", "", stream_id="stream-b", stream_end=True)
+
+    final_a = client.room_send_calls[-2]["content"]
+    final_b = client.room_send_calls[-1]["content"]
+    assert final_a["body"] == "A1"
+    assert final_a["m.relates_to"]["event_id"] == "event-a"
+    assert final_b["body"] == "B2"
+    assert final_b["m.relates_to"]["event_id"] == "event-b"
 
 
 @pytest.mark.asyncio
@@ -1702,7 +1981,7 @@ async def test_send_delta_threaded_edit_keeps_replace_and_thread_relation(monkey
     }
     await channel.send_delta("!room:matrix.org", "Hello", metadata)
     await channel.send_delta("!room:matrix.org", " world", metadata)
-    await channel.send_delta("!room:matrix.org", "", {"_stream_end": True, **metadata})
+    await channel.send_delta("!room:matrix.org", "", metadata, stream_end=True)
 
     edit_content = client.room_send_calls[1]["content"]
     final_content = client.room_send_calls[2]["content"]
@@ -1735,7 +2014,7 @@ async def test_send_delta_stream_end_noop_when_buffer_missing() -> None:
     client = _FakeAsyncClient("", "", "", None)
     channel.client = client
 
-    await channel.send_delta("!room:matrix.org", "", {"_stream_end": True})
+    await channel.send_delta("!room:matrix.org", "", stream_end=True)
 
     assert client.room_send_calls == []
     assert client.typing_calls == []
@@ -1756,7 +2035,7 @@ async def test_send_delta_on_error_stops_typing(monkeypatch) -> None:
     assert "!room:matrix.org" in channel._stream_bufs
     assert channel._stream_bufs["!room:matrix.org"].text == "Hello"
     assert len(client.room_send_calls) == 1
-    
+
     assert len(client.typing_calls) == 1
 
 
@@ -1773,4 +2052,116 @@ async def test_send_delta_ignores_whitespace_only_delta(monkeypatch) -> None:
 
     assert "!room:matrix.org" in channel._stream_bufs
     assert channel._stream_bufs["!room:matrix.org"].text == "   "
+
+
+@pytest.mark.asyncio
+async def test_fetch_media_rejects_missing_declared_size(monkeypatch, tmp_path) -> None:
+    channel = MatrixChannel(_make_config(max_media_bytes=8), MessageBus())
+    client = _FakeAsyncClient("https://matrix.org", "", "", None)
+    channel.client = client
+    monkeypatch.setattr("nanobot.channels.matrix.get_media_dir", lambda _name: tmp_path)
+
+    async def _download_should_not_run(*_args, **_kwargs):
+        raise AssertionError("download should be rejected before fetching bytes")
+
+    monkeypatch.setattr(channel, "_download_media_bytes", _download_should_not_run)
+    event = SimpleNamespace(
+        sender="@alice:matrix.org",
+        event_id="$event1",
+        body="payload.bin",
+        url="mxc://example.org/media",
+        source={"content": {"msgtype": "m.file"}},
+    )
+
+    attachment, marker = await channel._fetch_media_attachment(
+        SimpleNamespace(room_id="!room:matrix.org"),
+        event,
+    )
+
+    assert attachment is None
+    assert marker == "[attachment: payload.bin - too large]"
+
+
+@pytest.mark.asyncio
+async def test_fetch_media_rejects_bool_declared_size(monkeypatch, tmp_path) -> None:
+    channel = MatrixChannel(_make_config(max_media_bytes=8), MessageBus())
+    client = _FakeAsyncClient("https://matrix.org", "", "", None)
+    channel.client = client
+    monkeypatch.setattr("nanobot.channels.matrix.get_media_dir", lambda _name: tmp_path)
+
+    async def _download_should_not_run(*_args, **_kwargs):
+        raise AssertionError("bool size should be rejected before fetching bytes")
+
+    monkeypatch.setattr(channel, "_download_media_bytes", _download_should_not_run)
+    event = SimpleNamespace(
+        sender="@alice:matrix.org",
+        event_id="$event1",
+        body="payload.bin",
+        url="mxc://example.org/media",
+        source={"content": {"msgtype": "m.file", "info": {"size": True}}},
+    )
+
+    attachment, marker = await channel._fetch_media_attachment(
+        SimpleNamespace(room_id="!room:matrix.org"),
+        event,
+    )
+
+    assert attachment is None
+    assert marker == "[attachment: payload.bin - too large]"
+
+
+@pytest.mark.asyncio
+async def test_fetch_media_rejects_declared_oversized_before_download(monkeypatch, tmp_path) -> None:
+    channel = MatrixChannel(_make_config(max_media_bytes=8), MessageBus())
+    client = _FakeAsyncClient("https://matrix.org", "", "", None)
+    channel.client = client
+    monkeypatch.setattr("nanobot.channels.matrix.get_media_dir", lambda _name: tmp_path)
+
+    async def _download_should_not_run(*_args, **_kwargs):
+        raise AssertionError("download should be rejected before fetching bytes")
+
+    monkeypatch.setattr(channel, "_download_media_bytes", _download_should_not_run)
+    event = SimpleNamespace(
+        sender="@alice:matrix.org",
+        event_id="$event1",
+        body="payload.bin",
+        url="mxc://example.org/media",
+        source={"content": {"msgtype": "m.file", "info": {"size": 9}}},
+    )
+
+    attachment, marker = await channel._fetch_media_attachment(
+        SimpleNamespace(room_id="!room:matrix.org"),
+        event,
+    )
+
+    assert attachment is None
+    assert marker == "[attachment: payload.bin - too large]"
+
+
+@pytest.mark.asyncio
+async def test_fetch_media_maps_streaming_cap_to_too_large(monkeypatch, tmp_path) -> None:
+    channel = MatrixChannel(_make_config(max_media_bytes=8), MessageBus())
+    client = _FakeAsyncClient("https://matrix.org", "", "", None)
+    channel.client = client
+    monkeypatch.setattr("nanobot.channels.matrix.get_media_dir", lambda _name: tmp_path)
+
+    async def _download_too_large(_mxc_url: str, _limit_bytes: int):
+        raise matrix_module._MediaTooLargeError
+
+    monkeypatch.setattr(channel, "_download_media_bytes", _download_too_large)
+    event = SimpleNamespace(
+        sender="@alice:matrix.org",
+        event_id="$event1",
+        body="payload.bin",
+        url="mxc://example.org/media",
+        source={"content": {"msgtype": "m.file", "info": {"size": 8}}},
+    )
+
+    attachment, marker = await channel._fetch_media_attachment(
+        SimpleNamespace(room_id="!room:matrix.org"),
+        event,
+    )
+
+    assert attachment is None
+    assert marker == "[attachment: payload.bin - too large]"
     assert client.room_send_calls == []

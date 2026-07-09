@@ -54,6 +54,15 @@ def _fake_tool_call_response() -> SimpleNamespace:
     return SimpleNamespace(choices=[choice], usage=usage)
 
 
+def _fake_tool_call_response_with_arguments(arguments) -> SimpleNamespace:
+    """Build a minimal chat response with caller-supplied tool arguments."""
+    function = SimpleNamespace(name="optional_tool", arguments=arguments)
+    tool_call = SimpleNamespace(id="call_123", type="function", function=function)
+    message = SimpleNamespace(content=None, tool_calls=[tool_call], reasoning_content=None)
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], usage=SimpleNamespace())
+
+
 def _fake_responses_response(content: str = "ok") -> MagicMock:
     """Build a minimal Responses API response object."""
     resp = MagicMock()
@@ -602,12 +611,31 @@ async def test_openai_compat_preserves_extra_content_on_tool_calls() -> None:
 
     assert len(result.tool_calls) == 1
     tool_call = result.tool_calls[0]
+    assert tool_call.id == "call_123"
     assert tool_call.extra_content == {"google": {"thought_signature": "signed-token"}}
     assert tool_call.function_provider_specific_fields == {"inner": "value"}
 
     serialized = tool_call.to_openai_tool_call()
     assert serialized["extra_content"] == {"google": {"thought_signature": "signed-token"}}
     assert serialized["function"]["provider_specific_fields"] == {"inner": "value"}
+
+
+def test_openai_compat_parse_preserves_malformed_tool_arguments() -> None:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider()
+
+    result = provider._parse(_fake_tool_call_response_with_arguments('{path:"foo.txt"}'))
+
+    assert result.tool_calls[0].arguments == '{path:"foo.txt"}'
+
+
+def test_openai_compat_parse_preserves_array_tool_arguments() -> None:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider()
+
+    result = provider._parse(_fake_tool_call_response_with_arguments('["foo.txt"]'))
+
+    assert result.tool_calls[0].arguments == ["foo.txt"]
 
 
 def test_openai_model_passthrough() -> None:
@@ -901,6 +929,47 @@ def test_openai_compat_build_kwargs_uses_gpt5_safe_parameters() -> None:
     assert "temperature" not in kwargs
 
 
+@pytest.mark.parametrize(
+    ("model_name", "expected_key"),
+    [
+        ("gpt-5.4", "max_completion_tokens"),
+        ("o1-mini", "max_completion_tokens"),
+        ("o3-mini", "max_completion_tokens"),
+        ("o4-mini", "max_completion_tokens"),
+        ("gpt-4", "max_tokens"),
+        ("foo3-mini", "max_tokens"),
+        ("foo4-mini", "max_tokens"),
+    ],
+)
+def test_openai_compat_build_kwargs_max_completion_tokens_by_model_name(
+    model_name: str,
+    expected_key: str,
+) -> None:
+    spec = find_by_name("custom")
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="sk-test-key",
+            default_model=model_name,
+            spec=spec,
+        )
+
+    kwargs = provider._build_kwargs(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        model=model_name,
+        max_tokens=2048,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+
+    other_key = (
+        "max_tokens" if expected_key == "max_completion_tokens" else "max_completion_tokens"
+    )
+    assert kwargs[expected_key] == 2048
+    assert other_key not in kwargs
+
+
 def test_openai_compat_preserves_message_level_reasoning_fields() -> None:
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
         provider = OpenAICompatProvider()
@@ -994,9 +1063,37 @@ def test_deepseek_thinking_keeps_tool_history_with_reasoning_content() -> None:
     assert kwargs["messages"][2]["role"] == "tool"
 
 
-def test_openai_compat_keeps_tool_calls_after_consecutive_assistant_messages() -> None:
+def test_openai_compat_preserves_tool_call_ids_after_consecutive_assistant_messages() -> None:
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
         provider = OpenAICompatProvider()
+
+    sanitized = provider._sanitize_messages([
+        {"role": "user", "content": "不错"},
+        {"role": "assistant", "content": "对，破 4 万指日可待"},
+        {
+            "role": "assistant",
+            "content": "<think>我再查一下</think>",
+            "tool_calls": [
+                {
+                    "id": "call_function_akxp3wqzn7ph_1",
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_function_akxp3wqzn7ph_1", "name": "exec", "content": "ok"},
+        {"role": "user", "content": "多少star了呢"},
+    ])
+
+    assert sanitized[1]["role"] == "assistant"
+    assert sanitized[1]["content"] is None
+    assert sanitized[1]["tool_calls"][0]["id"] == "call_function_akxp3wqzn7ph_1"
+    assert sanitized[2]["tool_call_id"] == "call_function_akxp3wqzn7ph_1"
+
+
+def test_mistral_normalizes_tool_call_ids_after_consecutive_assistant_messages() -> None:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(spec=find_by_name("mistral"))
 
     sanitized = provider._sanitize_messages([
         {"role": "user", "content": "不错"},
@@ -1081,7 +1178,7 @@ def test_openai_compat_stringifies_dict_tool_arguments() -> None:
     assert sanitized[1]["tool_calls"][0]["function"]["arguments"] == '{"cmd": "ls -la"}'
 
 
-def test_openai_compat_repairs_non_json_tool_arguments_string() -> None:
+def test_openai_compat_repairs_object_like_history_tool_arguments_string() -> None:
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
         provider = OpenAICompatProvider()
 
@@ -1131,7 +1228,7 @@ def test_openai_compat_defaults_missing_tool_arguments_to_empty_object() -> None
 
 @pytest.mark.asyncio
 async def test_openai_compat_stream_watchdog_returns_error_on_stall(monkeypatch) -> None:
-    monkeypatch.setenv("NANOBOT_STREAM_IDLE_TIMEOUT_S", "0")
+    monkeypatch.setenv("NANOBOT_STREAM_IDLE_TIMEOUT_S", "0.01")
     mock_create = AsyncMock(return_value=_StalledStream())
     spec = find_by_name("openai")
 
@@ -1476,9 +1573,46 @@ def test_kimi_k26_thinking_enabled_with_openrouter_prefix() -> None:
     assert "reasoning_effort" not in kw
 
 
+def test_kimi_k27_code_thinking_enabled() -> None:
+    """Kimi K2.7 Code supports native thinking controls."""
+    kw = _build_kwargs_for("moonshot", "kimi-k2.7-code", reasoning_effort="medium")
+    assert kw.get("extra_body") == {"thinking": {"type": "enabled"}}
+    assert "reasoning_effort" not in kw
+
+
+def test_kimi_k27_code_thinking_enabled_with_openrouter_prefix() -> None:
+    """OpenRouter-routed Kimi K2.7 Code should carry both thinking shapes."""
+    kw = _build_kwargs_for("openrouter", "moonshotai/kimi-k2.7-code", reasoning_effort="high")
+    assert kw.get("extra_body") == {
+        "thinking": {"type": "enabled"},
+        "reasoning": {"effort": "high"},
+    }
+    assert "reasoning_effort" not in kw
+
+
+def test_kimi_k27_code_thinking_none_omits_disabled() -> None:
+    """Kimi K2.7 Code is always-thinking; disabled thinking is invalid upstream."""
+    kw = _build_kwargs_for("moonshot", "kimi-k2.7-code", reasoning_effort="none")
+    assert "extra_body" not in kw
+    assert "reasoning_effort" not in kw
+
+
+def test_kimi_k27_code_thinking_none_with_openrouter_prefix_omits_disabled() -> None:
+    """OpenRouter-routed Kimi K2.7 Code should not request disabled thinking."""
+    kw = _build_kwargs_for("openrouter", "moonshotai/kimi-k2.7-code", reasoning_effort="none")
+    assert "extra_body" not in kw
+    assert "reasoning_effort" not in kw
+
+
 def test_moonshot_kimi_k26_temperature_override() -> None:
     """Moonshot registry forces temperature 1.0 for kimi-k2.6 (API requirement)."""
     kw = _build_kwargs_for("moonshot", "kimi-k2.6", reasoning_effort=None)
+    assert kw["temperature"] == 1.0
+
+
+def test_moonshot_kimi_k27_code_temperature_override() -> None:
+    """Moonshot registry should force temperature 1.0 for Kimi K2.7 Code."""
+    kw = _build_kwargs_for("moonshot", "kimi-k2.7-code", reasoning_effort=None)
     assert kw["temperature"] == 1.0
 
 

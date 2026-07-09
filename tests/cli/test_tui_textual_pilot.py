@@ -854,8 +854,8 @@ async def test_show_question_popup_multiple_questions_sequential() -> None:
 
 
 @pytest.mark.asyncio
-async def test_idle_thinking_spinner_only_starts_after_long_stream_gap() -> None:
-    """Short token gaps should stay stable, but long provider silences need feedback."""
+async def test_stream_delta_only_inserts_idle_thinking_after_long_gap() -> None:
+    """Short token gaps stay stable, but long provider silences still show feedback."""
     tui = TextualTUI()
     tui.set_commands([])
 
@@ -888,10 +888,6 @@ async def test_idle_thinking_after_tool_completes_does_not_crash() -> None:
     async with app.run_test() as pilot:
         await pilot.pause()
         tui.stream_start()
-        await pilot.pause()
-        tui.stream_delta("准备写入文件。")
-        await pilot.pause(0.1)
-        tui.flush_stream()
         await pilot.pause()
         tui.tool_phase_start()
         await pilot.pause(0.1)
@@ -934,7 +930,6 @@ async def test_clear_idle_thinking_removes_stale_placeholder_before_progress() -
         assert tui._idle_placeholder_visible is False
         assert "📊 进度: 1/3" in text
         assert "思考中" not in text
-
 
 @pytest.mark.asyncio
 async def test_normal_submit_does_not_pollute_history_for_slash_text() -> None:
