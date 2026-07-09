@@ -386,6 +386,34 @@ async def test_large_single_line_paste_uses_hidden_payload() -> None:
 
         assert submitted == [payload]
 
+
+@pytest.mark.asyncio
+async def test_app_level_large_paste_routes_to_input() -> None:
+    """Large paste events received by the app should still populate the input."""
+    tui = TextualTUI()
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    tui.set_commands([])
+
+    app = tui._app
+    payload = "y" * (5 * 1024 + 1)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input")
+        app.on_paste(Paste(payload))
+        await pilot.pause()
+
+        assert inp.value == f"[pasted {len(payload)} chars]"
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert submitted == [payload]
+
 def test_file_edit_diff_block_folds_long_diff(monkeypatch) -> None:
     tui = TextualTUI()
     written: list[str] = []

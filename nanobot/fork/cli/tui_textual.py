@@ -634,6 +634,9 @@ if _TEXTUAL_AVAILABLE:
                 result = self.replace(text, *selection)
             self.move_cursor(result.end_location)
 
+        def insert_paste_text(self, text: str) -> None:
+            self._insert_paste_text(text)
+
         def submit_value(self) -> str:
             if not self._multiline_paste_tokens:
                 return self.value
@@ -658,12 +661,12 @@ if _TEXTUAL_AVAILABLE:
                 self._clear_multiline_paste_tokens()
 
         def _on_paste(self, event: Paste) -> None:
-            self._insert_paste_text(event.text)
+            self.insert_paste_text(event.text)
             event.prevent_default()
             event.stop()
 
         def action_paste(self) -> None:
-            self._insert_paste_text(self.app.clipboard)
+            self.insert_paste_text(self.app.clipboard)
 
         async def _on_key(self, event: Key) -> None:
             tui = self._tui_ref
@@ -1010,6 +1013,16 @@ if _TEXTUAL_AVAILABLE:
             if isinstance(input_widget, _ComposerInput):
                 input_widget.sync_multiline_paste_tokens()
                 self._tui._on_input_changed(input_widget.value)
+
+        def on_paste(self, event: Paste) -> None:
+            try:
+                input_widget = self.query_one("#input", _ComposerInput)
+            except Exception:
+                return
+            input_widget.insert_paste_text(event.text)
+            input_widget.focus()
+            event.prevent_default()
+            event.stop()
 
         # ── actions ────────────────────────────────────────────────────────
 
