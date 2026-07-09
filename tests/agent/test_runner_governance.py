@@ -32,6 +32,7 @@ def _governance_config(
         model=spec.model,
         tools=tools,
         workspace=spec.workspace,
+        data_dir=spec.data_dir,
         session_key=spec.session_key,
         max_tool_result_chars=spec.max_tool_result_chars,
         context_window_tokens=spec.context_window_tokens,

@@ -61,6 +61,7 @@ class ContextGovernanceConfig:
     model: str
     tools: Any
     workspace: Path | None
+    data_dir: Path | None
     session_key: str | None
     max_tool_result_chars: int
     context_window_tokens: int | None = None
@@ -123,6 +124,7 @@ class ContextGovernor:
                 tool_call_id,
                 result,
                 max_chars=config.max_tool_result_chars,
+                data_dir=config.data_dir,
             )
         except Exception:
             logger.exception(

@@ -103,3 +103,4 @@ exp/
 _sync_tmp/
 .playwright-mcp/
 bridge/node_modules/
+.nanobot/tool-results

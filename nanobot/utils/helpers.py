@@ -293,6 +293,7 @@ def current_time_str(timezone: str | None = None) -> str:
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
 _TOOL_RESULT_PREVIEW_CHARS = 1200
 _TOOL_RESULTS_DIR = ".nanobot/tool-results"
+_SESSION_TOOL_RESULTS_DIR = "tool-results"
 _TOOL_RESULT_RETENTION_SECS = 7 * 24 * 60 * 60
 _TOOL_RESULT_MAX_BUCKETS = 32
 _TRUNCATED_SUFFIX = "\n... (truncated)"
@@ -471,9 +472,10 @@ def maybe_persist_tool_result(
     content: Any,
     *,
     max_chars: int,
+    data_dir: Path | None = None,
 ) -> Any:
     """Persist oversized tool output and replace it with a stable reference string."""
-    if workspace is None or max_chars <= 0:
+    if (workspace is None and data_dir is None) or max_chars <= 0:
         return content
 
     text_payload: str | None = None
@@ -491,12 +493,17 @@ def maybe_persist_tool_result(
     if len(text_payload) <= max_chars:
         return content
 
-    root = ensure_dir(workspace / _TOOL_RESULTS_DIR)
-    bucket = ensure_dir(root / safe_filename(session_key or "default"))
-    try:
-        _cleanup_tool_result_buckets(root, bucket)
-    except Exception:
-        logger.exception("Failed to clean stale tool result buckets in {}", root)
+    safe_session = safe_filename((session_key or "default").replace(":", "_"))
+    if data_dir is not None:
+        bucket = ensure_dir(data_dir / "sessions" / safe_session / _SESSION_TOOL_RESULTS_DIR)
+    else:
+        assert workspace is not None
+        root = ensure_dir(workspace / _TOOL_RESULTS_DIR)
+        bucket = ensure_dir(root / safe_session)
+        try:
+            _cleanup_tool_result_buckets(root, bucket)
+        except Exception:
+            logger.exception("Failed to clean stale tool result buckets in {}", root)
     path = bucket / f"{safe_filename(tool_call_id)}.{suffix}"
     if not path.exists():
         if suffix == "json" and isinstance(content, list):

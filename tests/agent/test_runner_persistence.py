@@ -40,7 +40,8 @@ async def test_runner_persists_large_tool_results_for_follow_up_calls(tmp_path):
         tools=tools,
         model="test-model",
         max_iterations=2,
-        workspace=tmp_path,
+        workspace=tmp_path / "project",
+        data_dir=tmp_path / "data",
         session_key="test:runner",
         max_tool_result_chars=2048,
     ))
@@ -49,7 +50,10 @@ async def test_runner_persists_large_tool_results_for_follow_up_calls(tmp_path):
     tool_message = next(msg for msg in captured_second_call if msg.get("role") == "tool")
     assert "[tool output persisted]" in tool_message["content"]
     assert "tool-results" in tool_message["content"]
-    assert (tmp_path / ".nanobot" / "tool-results" / "test_runner" / "call_big.txt").exists()
+    assert (
+        tmp_path / "data" / "sessions" / "test_runner" / "tool-results" / "call_big.txt"
+    ).exists()
+    assert not (tmp_path / "project" / ".nanobot").exists()
 
 
 def test_persist_tool_result_prunes_old_session_buckets(tmp_path):
@@ -153,7 +157,8 @@ async def test_read_file_result_is_not_offloaded(tmp_path):
         tools=tools,
         model="test-model",
         max_iterations=2,
-        workspace=tmp_path,
+        workspace=tmp_path / "project",
+        data_dir=tmp_path / "data",
         session_key="test:runner",
         max_tool_result_chars=2048,
     ))

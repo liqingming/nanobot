@@ -82,6 +82,7 @@ class AgentRunSpec:
     concurrent_tools: bool = False
     fail_on_tool_error: bool = False
     workspace: Path | None = None
+    data_dir: Path | None = None
     session_key: str | None = None
     context_window_tokens: int | None = None
     context_block_limit: int | None = None
@@ -366,6 +367,7 @@ class AgentRunner:
             model=spec.model,
             tools=spec.tools,
             workspace=spec.workspace,
+            data_dir=spec.data_dir,
             session_key=spec.session_key,
             max_tool_result_chars=spec.max_tool_result_chars,
             context_window_tokens=spec.context_window_tokens,

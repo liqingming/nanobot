@@ -1104,6 +1104,7 @@ class AgentLoop:
                 ),
                 concurrent_tools=True,
                 workspace=effective_scope.project_path,
+                data_dir=self.context.data_dir,
                 session_key=session.key if session else None,
                 context_window_tokens=self.context_window_tokens,
                 context_block_limit=self.context_block_limit,
