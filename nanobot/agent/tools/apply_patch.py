@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import difflib
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.tools.base import tool_parameters
+from nanobot.agent.tools.base import ToolResult, tool_parameters
 from nanobot.agent.tools.filesystem import _FsTool
 from nanobot.agent.tools.schema import (
     ArraySchema,
@@ -31,19 +30,12 @@ class _PatchError(ValueError):
     pass
 
 
-_ABSOLUTE_WINDOWS_RE = re.compile(r"^[A-Za-z]:[\\/]")
-
-
-def _validate_relative_path(path: str) -> str:
+def _validate_patch_path(path: str) -> str:
     normalized = path.strip()
     if not normalized:
         raise _PatchError("patch path cannot be empty")
     if "\0" in normalized:
         raise _PatchError(f"patch path contains a null byte: {path!r}")
-    if normalized.startswith(("~", "/", "\\")) or _ABSOLUTE_WINDOWS_RE.match(normalized):
-        raise _PatchError(f"patch path must be relative: {path}")
-    if any(part == ".." for part in re.split(r"[\\/]+", normalized)):
-        raise _PatchError(f"patch path must not contain '..': {path}")
     return normalized
 
 
@@ -75,6 +67,18 @@ def _line_diff_stats(before: str, after: str) -> tuple[int, int]:
     return added, deleted
 
 
+def _append_text(content: str, addition: str) -> str:
+    """Append text without merging it into an unterminated final line."""
+    base = content.replace("\r\n", "\n")
+    extra = addition.replace("\r\n", "\n")
+    if base and extra and not base.endswith("\n") and not extra.startswith("\n"):
+        base += "\n"
+    combined = base + extra
+    if combined and not combined.endswith("\n"):
+        combined += "\n"
+    return combined
+
+
 def _format_summary(summary: _PatchSummary) -> str:
     stats = ""
     if summary.added or summary.deleted:
@@ -86,13 +90,16 @@ def _format_summary(summary: _PatchSummary) -> str:
     tool_parameters_schema(
         edits=ArraySchema(
             items=ObjectSchema(
-                path=StringSchema("Relative path to the file to edit."),
+                path=StringSchema(
+                    "Path to the file to edit. Relative paths resolve against the "
+                    "workspace; absolute paths and '..' obey the workspace access policy."
+                ),
                 action=StringSchema(
-                    "Operation type: replace (find and replace text), add (append new content or create file), delete (remove text).",
-                    enum=["replace", "add", "delete"],
+                    "Operation type: replace or add.",
+                    enum=["replace", "add"],
                 ),
                 old_text=StringSchema(
-                    "Exact text to search for in the file. Required for replace and delete.",
+                    "Exact text to search for in the file. Required for replace.",
                     nullable=True,
                 ),
                 new_text=StringSchema(
@@ -124,8 +131,10 @@ class ApplyPatchTool(_FsTool):
     def description(self) -> str:
         return (
             "Default tool for code edits. Supports multi-file changes in a single call. "
-            "Provide a list of structured edits, each specifying a file path, action (replace/add/delete), and the text to change. "
-            "Paths must be relative. Set dry_run=true to validate and preview without writing files. "
+            "Provide a list of structured edits, each specifying a file path, action "
+            "(replace/add), and the exact text to change. "
+            "Paths are resolved by the current workspace access policy. "
+            "Set dry_run=true to validate and preview without writing files. "
             "Use edit_file only for small exact replacements on a single file."
         )
 
@@ -140,7 +149,6 @@ class ApplyPatchTool(_FsTool):
                 raise _PatchError("must provide edits")
 
             writes: dict[Path, str] = {}
-            deletes: set[Path] = set()
             summaries: list[_PatchSummary] = []
 
             for edit in edits:
@@ -149,11 +157,11 @@ class ApplyPatchTool(_FsTool):
                 raw_path = edit.get("path")
                 if not isinstance(raw_path, str):
                     raise _PatchError("path required for edit")
-                path = _validate_relative_path(raw_path)
+                path = _validate_patch_path(raw_path)
                 action = edit.get("action")
                 if not isinstance(action, str):
                     raise _PatchError(f"action required for edit: {path}")
-                source = self._resolve(path)
+                source = self._resolve_write(path)
 
                 if action == "add":
                     new_text = edit.get("new_text")
@@ -177,13 +185,10 @@ class ApplyPatchTool(_FsTool):
 
                     if exists:
                         uses_crlf = "\r\n" in content
-                        new_norm = content.replace("\r\n", "\n") + new_text.replace("\r\n", "\n")
-                        if new_norm and not new_norm.endswith("\n"):
-                            new_norm += "\n"
+                        new_norm = _append_text(content, new_text)
                         if uses_crlf:
                             new_norm = new_norm.replace("\n", "\r\n")
                         writes[source] = new_norm
-                        deletes.discard(source)
                         added, deleted = _line_diff_stats(content, new_norm)
                         action_name = "update"
                     else:
@@ -191,7 +196,6 @@ class ApplyPatchTool(_FsTool):
                         if new_norm and not new_norm.endswith("\n"):
                             new_norm += "\n"
                         writes[source] = new_norm
-                        deletes.discard(source)
                         added = _text_line_count(new_norm)
                         deleted = 0
                         action_name = "add"
@@ -246,69 +250,12 @@ class ApplyPatchTool(_FsTool):
                         new_norm = new_norm.replace("\n", "\r\n")
 
                     writes[source] = new_norm
-                    deletes.discard(source)
                     added, deleted = _line_diff_stats(content, new_norm)
                     summaries.append(
                         _PatchSummary(
                             action="update", path=path, added=added, deleted=deleted
                         )
                     )
-
-                elif action == "delete":
-                    old_text = edit.get("old_text") or ""
-                    if not old_text:
-                        raise _PatchError(f"old_text required for delete: {path}")
-
-                    pending = writes.get(source)
-                    if pending is not None:
-                        content = pending
-                    elif source.exists():
-                        raw = source.read_bytes()
-                        try:
-                            content = raw.decode("utf-8")
-                        except UnicodeDecodeError:
-                            raise _PatchError(f"file is not UTF-8 text: {path}")
-                    else:
-                        raise _PatchError(f"file to update does not exist: {path}")
-
-                    if pending is None and not source.is_file():
-                        raise _PatchError(f"path to update is not a file: {path}")
-
-                    uses_crlf = "\r\n" in content
-                    norm_content = content.replace("\r\n", "\n")
-                    norm_old = old_text.replace("\r\n", "\n")
-
-                    pos = norm_content.find(norm_old)
-                    if pos < 0:
-                        raise _PatchError(f"old_text not found in {path}")
-                    if norm_content.find(norm_old, pos + 1) >= 0:
-                        raise _PatchError(f"old_text appears multiple times in {path}")
-
-                    if norm_old == norm_content:
-                        deletes.add(source)
-                        writes.pop(source, None)
-                        added, deleted = 0, _text_line_count(content)
-                        summaries.append(
-                            _PatchSummary(
-                                action="delete", path=path, added=added, deleted=deleted
-                            )
-                        )
-                    else:
-                        new_norm = (
-                            norm_content[:pos] + norm_content[pos + len(norm_old) :]
-                        )
-                        if new_norm and not new_norm.endswith("\n"):
-                            new_norm += "\n"
-                        if uses_crlf:
-                            new_norm = new_norm.replace("\n", "\r\n")
-                        writes[source] = new_norm
-                        deletes.discard(source)
-                        added, deleted = _line_diff_stats(content, new_norm)
-                        summaries.append(
-                            _PatchSummary(
-                                action="update", path=path, added=added, deleted=deleted
-                            )
-                        )
 
                 else:
                     raise _PatchError(f"unknown action: {action}")
@@ -319,13 +266,10 @@ class ApplyPatchTool(_FsTool):
                 )
 
             backups: dict[Path, bytes | None] = {}
-            for path in set(writes) | deletes:
+            for path in writes:
                 backups[path] = path.read_bytes() if path.exists() else None
 
             try:
-                for path in deletes:
-                    if path.exists():
-                        path.unlink()
                 for path, content in writes.items():
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(content, encoding="utf-8", newline="")
@@ -339,14 +283,14 @@ class ApplyPatchTool(_FsTool):
                         path.write_bytes(data)
                 raise
 
-            for path in set(writes) | deletes:
+            for path in writes:
                 self._file_states.record_write(path)
             return "Patch applied:\n" + "\n".join(
                 _format_summary(summary) for summary in summaries
             )
         except PermissionError as exc:
-            return f"Error: {exc}"
+            return ToolResult.error(f"Error: {exc}")
         except _PatchError as exc:
-            return f"Error applying patch: {exc}"
+            return ToolResult.error(f"Error applying patch: {exc}")
         except Exception as exc:
-            return f"Error applying patch: {exc}"
+            return ToolResult.error(f"Error applying patch: {exc}")

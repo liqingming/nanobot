@@ -99,6 +99,7 @@ tmp/
 temp/
 *.tmp
 exp/
-
 # Fork sync working dir
 _sync_tmp/
+.playwright-mcp/
+bridge/node_modules/

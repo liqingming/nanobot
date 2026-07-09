@@ -2166,6 +2166,14 @@ class TextualTUI(TUIBase):
                 self._tool_placeholder_line = self._tool_placeholder_line_backup
                 self._tool_placeholder_line_backup = None
 
+    def clear_idle_thinking(self) -> None:
+        """Remove the stale idle-thinking placeholder before visible progress.
+
+        System/todo progress messages are already user-visible activity. Keeping
+        the previous "思考中" line below them makes the UI look stuck, and the
+        elapsed counter can restart on a second placeholder.
+        """
+        self._cancel_idle_thinking()
     def stop_thinking(self) -> None:
         """TUIBase hook: stop the idle/thinking spinner on turn completion so it
         never outlives the turn. The non-streaming reply path has no pop_stream
@@ -2201,7 +2209,8 @@ class TextualTUI(TUIBase):
                 # Back up the existing anchor so pop_stream / stream_delta can
                 # later truncate the right line (the stream content), not the
                 # idle thinking line we're about to add.
-                self._tool_placeholder_line_backup = self._tool_placeholder_line
+                if self._tool_placeholder_line_backup is None:
+                    self._tool_placeholder_line_backup = self._tool_placeholder_line
                 self._tool_placeholder_line = len(out.lines)
                 # 2-space indent + grey50 distinguishes idle thinking from
                 # the 4-space cyan tool traces above it (so users don't
@@ -2269,9 +2278,11 @@ class TextualTUI(TUIBase):
             self._petrify_tool_placeholder()
         self._stream_buf += delta
         self._schedule_stream_render()
-        # If no further delta arrives in the next 500ms, show a "still thinking"
-        # spinner in #live so the user sees feedback during LLM reasoning gaps.
-        self._schedule_idle_thinking()
+        # Keep normal token streaming stable, but still surface long provider
+        # silences such as "generating a large tool_call argument". The delay is
+        # intentionally much longer than the render debounce so small chunks do
+        # not get separated by a thinking line.
+        self._schedule_idle_thinking(delay=2.0)
 
     def flush_stream(self, metadata: dict | None = None) -> None:
         self._activity_phase = "flush_stream"

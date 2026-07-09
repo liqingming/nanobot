@@ -1,4 +1,5 @@
 import {
+  Component,
   Suspense,
   lazy,
   memo,
@@ -8,6 +9,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 
 import { cn } from "@/lib/utils";
@@ -16,6 +18,7 @@ interface MarkdownTextProps {
   children: string;
   className?: string;
   streaming?: boolean;
+  onOpenFilePreview?: (path: string) => void;
 }
 
 const loadMarkdownRenderer = () => import("@/components/MarkdownTextRenderer");
@@ -25,13 +28,19 @@ const MemoizedMarkdownRenderer = memo(function MemoizedMarkdownRenderer({
   source,
   className,
   highlightCode,
+  onOpenFilePreview,
 }: {
   source: string;
   className?: string;
   highlightCode: boolean;
+  onOpenFilePreview?: (path: string) => void;
 }) {
   return (
-    <LazyMarkdownRenderer className={className} highlightCode={highlightCode}>
+    <LazyMarkdownRenderer
+      className={className}
+      highlightCode={highlightCode}
+      onOpenFilePreview={onOpenFilePreview}
+    >
       {source}
     </LazyMarkdownRenderer>
   );
@@ -40,6 +49,22 @@ const MemoizedMarkdownRenderer = memo(function MemoizedMarkdownRenderer({
 const SHORT_STREAM_COMMIT_MS = 80;
 const MEDIUM_STREAM_COMMIT_MS = 140;
 const LONG_STREAM_COMMIT_MS = 220;
+const STREAMING_HIGHLIGHT_CHAR_LIMIT = 16_000;
+
+class MarkdownRendererBoundary extends Component<
+  { children: ReactNode; fallback: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
 
 export function preloadMarkdownText(): void {
   void loadMarkdownRenderer();
@@ -54,33 +79,39 @@ export function MarkdownText({
   children,
   className,
   streaming = false,
+  onOpenFilePreview,
 }: MarkdownTextProps) {
   const renderedSource = useStreamingMarkdownSource(children, streaming);
-  const highlightCode = !streaming && renderedSource === children;
+  const highlightCode = streaming
+    ? renderedSource.length <= STREAMING_HIGHLIGHT_CHAR_LIMIT
+    : renderedSource === children;
 
   useEffect(() => {
     if (streaming) preloadMarkdownText();
   }, [streaming]);
 
-  return (
-    <Suspense
-      fallback={
-        <div
-          className={cn(
-            "whitespace-pre-wrap break-words leading-relaxed text-foreground/92",
-            className,
-          )}
-        >
-          {renderedSource}
-        </div>
-      }
+  const plainFallback = (
+    <div
+      className={cn(
+        "whitespace-pre-wrap break-words leading-relaxed text-foreground/92",
+        className,
+      )}
     >
-      <MemoizedMarkdownRenderer
-        source={renderedSource}
-        className={className}
-        highlightCode={highlightCode}
-      />
-    </Suspense>
+      {renderedSource}
+    </div>
+  );
+
+  return (
+    <MarkdownRendererBoundary fallback={plainFallback}>
+      <Suspense fallback={plainFallback}>
+        <MemoizedMarkdownRenderer
+          source={renderedSource}
+          className={className}
+          highlightCode={highlightCode}
+          onOpenFilePreview={onOpenFilePreview}
+        />
+      </Suspense>
+    </MarkdownRendererBoundary>
   );
 }
 

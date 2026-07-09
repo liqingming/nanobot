@@ -1,6 +1,15 @@
 import type { BootstrapResponse } from "./types";
+import { fetchWithTimeout } from "./http";
 
 const SECRET_STORAGE_KEY = "nanobot-webui.bootstrap-secret";
+const URL_SECRET_PARAM = "bootstrapSecret";
+
+export class BootstrapAuthRequiredError extends Error {
+  constructor(message = "bootstrap authentication required") {
+    super(message);
+    this.name = "BootstrapAuthRequiredError";
+  }
+}
 
 /** Read a previously saved bootstrap secret from localStorage. */
 export function loadSavedSecret(): string {
@@ -30,6 +39,29 @@ export function clearSavedSecret(): void {
   }
 }
 
+export function consumeUrlBootstrapSecret(): string {
+  if (typeof window === "undefined") return "";
+  const hash = window.location.hash || "";
+  const queryStart = hash.indexOf("?");
+  if (queryStart < 0) return "";
+
+  const path = hash.slice(0, queryStart) || "#/";
+  const query = hash.slice(queryStart + 1);
+  const params = new URLSearchParams(query);
+  const secret = params.get(URL_SECRET_PARAM)?.trim() || "";
+  if (!secret) return "";
+
+  params.delete(URL_SECRET_PARAM);
+  const nextQuery = params.toString();
+  const nextHash = `${path}${nextQuery ? `?${nextQuery}` : ""}`;
+  window.history.replaceState(
+    null,
+    "",
+    `${window.location.pathname}${window.location.search}${nextHash}`,
+  );
+  return secret;
+}
+
 /**
  * Fetch a short-lived token + the WebSocket path from the gateway's
  * ``/webui/bootstrap`` endpoint.
@@ -37,22 +69,31 @@ export function clearSavedSecret(): void {
 export async function fetchBootstrap(
   baseUrl: string = "",
   secret: string = "",
+  timeoutMs?: number,
 ): Promise<BootstrapResponse> {
   const headers: Record<string, string> = {};
   if (secret) {
     headers["X-Nanobot-Auth"] = secret;
   }
-  const res = await fetch(`${baseUrl}/webui/bootstrap`, {
+  const res = await fetchWithTimeout(`${baseUrl}/webui/bootstrap`, {
     method: "GET",
     credentials: "same-origin",
     headers,
-  });
+  }, timeoutMs);
   if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new BootstrapAuthRequiredError(`bootstrap failed: HTTP ${res.status}`);
+    }
     throw new Error(`bootstrap failed: HTTP ${res.status}`);
   }
   const body = (await res.json()) as BootstrapResponse;
   if (!body.token || !body.ws_path) {
     throw new Error("bootstrap response missing token or ws_path");
+  }
+  if (!body.api_token) {
+    throw new BootstrapAuthRequiredError(
+      "bootstrap authentication required: missing api_token",
+    );
   }
   return body;
 }
@@ -64,9 +105,23 @@ export async function fetchBootstrap(
  * matters because some WS servers dispatch handshakes based on the literal
  * path, not a normalised form.
  */
-export function deriveWsUrl(wsPath: string, token: string): string {
-  const path = wsPath && wsPath.startsWith("/") ? wsPath : `/${wsPath || ""}`;
+export function deriveWsUrl(
+  wsPath: string,
+  token: string,
+  wsUrl?: string | null,
+): string {
   const query = `?token=${encodeURIComponent(token)}`;
+  const path = wsPath && wsPath.startsWith("/") ? wsPath : `/${wsPath || ""}`;
+  if (typeof window !== "undefined" && window.location.port === "5173") {
+    const host = window.location.hostname.includes(":")
+      ? `[${window.location.hostname}]`
+      : window.location.hostname;
+    return `ws://${host}:8765${path}${query}`;
+  }
+  if (wsUrl && /^(wss?|nanobot-host):\/\//i.test(wsUrl)) {
+    const join = wsUrl.includes("?") ? "&" : "?";
+    return `${wsUrl}${join}token=${encodeURIComponent(token)}`;
+  }
   if (typeof window === "undefined") {
     return `ws://127.0.0.1:8765${path}${query}`;
   }

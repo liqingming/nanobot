@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -11,11 +12,14 @@ except ImportError:
     pytest.skip("Telegram dependencies not installed (python-telegram-bot)", allow_module_level=True)
 
 from nanobot.bus.events import OutboundMessage
+from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram import (
     TELEGRAM_REPLY_CONTEXT_MAX_LEN,
     TelegramChannel,
     TelegramConfig,
+    _markdown_to_telegram_html,
+    _split_telegram_markdown,
     _StreamBuf,
 )
 
@@ -36,10 +40,18 @@ class _FakeUpdater:
     def __init__(self, on_start_polling) -> None:
         self._on_start_polling = on_start_polling
         self.start_polling_kwargs = None
+        self.start_webhook_kwargs = None
 
     async def start_polling(self, **kwargs) -> None:
         self.start_polling_kwargs = kwargs
         self._on_start_polling()
+
+    async def start_webhook(self, **kwargs) -> None:
+        self.start_webhook_kwargs = kwargs
+        self._on_start_polling()
+
+    async def stop(self) -> None:
+        pass
 
 
 class _FakeBot:
@@ -103,6 +115,12 @@ class _FakeApp:
     async def start(self) -> None:
         pass
 
+    async def stop(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
+
 
 class _FakeBuilder:
     def __init__(self, app: _FakeApp) -> None:
@@ -164,6 +182,67 @@ def _make_telegram_update(
     return SimpleNamespace(message=message, effective_user=user)
 
 
+def _assert_code_blocks_render_balanced(chunks: list[str]) -> None:
+    for chunk in chunks:
+        html = _markdown_to_telegram_html(chunk)
+        assert html.count("<pre><code>") == html.count("</code></pre>")
+
+
+def test_split_telegram_markdown_inside_code_block_moves_before_fence() -> None:
+    content = "Intro paragraph.\n```python\nprint('a')\nprint('b')\n```\nDone"
+
+    chunks = _split_telegram_markdown(content, max_len=35)
+
+    assert chunks[0] == "Intro paragraph.\n"
+    assert chunks[1].startswith("```python\nprint('a')")
+    _assert_code_blocks_render_balanced(chunks)
+
+
+def test_split_telegram_markdown_long_code_block_closes_and_reopens() -> None:
+    content = "```python\n" + ("print('line one')\n" * 6) + "```\nDone"
+
+    chunks = _split_telegram_markdown(content, max_len=60)
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 60 for chunk in chunks)
+    assert chunks[0].startswith("```python\n")
+    assert chunks[0].endswith("\n```")
+    assert chunks[1].startswith("```python\n")
+    _assert_code_blocks_render_balanced(chunks)
+
+
+def test_split_telegram_markdown_multiple_code_blocks() -> None:
+    content = (
+        "First\n"
+        "```js\n"
+        "one();\n"
+        "```\n"
+        "Middle paragraph here\n"
+        "```py\n"
+        "two()\n"
+        "three()\n"
+        "```\n"
+        "End"
+    )
+
+    chunks = _split_telegram_markdown(content, max_len=55)
+
+    assert chunks[0].endswith("Middle paragraph here\n")
+    assert chunks[1].startswith("```py\n")
+    _assert_code_blocks_render_balanced(chunks)
+
+
+def test_split_telegram_markdown_leading_whitespace_before_fence() -> None:
+    content = "\n```python\n" + ("print('line one')\n" * 6) + "```\nDone"
+
+    chunks = _split_telegram_markdown(content, max_len=60)
+
+    assert chunks
+    assert all(chunk.strip() for chunk in chunks)
+    assert chunks[0].startswith("```python\n")
+    _assert_code_blocks_render_balanced(chunks)
+
+
 @pytest.mark.asyncio
 async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     _FakeHTTPXRequest.clear()
@@ -197,9 +276,11 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     assert callable(app.updater.start_polling_kwargs["error_callback"])
     assert any(cmd.command == "status" for cmd in app.bot.commands)
     assert any(cmd.command == "history" for cmd in app.bot.commands)
+    assert any(cmd.command == "skill" for cmd in app.bot.commands)
     assert any(cmd.command == "dream" for cmd in app.bot.commands)
     assert any(cmd.command == "dream_log" for cmd in app.bot.commands)
     assert any(cmd.command == "dream_restore" for cmd in app.bot.commands)
+    assert any(cmd.command == "dream_prompt" for cmd in app.bot.commands)
 
 
 @pytest.mark.asyncio
@@ -230,6 +311,98 @@ async def test_start_respects_custom_pool_config(monkeypatch) -> None:
     assert api_req.kwargs["connection_pool_size"] == 32
     assert api_req.kwargs["pool_timeout"] == 10.0
     assert poll_req.kwargs["pool_timeout"] == 10.0
+
+
+def test_webhook_config_requires_https_url_and_secret() -> None:
+    with pytest.raises(ValueError, match="webhook_url is required"):
+        TelegramConfig(enabled=True, token="123:abc", mode="webhook")
+
+    with pytest.raises(ValueError, match="public HTTPS URL"):
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            mode="webhook",
+            webhook_url="http://example.com/telegram",
+            webhook_secret_token="secret",
+        )
+
+    with pytest.raises(ValueError, match="webhook_secret_token is required"):
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            mode="webhook",
+            webhook_url="https://example.com/telegram",
+        )
+
+
+@pytest.mark.asyncio
+async def test_start_webhook_mode(monkeypatch) -> None:
+    _FakeHTTPXRequest.clear()
+    config = TelegramConfig(
+        enabled=True,
+        token="123:abc",
+        allow_from=["*"],
+        mode="webhook",
+        webhook_url="https://example.com/telegram",
+        webhook_listen_host="127.0.0.1",
+        webhook_listen_port=8081,
+        webhook_path="/telegram",
+        webhook_secret_token="secret-token",
+        webhook_max_connections=1,
+    )
+    bus = MessageBus()
+    channel = TelegramChannel(config, bus)
+    app = _FakeApp(lambda: setattr(channel, "_running", False))
+    builder = _FakeBuilder(app)
+
+    monkeypatch.setattr("nanobot.channels.telegram.HTTPXRequest", _FakeHTTPXRequest)
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.Application",
+        SimpleNamespace(builder=lambda: builder),
+    )
+
+    await channel.start()
+
+    assert app.updater.start_polling_kwargs is None
+    assert app.updater.start_webhook_kwargs == {
+        "listen": "127.0.0.1",
+        "port": 8081,
+        "url_path": "telegram",
+        "webhook_url": "https://example.com/telegram",
+        "allowed_updates": ["message"],
+        "drop_pending_updates": False,
+        "secret_token": "secret-token",
+        "max_connections": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_running_message_handler_reorders_same_session_updates() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    seen: list[int] = []
+
+    async def fake_process(update, context) -> None:
+        seen.append(update.message.message_id)
+
+    channel._process_message_update = fake_process
+    channel._running = True
+
+    first = _make_telegram_update(text="first")
+    first.update_id = 100
+    first.message.message_id = 1
+    second = _make_telegram_update(text="second")
+    second.update_id = 101
+    second.message.message_id = 2
+
+    await channel._on_message(second, None)
+    await channel._on_message(first, None)
+    await asyncio.sleep(0.3)
+    channel._running = False
+
+    assert seen == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -293,6 +466,62 @@ async def test_send_text_gives_up_after_max_retries() -> None:
         tg_mod._SEND_RETRY_BASE_DELAY = orig_delay
 
     assert channel._app.bot.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_send_rich_capability_error_latches_and_falls_back() -> None:
+    from telegram.error import BadRequest
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], rich_messages=True),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.do_api_request = AsyncMock(side_effect=BadRequest("Method not found"))
+
+    await channel.send(OutboundMessage(channel="telegram", chat_id="123", content="**hello**"))
+
+    assert channel._rich_send_disabled is True
+    channel._app.bot.do_api_request.assert_awaited_once()
+    assert len(channel._app.bot.sent_messages) == 1
+    assert channel._app.bot.sent_messages[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_send_rich_bad_request_does_not_latch_capability() -> None:
+    from telegram.error import BadRequest
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], rich_messages=True),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.do_api_request = AsyncMock(
+        side_effect=BadRequest("Bad Request: message to reply not found")
+    )
+
+    await channel.send(OutboundMessage(channel="telegram", chat_id="123", content="**hello**"))
+
+    assert channel._rich_send_disabled is False
+    channel._app.bot.do_api_request.assert_awaited_once()
+    assert len(channel._app.bot.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_default_skips_send_rich_message() -> None:
+    """By default, sendRichMessage should not be called."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.do_api_request = AsyncMock()
+
+    await channel.send(OutboundMessage(channel="telegram", chat_id="123", content="**hello**"))
+
+    channel._app.bot.do_api_request.assert_not_called()
+    assert len(channel._app.bot.sent_messages) == 1
+    assert channel._app.bot.sent_messages[0]["text"]
 
 
 @pytest.mark.asyncio
@@ -377,7 +606,7 @@ async def test_send_delta_stream_end_raises_and_keeps_buffer_on_failure() -> Non
     channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0)
 
     with pytest.raises(RuntimeError, match="boom"):
-        await channel.send_delta("123", "", {"_stream_end": True})
+        await channel.send_delta("123", "", stream_end=True)
 
     assert "123" in channel._stream_bufs
 
@@ -394,7 +623,7 @@ async def test_send_delta_stream_end_treats_not_modified_as_success() -> None:
     channel._app.bot.edit_message_text = AsyncMock(side_effect=BadRequest("Message is not modified"))
     channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0, stream_id="s:0")
 
-    await channel.send_delta("123", "", {"_stream_end": True, "_stream_id": "s:0"})
+    await channel.send_delta("123", "", stream_id="s:0", stream_end=True)
 
     assert "123" not in channel._stream_bufs
 
@@ -415,7 +644,7 @@ async def test_send_delta_stream_end_does_not_fallback_on_network_timeout() -> N
     channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0)
 
     with pytest.raises(TimedOut, match="network timeout"):
-        await channel.send_delta("123", "", {"_stream_end": True})
+        await channel.send_delta("123", "", stream_end=True)
 
     # Every call to edit_message_text must have used parse_mode="HTML" —
     # no plain-text fallback call should have been made.
@@ -439,7 +668,7 @@ async def test_send_delta_stream_end_does_not_fallback_on_network_error() -> Non
     channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0)
 
     with pytest.raises(NetworkError, match="connection reset"):
-        await channel.send_delta("123", "", {"_stream_end": True})
+        await channel.send_delta("123", "", stream_end=True)
 
     # Every call to edit_message_text must have used parse_mode="HTML" —
     # no plain-text fallback call should have been made.
@@ -466,7 +695,7 @@ async def test_send_delta_stream_end_falls_back_on_bad_request() -> None:
     )
     channel._stream_bufs["123"] = _StreamBuf(text="hello <bad>", message_id=7, last_edit=0.0)
 
-    await channel.send_delta("123", "", {"_stream_end": True})
+    await channel.send_delta("123", "", stream_end=True)
 
     # edit_message_text should have been called twice: once for HTML, once for plain fallback
     assert channel._app.bot.edit_message_text.call_count == 2
@@ -497,7 +726,7 @@ async def test_send_delta_stream_end_splits_oversized_reply() -> None:
     oversized = "x" * (4000 + 500)
     channel._stream_bufs["123"] = _StreamBuf(text=oversized, message_id=7, last_edit=0.0)
 
-    await channel.send_delta("123", "", {"_stream_end": True})
+    await channel.send_delta("123", "", stream_end=True)
 
     channel._app.bot.edit_message_text.assert_called_once()
     edit_text = channel._app.bot.edit_message_text.call_args.kwargs.get("text", "")
@@ -535,7 +764,7 @@ async def test_send_delta_stream_end_html_expansion_does_not_overflow() -> None:
 
     channel._stream_bufs["123"] = _StreamBuf(text=markdown_text, message_id=7, last_edit=0.0)
 
-    await channel.send_delta("123", "", {"_stream_end": True})
+    await channel.send_delta("123", "", stream_end=True)
 
     channel._app.bot.edit_message_text.assert_called_once()
     edit_text = channel._app.bot.edit_message_text.call_args.kwargs.get("text", "")
@@ -545,6 +774,36 @@ async def test_send_delta_stream_end_html_expansion_does_not_overflow() -> None:
     )
 
     channel._app.bot.send_message.assert_called_once()
+    assert "123" not in channel._stream_bufs
+
+
+@pytest.mark.asyncio
+async def test_send_delta_stream_end_splits_long_code_block_before_html_rendering() -> None:
+    """Final streamed replies must not split Telegram HTML inside <pre><code>."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._app.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=99))
+
+    raw_text = "```python\n" + ("print(\"line\")\n" * 450) + "```\nDone"
+    channel._stream_bufs["123"] = _StreamBuf(text=raw_text, message_id=7, last_edit=0.0)
+
+    await channel.send_delta("123", "", stream_end=True)
+
+    html_chunks = [
+        channel._app.bot.edit_message_text.call_args.kwargs.get("text", ""),
+        *[
+            call.kwargs.get("text", "")
+            for call in channel._app.bot.send_message.call_args_list
+        ],
+    ]
+    assert len(html_chunks) > 1
+    for html in html_chunks:
+        assert len(html) <= 4096
+        assert html.count("<pre><code>") == html.count("</code></pre>")
     assert "123" not in channel._stream_bufs
 
 
@@ -562,7 +821,7 @@ async def test_send_delta_new_stream_id_replaces_stale_buffer() -> None:
         stream_id="old:0",
     )
 
-    await channel.send_delta("123", "world", {"_stream_delta": True, "_stream_id": "new:0"})
+    await channel.send_delta("123", "world", stream_id="new:0")
 
     buf = channel._stream_bufs["123"]
     assert buf.text == "world"
@@ -582,7 +841,7 @@ async def test_send_delta_incremental_edit_treats_not_modified_as_success() -> N
     channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0, stream_id="s:0")
     channel._app.bot.edit_message_text = AsyncMock(side_effect=BadRequest("Message is not modified"))
 
-    await channel.send_delta("123", "", {"_stream_delta": True, "_stream_id": "s:0"})
+    await channel.send_delta("123", "", stream_id="s:0")
 
     assert channel._stream_bufs["123"].last_edit > 0.0
 
@@ -607,7 +866,7 @@ async def test_send_delta_incremental_edit_splits_oversized_buffer() -> None:
         text=oversized, message_id=7, last_edit=0.0, stream_id="s:0"
     )
 
-    await channel.send_delta("123", "y", {"_stream_delta": True, "_stream_id": "s:0"})
+    await channel.send_delta("123", "y", stream_id="s:0")
 
     channel._app.bot.edit_message_text.assert_called_once()
     edit_text = channel._app.bot.edit_message_text.call_args.kwargs.get("text", "")
@@ -631,7 +890,8 @@ async def test_send_delta_initial_send_keeps_message_in_thread() -> None:
     await channel.send_delta(
         "123",
         "hello",
-        {"_stream_delta": True, "_stream_id": "s:0", "message_thread_id": 42},
+        {"message_thread_id": 42},
+        stream_id="s:0",
     )
 
     assert channel._app.bot.sent_messages[0]["message_thread_id"] == 42
@@ -705,7 +965,8 @@ async def test_send_progress_keeps_message_in_topic() -> None:
             channel="telegram",
             chat_id="123",
             content="hello",
-            metadata={"_progress": True, "message_thread_id": 42},
+            event=ProgressEvent(content="hello"),
+            metadata={"message_thread_id": 42},
         )
     )
 
@@ -1253,6 +1514,23 @@ async def test_forward_command_does_not_inject_reply_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forward_command_pairs_unauthorized_private_user(monkeypatch) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    monkeypatch.setattr(
+        "nanobot.channels.base.generate_code", lambda _ch, _sid: "ABCD-EFGH"
+    )
+
+    await channel._forward_command(_make_telegram_update(text="/new", chat_type="private"), None)
+
+    assert len(channel._app.bot.sent_messages) == 1
+    assert "ABCD-EFGH" in channel._app.bot.sent_messages[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_forward_command_preserves_dream_log_args_and_strips_bot_suffix() -> None:
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
@@ -1293,6 +1571,14 @@ async def test_forward_command_normalizes_telegram_safe_dream_aliases() -> None:
     assert len(handled) == 1
     assert handled[0]["content"] == "/dream-restore deadbeef"
 
+    handled.clear()
+    update = _make_telegram_update(text="/dream_prompt@nanobot_test init", reply_to_message=None)
+
+    await channel._forward_command(update, None)
+
+    assert len(handled) == 1
+    assert handled[0]["content"] == "/dream-prompt init"
+
 
 def test_telegram_bus_slash_command_regex_matches_agent_loop_commands() -> None:
     """Bus-routed slash commands must match the Telegram handler regex (see builtin router)."""
@@ -1300,12 +1586,18 @@ def test_telegram_bus_slash_command_regex_matches_agent_loop_commands() -> None:
     assert pat.fullmatch("/history")
     assert pat.fullmatch("/history 5")
     assert pat.fullmatch("/goal ship the feature")
+    assert pat.fullmatch("/trigger")
+    assert pat.fullmatch("/trigger PR review")
     assert pat.fullmatch("/pairing list")
     assert pat.fullmatch("/model fast")
+    assert pat.fullmatch("/skill")
+    assert pat.fullmatch("/skill@nanobot_bot")
     assert pat.fullmatch("/new@nanobot_bot")
     assert pat.fullmatch("/goal@nanobot_bot refine objective")
+    assert pat.fullmatch("/trigger@nanobot_bot CI summary")
     assert pat.fullmatch("/dream-log deadbeef") is None
     assert pat.fullmatch("/dream-restore deadbeef") is None
+    assert pat.fullmatch("/dream-prompt init") is None
 
 
 @pytest.mark.asyncio
@@ -1323,64 +1615,81 @@ async def test_on_help_includes_restart_command() -> None:
     help_text = update.message.reply_text.await_args.args[0]
     assert "/restart" in help_text
     assert "/status" in help_text
+    assert "/skill" in help_text
     assert "/dream" in help_text
     assert "/dream-log" in help_text
+    assert "/dream-prompt" in help_text
     assert "/goal" in help_text
+    assert "/trigger" in help_text
     assert "/pairing" in help_text
     assert "/model" in help_text
     assert "/dream-restore" in help_text
 
 
 @pytest.mark.asyncio
-async def test_on_start_ignores_unauthorized_user_silently() -> None:
+async def test_on_start_sends_pairing_code_to_unauthorized_private_user(monkeypatch) -> None:
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], group_policy="open"),
         MessageBus(),
     )
+    channel._app = _FakeApp(lambda: None)
     update = _make_telegram_update(text="/start", chat_type="private")
     update.message.reply_text = AsyncMock()
+    monkeypatch.setattr(
+        "nanobot.channels.base.generate_code", lambda _ch, _sid: "ABCD-EFGH"
+    )
 
     await channel._on_start(update, None)
 
     update.message.reply_text.assert_not_awaited()
+    assert len(channel._app.bot.sent_messages) == 1
+    assert "ABCD-EFGH" in channel._app.bot.sent_messages[0]["text"]
 
 
 @pytest.mark.asyncio
-async def test_on_help_ignores_unauthorized_user_silently() -> None:
+async def test_on_help_sends_pairing_code_to_unauthorized_private_user(monkeypatch) -> None:
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], group_policy="open"),
         MessageBus(),
     )
+    channel._app = _FakeApp(lambda: None)
     update = _make_telegram_update(text="/help", chat_type="private")
     update.message.reply_text = AsyncMock()
+    monkeypatch.setattr(
+        "nanobot.channels.base.generate_code", lambda _ch, _sid: "ABCD-EFGH"
+    )
 
     await channel._on_help(update, None)
 
     update.message.reply_text.assert_not_awaited()
+    assert len(channel._app.bot.sent_messages) == 1
+    assert "ABCD-EFGH" in channel._app.bot.sent_messages[0]["text"]
 
 
 @pytest.mark.asyncio
-async def test_on_message_ignores_unauthorized_user_before_side_effects() -> None:
+async def test_on_message_pairs_unauthorized_private_user_before_side_effects(
+    monkeypatch,
+) -> None:
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["999"], group_policy="open"),
         MessageBus(),
     )
     channel._app = _FakeApp(lambda: None)
     started_typing: list[str] = []
-    handled: list[dict] = []
     channel._start_typing = lambda chat_id: started_typing.append(chat_id)
     channel._add_reaction = AsyncMock(return_value=None)
-
-    async def capture_handle(**kwargs) -> None:
-        handled.append(kwargs)
-
-    channel._handle_message = capture_handle
+    channel._download_message_media = AsyncMock(return_value=([], []))
+    monkeypatch.setattr(
+        "nanobot.channels.base.generate_code", lambda _ch, _sid: "ABCD-EFGH"
+    )
 
     await channel._on_message(_make_telegram_update(text="hello", chat_type="private"), None)
 
     assert started_typing == []
     channel._add_reaction.assert_not_awaited()
-    assert handled == []
+    channel._download_message_media.assert_not_awaited()
+    assert len(channel._app.bot.sent_messages) == 1
+    assert "ABCD-EFGH" in channel._app.bot.sent_messages[0]["text"]
 
 
 @pytest.mark.asyncio

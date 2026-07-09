@@ -79,6 +79,37 @@ async def test_publishes_ask_user_message_to_bus() -> None:
     data = json.loads(out)
     assert data == {"answers": {"yes?": "y"}}
 
+def test_parameters_allow_ten_questions() -> None:
+    tool = AskUserTool()
+    assert tool.parameters["properties"]["questions"]["maxItems"] == 10
+
+
+@pytest.mark.asyncio
+async def test_publishes_ten_questions_to_bus() -> None:
+    bus = MessageBus()
+    tool = AskUserTool(bus=bus)
+    tool.set_context(RequestContext(channel="cli", chat_id="test"))
+    questions = [
+        {
+            "question": f"Q{i}?",
+            "options": [
+                {"label": "A", "description": ""},
+                {"label": "B", "description": ""},
+            ],
+        }
+        for i in range(10)
+    ]
+
+    task = asyncio.create_task(tool.execute(questions=questions))
+    await asyncio.sleep(0.05)
+    msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+    assert msg.metadata.get("_ask_user_questions") == questions
+    cid = msg.metadata["_ask_user_id"]
+    deliver_reply(cid, {q["question"]: "A" for q in questions})
+    out = await asyncio.wait_for(task, timeout=1.0)
+    assert len(json.loads(out)["answers"]) == 10
+
 
 @pytest.mark.asyncio
 async def test_deliver_reply_resolves_pending_future() -> None:

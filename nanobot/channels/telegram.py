@@ -10,8 +10,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -25,6 +26,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
+from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
@@ -35,11 +37,84 @@ from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
 # Telegram's actual API limit is 4096; we split raw markdown at 4000 as a
-# safety margin for mid-stream edits (plain text).  For _stream_end, we
-# convert to HTML first and then split at the true 4096-char boundary so
-# the final rendered message never overflows.
+# safety margin for mid-stream edits (plain text).  On stream end, we split
+# raw markdown into chunks whose rendered HTML fits Telegram's true 4096-char
+# boundary so the final rendered message never overflows.
 TELEGRAM_HTML_MAX_LEN = 4096
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
+
+
+def _split_telegram_markdown(content: str, max_len: int) -> list[str]:
+    """Split raw Telegram Markdown without leaving fenced code blocks unbalanced."""
+    if not content:
+        return []
+    content = content.lstrip()
+    if not content:
+        return []
+    if len(content) <= max_len:
+        return [content]
+
+    def fence_line(fence_pos: int) -> str:
+        line_end = content.find("\n", fence_pos)
+        if line_end < 0:
+            return content[fence_pos:]
+        return content[fence_pos:line_end]
+
+    def split_inside_fenced_code_block(pos: int) -> tuple[bool, int, str]:
+        if content[:pos].count("```") % 2 == 0:
+            return False, -1, ""
+        opening = content.rfind("```", 0, pos)
+        if opening < 0:
+            return True, -1, "```"
+        return True, opening, fence_line(opening)
+
+    chunks: list[str] = []
+    while content:
+        if len(content) <= max_len:
+            chunks.append(content)
+            break
+
+        cut = content[:max_len]
+        pos = cut.rfind("\n")
+        if pos <= 0:
+            pos = cut.rfind(" ")
+        if pos <= 0:
+            pos = max_len
+
+        inside_code, opening, fence = split_inside_fenced_code_block(pos)
+        if inside_code:
+            if opening > 0:
+                pos = opening
+            else:
+                closing = "\n```"
+                min_code_pos = len(fence)
+                if content.startswith(fence + "\n"):
+                    min_code_pos += 1
+                if pos < min_code_pos and min_code_pos + len(closing) > max_len:
+                    chunks.append(content[:max_len])
+                    content = content[max_len:].lstrip()
+                    continue
+                if pos + len(closing) > max_len:
+                    budget = max_len - len(closing)
+                    if budget > 0:
+                        recut = content[:budget]
+                        adjusted = recut.rfind("\n")
+                        if adjusted <= 0:
+                            adjusted = recut.rfind(" ")
+                        pos = adjusted if adjusted > 0 else budget
+                    else:
+                        closing = "```"
+                        pos = max_len - len(closing)
+                chunks.append(content[:pos] + closing)
+                remainder = content[pos:]
+                if remainder.startswith("\n"):
+                    remainder = remainder[1:]
+                content = f"{fence}\n{remainder}"
+                continue
+
+        chunks.append(content[:pos])
+        content = content[pos:].lstrip()
+    return chunks
 
 
 def _escape_telegram_html(text: str) -> str:
@@ -211,6 +286,32 @@ def _markdown_to_telegram_html(text: str) -> str:
     return text
 
 
+def _split_telegram_markdown_html(content: str, max_html_len: int) -> list[str]:
+    """Split raw Telegram Markdown and return HTML chunks within Telegram's limit."""
+    chunks: list[str] = []
+    pending = _split_telegram_markdown(content, TELEGRAM_MAX_MESSAGE_LEN)
+    while pending:
+        chunk = pending.pop(0)
+        html = _markdown_to_telegram_html(chunk)
+        if len(html) <= max_html_len:
+            chunks.append(html)
+            continue
+
+        # Markdown can expand when rendered as HTML (tags/entities). Re-split
+        # the raw markdown with a smaller budget instead of slicing HTML tags.
+        next_limit = max(1, int(len(chunk) * max_html_len / len(html)) - 8)
+        next_limit = min(next_limit, len(chunk) - 1)
+        if next_limit <= 0:
+            chunks.extend(split_message(html, max_html_len))
+            continue
+        parts = _split_telegram_markdown(chunk, next_limit)
+        if len(parts) == 1 and parts[0] == chunk:
+            chunks.extend(split_message(html, max_html_len))
+            continue
+        pending = parts + pending
+    return chunks
+
+
 _SEND_MAX_RETRIES = 3
 _SEND_RETRY_BASE_DELAY = 0.5  # seconds, doubled each retry
 _STREAM_EDIT_INTERVAL_DEFAULT = 0.6  # min seconds between edit_message_text calls
@@ -225,11 +326,22 @@ class _StreamBuf:
     stream_id: str | None = None
 
 
+@dataclass
+class _QueuedTelegramUpdate:
+    """Telegram update staged for per-session ordered processing."""
+
+    kind: Literal["command", "message"]
+    update: Update
+    context: Any
+    sort_key: tuple[int, int]
+
+
 class TelegramConfig(Base):
     """Telegram channel configuration."""
 
     enabled: bool = False
     token: str = ""
+    mode: Literal["polling", "webhook"] = "polling"
     allow_from: list[str] = Field(default_factory=list)
     proxy: str | None = None
     reply_to_message: bool = False
@@ -240,14 +352,51 @@ class TelegramConfig(Base):
     streaming: bool = True
     # Enable inline keyboard buttons in Telegram messages.
     inline_keyboards: bool = False
+    # Opt in to Bot API 10.1 sendRichMessage for richer markdown rendering.
+    rich_messages: bool = False
     stream_edit_interval: float = Field(default=_STREAM_EDIT_INTERVAL_DEFAULT, ge=0.1)
+    webhook_url: str = ""
+    webhook_listen_host: str = "127.0.0.1"
+    webhook_listen_port: int = Field(default=8081, ge=1, le=65535)
+    webhook_path: str = "/telegram"
+    webhook_secret_token: str = ""
+    webhook_max_connections: int = Field(default=4, ge=1, le=100)
+
+    @field_validator("webhook_path")
+    @classmethod
+    def webhook_path_must_start_with_slash(cls, value: str) -> str:
+        value = value.strip() or "/telegram"
+        if not value.startswith("/"):
+            raise ValueError('webhook_path must start with "/"')
+        return value
+
+    @model_validator(mode="after")
+    def validate_webhook_config(self) -> "TelegramConfig":
+        if self.mode != "webhook":
+            return self
+
+        url = self.webhook_url.strip()
+        if not url:
+            raise ValueError("webhook_url is required when Telegram mode is webhook")
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("webhook_url must be a public HTTPS URL")
+        secret = self.webhook_secret_token.strip()
+        if not secret:
+            raise ValueError("webhook_secret_token is required when Telegram mode is webhook")
+        if len(secret) > 256 or re.match(r"^[A-Za-z0-9_-]+$", secret) is None:
+            raise ValueError(
+                "webhook_secret_token must be 1-256 characters using only A-Z, a-z, 0-9, _ and -"
+            )
+        return self
 
 
 class TelegramChannel(BaseChannel):
     """
-    Telegram channel using long polling.
+    Telegram channel using long polling or webhook mode.
 
-    Simple and reliable - no webhook/public IP needed.
+    Long polling is the default. Webhook mode requires a public HTTPS URL and a
+    Telegram secret token.
     """
 
     name = "telegram"
@@ -262,18 +411,21 @@ class TelegramChannel(BaseChannel):
         BotCommand("status", "Show bot status"),
         BotCommand("history", "Show recent conversation messages"),
         BotCommand("goal", "Start a sustained objective (long-running task)"),
+        BotCommand("trigger", "Create a named local trigger"),
         BotCommand("pairing", "Manage DM pairing (approve/deny/list)"),
         BotCommand("model", "Switch runtime model preset"),
+        BotCommand("skill", "List enabled skills"),
         BotCommand("dream", "Run Dream memory consolidation now"),
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
+        BotCommand("dream_prompt", "Tell Dream how to organize memory"),
         BotCommand("help", "Show available commands"),
     ]
 
     # Regex for slash commands routed to AgentLoop via ``_forward_command``.
     # Hyphenated ``dream-*`` commands stay on a separate handler (below).
     TELEGRAM_BUS_SLASH_COMMAND_RE = re.compile(
-        r"^/(?:new|stop|restart|status|dream|history|goal|pairing|model)(?:@\w+)?(?:\s+.*)?$"
+        r"^/(?:new|stop|restart|status|dream|history|goal|trigger|pairing|model|skill)(?:@\w+)?(?:\s+.*)?$"
     )
 
     @classmethod
@@ -294,6 +446,9 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
+        self._inbound_buffers: dict[str, list[_QueuedTelegramUpdate]] = {}
+        self._inbound_workers: dict[str, asyncio.Task] = {}
+        self._rich_send_disabled: bool = False  # Latch off if Bot API < 10.1
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -323,10 +478,12 @@ class TelegramChannel(BaseChannel):
             return content.replace("/dream_log", "/dream-log", 1)
         if content == "/dream_restore" or content.startswith("/dream_restore "):
             return content.replace("/dream_restore", "/dream-restore", 1)
+        if content == "/dream_prompt" or content.startswith("/dream_prompt "):
+            return content.replace("/dream_prompt", "/dream-prompt", 1)
         return content
 
     async def start(self) -> None:
-        """Start the Telegram bot with long polling."""
+        """Start the Telegram bot."""
         if not self.config.token:
             self.logger.error("bot token not configured")
             return
@@ -369,7 +526,9 @@ class TelegramChannel(BaseChannel):
         )
         self._app.add_handler(
             MessageHandler(
-                filters.Regex(r"^/(dream-log|dream_log|dream-restore|dream_restore)(?:@\w+)?(?:\s+.*)?$"),
+                filters.Regex(
+                    r"^/(dream-log|dream_log|dream-restore|dream_restore|dream-prompt|dream_prompt)(?:@\w+)?(?:\s+.*)?$"
+                ),
                 self._forward_command,
             )
         )
@@ -394,9 +553,12 @@ class TelegramChannel(BaseChannel):
         else:
             allowed_updates = ["message"]
 
-        self.logger.info("Starting bot (polling mode)...")
+        if self.config.mode == "webhook":
+            self.logger.info("Starting bot (webhook mode)...")
+        else:
+            self.logger.info("Starting bot (polling mode)...")
 
-        # Initialize and start polling
+        # Initialize and start receiving updates
         await self._app.initialize()
         await self._app.start()
 
@@ -412,12 +574,26 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             self.logger.warning("Failed to register bot commands: {}", e)
 
-        # Start polling (this runs until stopped)
-        await self._app.updater.start_polling(
-            allowed_updates=allowed_updates,
-            drop_pending_updates=False,  # Process pending messages on startup
-            error_callback=self._on_polling_error,
-        )
+        if self.config.mode == "webhook":
+            # ``url_path`` is the local HTTP route. ``webhook_url`` is the
+            # public HTTPS URL Telegram calls; reverse proxies may rewrite it.
+            await self._app.updater.start_webhook(
+                listen=self.config.webhook_listen_host,
+                port=self.config.webhook_listen_port,
+                url_path=self.config.webhook_path.lstrip("/"),
+                webhook_url=self.config.webhook_url.strip(),
+                allowed_updates=allowed_updates,
+                drop_pending_updates=False,
+                secret_token=self.config.webhook_secret_token.strip(),
+                max_connections=self.config.webhook_max_connections,
+            )
+        else:
+            # Start polling (this runs until stopped)
+            await self._app.updater.start_polling(
+                allowed_updates=allowed_updates,
+                drop_pending_updates=False,  # Process pending messages on startup
+                error_callback=self._on_polling_error,
+            )
 
         # Keep running until stopped
         while self._running:
@@ -435,6 +611,11 @@ class TelegramChannel(BaseChannel):
             task.cancel()
         self._media_group_tasks.clear()
         self._media_group_buffers.clear()
+
+        for task in self._inbound_workers.values():
+            task.cancel()
+        self._inbound_workers.clear()
+        self._inbound_buffers.clear()
 
         if self._app:
             self.logger.info("Stopping bot...")
@@ -461,14 +642,81 @@ class TelegramChannel(BaseChannel):
     def _is_remote_media_url(path: str) -> bool:
         return path.startswith(("http://", "https://"))
 
+    @staticmethod
+    def _is_rich_capability_error(exc: Exception) -> bool:
+        """True when the error indicates sendRichMessage is unavailable."""
+        err = str(exc).lower()
+        return (
+            "method not found" in err
+            or "unknown method" in err
+            or "bad request: invalid parameter" in err
+        )
+
+    async def _try_send_rich(
+        self,
+        chat_id: int,
+        content: str,
+        reply_params=None,
+        thread_kwargs: dict | None = None,
+        reply_markup=None,
+    ) -> bool:
+        """Attempt sendRichMessage (Bot API 10.1). Returns True on success."""
+        if not self._app:
+            return False
+
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "rich_message": {
+                "markdown": content,
+            },
+        }
+        if reply_params is not None:
+            # sendRichMessage uses reply_parameters (object), not reply_to_message_id.
+            if hasattr(reply_params, "message_id"):
+                payload["reply_parameters"] = {
+                    "message_id": reply_params.message_id,
+                    "allow_sending_without_reply": True,
+                }
+            else:
+                payload["reply_parameters"] = reply_params
+        if thread_kwargs:
+            payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+
+        try:
+            await self._call_with_retry(
+                self._app.bot.do_api_request,
+                "sendRichMessage",
+                api_kwargs=payload,
+            )
+            return True
+        except BadRequest as exc:
+            if self._is_rich_capability_error(exc):
+                self.logger.debug("sendRichMessage not available, disabling")
+                self._rich_send_disabled = True
+            else:
+                self.logger.debug("sendRichMessage rejected: {}", exc)
+            return False
+        except Exception as exc:
+            err_str = str(exc).lower()
+            is_timeout = "timed out" in err_str or isinstance(exc, TimedOut)
+            if is_timeout:
+                self.logger.debug("sendRichMessage timeout, falling back to legacy path")
+                return False
+            self.logger.debug("sendRichMessage failed: {}", exc)
+            return False
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
         if not self._app:
             self.logger.warning("bot not running")
             return
 
+        progress_event = msg.event if isinstance(msg.event, ProgressEvent) else None
+
         # Only stop typing indicator and remove reaction for final responses
-        if not msg.metadata.get("_progress", False):
+        if progress_event is None:
             self._stop_typing(msg.chat_id)
             if reply_to_message_id := msg.metadata.get("message_id"):
                 with suppress(ValueError):
@@ -553,14 +801,29 @@ class TelegramChannel(BaseChannel):
 
         # Send text content
         if msg.content and msg.content != "[empty message]":
-            render_as_blockquote = bool(msg.metadata.get("_tool_hint"))
+            render_as_blockquote = bool(progress_event and progress_event.tool_hint)
             buttons = getattr(msg, "buttons", None) or []
             reply_markup = self._build_keyboard(buttons) if buttons else None
             text = msg.content
             # Fallback: no native keyboard → splice labels into the message so the choices survive.
             if buttons and reply_markup is None:
                 text = f"{text}\n\n{self._buttons_as_text(buttons)}"
-            chunks = split_message(text, TELEGRAM_MAX_MESSAGE_LEN)
+
+            # Bot API 10.1 rich fast-path: send raw markdown via sendRichMessage.
+            # All non-blockquote content tries rich first; _rich_send_disabled
+            # latches off permanently if the server doesn't support it.
+            if (
+                not render_as_blockquote
+                and self.config.rich_messages
+                and not getattr(self, "_rich_send_disabled", False)
+            ):
+                rich_ok = await self._try_send_rich(
+                    chat_id, text, reply_params, thread_kwargs, reply_markup,
+                )
+                if rich_ok:
+                    return
+
+            chunks = _split_telegram_markdown(text, TELEGRAM_MAX_MESSAGE_LEN)
             for i, chunk in enumerate(chunks):
                 is_last = (i == len(chunks) - 1)
                 await self._send_text(
@@ -633,15 +896,23 @@ class TelegramChannel(BaseChannel):
     def _is_not_modified_error(exc: Exception) -> bool:
         return isinstance(exc, BadRequest) and "message is not modified" in str(exc).lower()
 
-    async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
+    async def send_delta(
+        self,
+        chat_id: str,
+        delta: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        stream_id: str | None = None,
+        stream_end: bool = False,
+        resuming: bool = False,
+    ) -> None:
         """Progressive message editing: send on first delta, edit on subsequent ones."""
         if not self._app:
             return
         meta = metadata or {}
         int_chat_id = int(chat_id)
-        stream_id = meta.get("_stream_id")
 
-        if meta.get("_stream_end"):
+        if stream_end:
             buf = self._stream_bufs.get(chat_id)
             if not buf or not buf.message_id or not buf.text:
                 return
@@ -655,14 +926,34 @@ class TelegramChannel(BaseChannel):
             if message_thread_id := meta.get("message_thread_id"):
                 thread_kwargs["message_thread_id"] = message_thread_id
             raw_text = buf.text
-            html = _markdown_to_telegram_html(raw_text)
-            if len(html) <= TELEGRAM_HTML_MAX_LEN:
-                primary_html = html
-                extra_html_chunks = []
-            else:
-                html_chunks = split_message(html, TELEGRAM_HTML_MAX_LEN)
-                primary_html = html_chunks[0]
-                extra_html_chunks = html_chunks[1:]
+
+            # Try sendRichMessage for final output (Bot API 10.1).
+            # Skip when a streaming preview already exists to avoid the
+            # delete-and-resend pattern that causes flickering and drops
+            # line breaks (issue #4470).
+            if not buf.message_id and self.config.rich_messages and not getattr(self, "_rich_send_disabled", False):
+                reply_params = None
+                if reply_to_message_id := meta.get("message_id"):
+                    reply_params = {"message_id": int(reply_to_message_id), "allow_sending_without_reply": True}
+                rich_ok = await self._try_send_rich(
+                    int_chat_id, raw_text, reply_params, thread_kwargs, None,
+                )
+                if rich_ok:
+                    # Delete the streaming preview message
+                    try:
+                        await self._call_with_retry(
+                            self._app.bot.delete_message,
+                            chat_id=int_chat_id, message_id=buf.message_id,
+                        )
+                    except Exception:
+                        pass  # Preview stays if delete fails
+                    self._stream_bufs.pop(chat_id, None)
+                    return
+
+            # Legacy path: edit existing streaming message with HTML
+            html_chunks = _split_telegram_markdown_html(raw_text, TELEGRAM_HTML_MAX_LEN)
+            primary_html = html_chunks[0]
+            extra_html_chunks = html_chunks[1:]
             try:
                 await self._call_with_retry(
                     self._app.bot.edit_message_text,
@@ -766,7 +1057,7 @@ class TelegramChannel(BaseChannel):
         intermediate chunks as standalone messages, then opens a new message
         for the tail so subsequent deltas continue streaming into it.
         """
-        chunks = split_message(buf.text, TELEGRAM_MAX_MESSAGE_LEN)
+        chunks = _split_telegram_markdown(buf.text, TELEGRAM_MAX_MESSAGE_LEN)
         if len(chunks) <= 1:
             return
         try:
@@ -798,7 +1089,9 @@ class TelegramChannel(BaseChannel):
             return
 
         user = update.effective_user
-        if not self.is_allowed(self._sender_id(user)):
+        sender_id = self._sender_id(user)
+        if not self.is_allowed(sender_id):
+            await self._send_pairing_code_if_private(sender_id, update.message, user)
             return
         await update.message.reply_text(
             f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
@@ -810,7 +1103,10 @@ class TelegramChannel(BaseChannel):
         """Handle /help command for allowed users only."""
         if not update.message or not update.effective_user:
             return
-        if not self.is_allowed(self._sender_id(update.effective_user)):
+        user = update.effective_user
+        sender_id = self._sender_id(user)
+        if not self.is_allowed(sender_id):
+            await self._send_pairing_code_if_private(sender_id, update.message, user)
             return
         await update.message.reply_text(build_help_text())
 
@@ -819,6 +1115,17 @@ class TelegramChannel(BaseChannel):
         """Build sender_id with username for allowlist matching."""
         sid = str(user.id)
         return f"{sid}|{user.username}" if user.username else sid
+
+    async def _send_pairing_code_if_private(self, sender_id: str, message, user) -> None:
+        if message.chat.type != "private":
+            return
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=str(message.chat_id),
+            content="",
+            metadata=self._build_message_metadata(message, user),
+            is_dm=True,
+        )
 
     @staticmethod
     def _derive_topic_session_key(message) -> str | None:
@@ -995,14 +1302,90 @@ class TelegramChannel(BaseChannel):
         if len(self._message_threads) > 1000:
             self._message_threads.pop(next(iter(self._message_threads)))
 
+    @staticmethod
+    def _queue_key_for_message(message) -> str:
+        """Return the final nanobot session key used for ordered Telegram ingress."""
+        return TelegramChannel._derive_topic_session_key(message) or f"telegram:{message.chat_id}"
+
+    @staticmethod
+    def _sort_key_for_update(update: Update) -> tuple[int, int]:
+        """Sort by chat message id first, then Telegram update id."""
+        message = getattr(update, "message", None)
+        message_id = int(getattr(message, "message_id", 0) or 0)
+        update_id = int(getattr(update, "update_id", 0) or 0)
+        return (message_id, update_id)
+
+    def _enqueue_ordered_update(
+        self,
+        *,
+        kind: Literal["command", "message"],
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Stage a Telegram update behind a short per-session reorder window."""
+        message = update.message
+        key = self._queue_key_for_message(message)
+        self._inbound_buffers.setdefault(key, []).append(
+            _QueuedTelegramUpdate(
+                kind=kind,
+                update=update,
+                context=context,
+                sort_key=self._sort_key_for_update(update),
+            )
+        )
+        if key not in self._inbound_workers:
+            self._inbound_workers[key] = asyncio.create_task(
+                self._drain_ordered_updates(key)
+            )
+
+    async def _drain_ordered_updates(self, key: str) -> None:
+        """Drain one Telegram session buffer in stable message order."""
+        try:
+            while self._running:
+                await asyncio.sleep(0.2)
+                batch = self._inbound_buffers.get(key, [])
+                if not batch:
+                    break
+                self._inbound_buffers[key] = []
+                batch.sort(key=lambda item: item.sort_key)
+                for item in batch:
+                    try:
+                        if item.kind == "command":
+                            await self._process_forward_command(item.update, item.context)
+                        else:
+                            await self._process_message_update(item.update, item.context)
+                    except Exception as e:
+                        self.logger.warning(
+                            "Telegram queued update handling failed for {}: {}",
+                            key,
+                            e,
+                        )
+            if not self._inbound_buffers.get(key):
+                self._inbound_buffers.pop(key, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger.warning("Telegram ordered update worker failed for {}: {}", key, e)
+        finally:
+            if not self._inbound_buffers.get(key):
+                self._inbound_workers.pop(key, None)
+
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
             return
+        if not self._running:
+            await self._process_forward_command(update, context)
+            return
+        self._enqueue_ordered_update(kind="command", update=update, context=context)
+
+    async def _process_forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Process a queued slash command."""
         message = update.message
         user = update.effective_user
         sender_id = self._sender_id(user)
         if not self.is_allowed(sender_id):
+            await self._send_pairing_code_if_private(sender_id, message, user)
             return
         self._remember_thread_context(message)
 
@@ -1027,12 +1410,20 @@ class TelegramChannel(BaseChannel):
         """Handle incoming messages (text, photos, voice, documents)."""
         if not update.message or not update.effective_user:
             return
+        if not self._running:
+            await self._process_message_update(update, context)
+            return
+        self._enqueue_ordered_update(kind="message", update=update, context=context)
+
+    async def _process_message_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Process a queued Telegram message update."""
 
         message = update.message
         user = update.effective_user
         chat_id = message.chat_id
         sender_id = self._sender_id(user)
         if not self.is_allowed(sender_id):
+            await self._send_pairing_code_if_private(sender_id, message, user)
             return
         self._remember_thread_context(message)
 
