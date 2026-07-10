@@ -263,6 +263,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             return _error_json(400, "timeout must be greater than 0")
 
     metadata: dict[str, Any] = {}
+    if session_id and str(session_id).startswith("review_"):
+        metadata["review_session"] = True
     if requested_workspace:
         try:
             scope = validate_workspace_scope_payload(
@@ -283,6 +285,11 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         "API request session_key={} media={} text={} stream={}",
         session_key, len(media_paths), text[:80], stream,
     )
+    async def _discard_api_progress(*_args: Any, **_kwargs: Any) -> None:
+        # HTTP callers receive only the final response. Publishing intermediate
+        # progress to the message bus can synchronously block the agent loop.
+        return None
+
     # -- streaming path --
     if stream:
         resp = web.StreamResponse()
@@ -319,6 +326,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
+                            on_progress=_discard_api_progress,
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
                             metadata=metadata,
@@ -366,6 +374,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
+                        on_progress=_discard_api_progress,
                         metadata=metadata,
                     ),
                     timeout=request_timeout_s,
@@ -382,6 +391,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             channel="api",
                             chat_id=API_CHAT_ID,
                             persist_user_message=False,
+                            on_progress=_discard_api_progress,
                             metadata=metadata,
                         ),
                         timeout=request_timeout_s,

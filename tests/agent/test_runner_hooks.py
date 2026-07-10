@@ -559,3 +559,55 @@ async def test_runner_preserves_cancellation_when_finally_hook_fails():
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
             hook=BadFinallyHook(),
         ))
+
+
+@pytest.mark.asyncio
+async def test_runner_continues_to_tools_when_pre_tool_hook_times_out():
+    import asyncio
+
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock(spec=LLMProvider)
+    call_count = {"n": 0}
+
+    async def chat_with_retry(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
+            )
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="tool result")
+    events: list[str] = []
+
+    class BlockingHook(AgentHook):
+        async def before_execute_tools(self, context: AgentHookContext) -> None:
+            await asyncio.sleep(3600)
+
+    runner = AgentRunner(provider)
+    runner._log_event = lambda _spec, event, **_fields: events.append(event)  # type: ignore[method-assign]
+    import nanobot.agent.runner as runner_module
+    original_timeout = runner_module._PRE_TOOL_TRANSITION_WATCHDOG_S
+    runner_module._PRE_TOOL_TRANSITION_WATCHDOG_S = 0.01
+    try:
+        result = await runner.run(AgentRunSpec(
+            initial_messages=[],
+            tools=tools,
+            model="test-model",
+            max_iterations=2,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            hook=BlockingHook(),
+        ))
+    finally:
+        runner_module._PRE_TOOL_TRANSITION_WATCHDOG_S = original_timeout
+
+    assert result.final_content == "done"
+    tools.execute.assert_awaited_once()
+    assert "runner.pre_tools.watchdog_timeout" in events
+    assert "runner.pre_tools.dispatch_tools" in events

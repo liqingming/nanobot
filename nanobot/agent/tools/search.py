@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, TypeVar
 
 from nanobot.agent.tools.base import ToolResult
+from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.filesystem import ListDirTool, _FsTool
 
 _DEFAULT_HEAD_LIMIT = 250
@@ -205,6 +206,18 @@ class FindFilesTool(_SearchTool):
             for filename in sorted(filenames):
                 yield current / filename
 
+    @staticmethod
+    def _reject_unbounded_review_search(path: str) -> str | None:
+        request_ctx = current_request_context()
+        session_key = str(request_ctx.session_key or "") if request_ctx else ""
+        if session_key.startswith("api:review_") and (not path.strip() or path.strip() in {".", "./"}):
+            return (
+                "Error: unbounded find_files search is disabled for review sessions. "
+                "Use a changed file path or a specific business directory such as "
+                "Assets/Script/Game/moduls/<Module>."
+            )
+        return None
+
     async def execute(
         self,
         path: str = ".",
@@ -218,6 +231,8 @@ class FindFilesTool(_SearchTool):
         **kwargs: Any,
     ) -> str:
         try:
+            if rejection := self._reject_unbounded_review_search(path):
+                return ToolResult.error(rejection)
             target = self._resolve(path or ".")
             if not target.exists():
                 return ToolResult.error(f"Error: Path not found: {path}")

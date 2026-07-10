@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -262,8 +262,10 @@ async def test_successful_request_uses_fixed_api_session(aiohttp_client, mock_ag
         media=None,
         session_key=API_SESSION_KEY,
         channel="api",
-        chat_id=API_CHAT_ID,
-        metadata={},
+            chat_id=API_CHAT_ID,
+            on_progress=ANY,
+            metadata={},
+
     )
 
 

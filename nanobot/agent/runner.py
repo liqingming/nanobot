@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import time
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -63,6 +64,8 @@ _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
+# A hook must not indefinitely prevent a model-approved tool call from starting.
+_PRE_TOOL_TRANSITION_WATCHDOG_S = 30.0
 
 @dataclass(slots=True)
 class AgentRunSpec:
@@ -562,20 +565,86 @@ class AgentRunner:
                     thinking_blocks=response.thinking_blocks,
                 )
                 messages.append(assistant_message)
-                await self._emit_checkpoint(
+                transition_started_at = time.monotonic()
+                self._log_event(
                     spec,
-                    {
-                        "phase": "awaiting_tools",
-                        "iteration": iteration,
-                        "model": spec.model,
-                        "assistant_message": assistant_message,
-                        "completed_tool_results": [],
-                        "pending_tool_calls": [tc.to_openai_tool_call() for tc in response.tool_calls],
-                    },
+                    "runner.pre_tools.start",
+                    iteration=iteration,
+                    tool_calls=[tc.name for tc in response.tool_calls],
                 )
+                self._log_event(spec, "runner.pre_tools.checkpoint.start", iteration=iteration)
+                try:
+                    await asyncio.wait_for(
+                        self._emit_checkpoint(
+                            spec,
+                            {
+                                "phase": "awaiting_tools",
+                                "iteration": iteration,
+                                "model": spec.model,
+                                "assistant_message": assistant_message,
+                                "completed_tool_results": [],
+                                "pending_tool_calls": [tc.to_openai_tool_call() for tc in response.tool_calls],
+                            },
+                        ),
+                        timeout=_PRE_TOOL_TRANSITION_WATCHDOG_S,
+                    )
+                except asyncio.TimeoutError:
+                    self._log_event(
+                        spec,
+                        "runner.pre_tools.watchdog_timeout",
+                        iteration=iteration,
+                        phase="checkpoint",
+                        timeout_s=_PRE_TOOL_TRANSITION_WATCHDOG_S,
+                        tool_calls=[tc.name for tc in response.tool_calls],
+                    )
+                    logger.warning(
+                        "Pre-tool checkpoint timed out after {}s for {}; continuing to tools",
+                        _PRE_TOOL_TRANSITION_WATCHDOG_S,
+                        spec.session_key or "default",
+                    )
+                else:
+                    self._log_event(
+                        spec,
+                        "runner.pre_tools.checkpoint.done",
+                        iteration=iteration,
+                        duration_ms=round((time.monotonic() - transition_started_at) * 1000, 1),
+                    )
 
-                await hook.before_execute_tools(context)
+                hook_started_at = time.monotonic()
+                self._log_event(spec, "runner.pre_tools.hook.start", iteration=iteration)
+                try:
+                    await asyncio.wait_for(
+                        hook.before_execute_tools(context),
+                        timeout=_PRE_TOOL_TRANSITION_WATCHDOG_S,
+                    )
+                except asyncio.TimeoutError:
+                    self._log_event(
+                        spec,
+                        "runner.pre_tools.watchdog_timeout",
+                        iteration=iteration,
+                        phase="before_execute_tools",
+                        timeout_s=_PRE_TOOL_TRANSITION_WATCHDOG_S,
+                        tool_calls=[tc.name for tc in response.tool_calls],
+                    )
+                    logger.warning(
+                        "Pre-tool hook timed out after {}s for {}; continuing to tools",
+                        _PRE_TOOL_TRANSITION_WATCHDOG_S,
+                        spec.session_key or "default",
+                    )
+                else:
+                    self._log_event(
+                        spec,
+                        "runner.pre_tools.hook.done",
+                        iteration=iteration,
+                        duration_ms=round((time.monotonic() - hook_started_at) * 1000, 1),
+                    )
 
+                self._log_event(
+                    spec,
+                    "runner.pre_tools.dispatch_tools",
+                    iteration=iteration,
+                    transition_duration_ms=round((time.monotonic() - transition_started_at) * 1000, 1),
+                )
                 results, new_events, fatal_error = await self._execute_tools(
                     spec,
                     response.tool_calls,

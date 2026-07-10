@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.subagent import SubagentManager, SubagentStatus
 from nanobot.agent.tools.search import FindFilesTool, GrepTool
 from nanobot.agent.tools.web import WebSearchTool
@@ -49,6 +50,43 @@ async def test_find_files_filters_by_query_glob_and_type(tmp_path: Path) -> None
     )
 
     assert result.splitlines() == ["src/settings_view.tsx"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["", ".", "./"])
+async def test_find_files_rejects_unbounded_root_search_for_review_session(tmp_path: Path, path: str) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("pass\n", encoding="utf-8")
+    tool = FindFilesTool(workspace=tmp_path, allowed_dir=tmp_path)
+    token = bind_request_context(RequestContext(
+        channel="api",
+        chat_id="default",
+        session_key="api:review_123_code_review",
+    ))
+    try:
+        result = await tool.execute(path=path, query="main")
+    finally:
+        reset_request_context(token)
+
+    assert "unbounded find_files search is disabled" in str(result)
+
+
+@pytest.mark.asyncio
+async def test_find_files_allows_scoped_search_for_review_session(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("pass\n", encoding="utf-8")
+    tool = FindFilesTool(workspace=tmp_path, allowed_dir=tmp_path)
+    token = bind_request_context(RequestContext(
+        channel="api",
+        chat_id="default",
+        session_key="api:review_123_code_review",
+    ))
+    try:
+        result = await tool.execute(path="src", query="main")
+    finally:
+        reset_request_context(token)
+
+    assert result.splitlines() == ["src/main.py"]
 
 
 @pytest.mark.asyncio
