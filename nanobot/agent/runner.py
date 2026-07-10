@@ -16,7 +16,7 @@ import inspect
 import os
 from contextlib import suppress
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -362,6 +362,8 @@ class AgentRunner:
         had_injections = False
         injection_cycles = 0
         compacted_tool_call_ids: set[str] = set()
+        adaptive_context_block_limit: int | None = None
+        false_tool_budget_retries = 0
         governance_config = ContextGovernanceConfig(
             provider=self.provider,
             model=spec.model,
@@ -388,8 +390,16 @@ class AgentRunner:
                 # may repair or compact historical messages for the model, but
                 # those synthetic edits must not shift the append boundary used
                 # later when the caller saves only the new turn.
+                active_governance_config = (
+                    replace(
+                        governance_config,
+                        context_block_limit=adaptive_context_block_limit,
+                    )
+                    if adaptive_context_block_limit is not None
+                    else governance_config
+                )
                 messages_for_model = self.context_governor.prepare_for_model(
-                    governance_config,
+                    active_governance_config,
                     messages,
                     compacted_tool_call_ids,
                 )
@@ -421,7 +431,99 @@ class AgentRunner:
             )
             await hook.before_iteration(context)
             response = await self._request_model(spec, messages_for_model, hook, context)
+            if (
+                LLMProvider.is_context_length_response(response)
+                and not context.streamed_content
+            ):
+                estimate, source = estimate_prompt_tokens_chain(
+                    self.provider,
+                    spec.model,
+                    messages_for_model,
+                    spec.tools.get_definitions(),
+                )
+                emergency_budget = max(1024, int(estimate * 0.75))
+                if adaptive_context_block_limit is not None:
+                    emergency_budget = min(
+                        adaptive_context_block_limit, emergency_budget
+                    )
+                retry_config = replace(
+                    governance_config,
+                    context_block_limit=emergency_budget,
+                )
+                retry_messages = self.context_governor.snip_history(
+                    retry_config, messages_for_model
+                )
+                retry_messages = ContextGovernor.drop_orphan_tool_results(
+                    retry_messages
+                )
+                retry_messages = ContextGovernor.backfill_missing_tool_results(
+                    retry_messages
+                )
+                if retry_messages != messages_for_model:
+                    adaptive_context_block_limit = emergency_budget
+                    self._log_event(
+                        spec,
+                        "runner.context_overflow.retry",
+                        estimated_tokens=estimate,
+                        target_tokens=emergency_budget,
+                        estimate_source=source,
+                        messages_before=len(messages_for_model),
+                        messages_after=len(retry_messages),
+                    )
+                    logger.warning(
+                        "Context overflow for {}; trimming {} -> {} messages "
+                        "and retrying once",
+                        spec.session_key or "default",
+                        len(messages_for_model),
+                        len(retry_messages),
+                    )
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=True)
+                    messages_for_model = retry_messages
+                    response = await self._request_model(
+                        spec, messages_for_model, hook, context
+                    )
+            if (
+                false_tool_budget_retries < 1
+                and self._claims_false_tool_budget(response)
+                and bool(spec.tools.get_definitions())
+            ):
+                false_tool_budget_retries += 1
+                rejected_usage = self._usage_or_estimate(
+                    spec, messages_for_model, response
+                )
+                self._accumulate_usage(usage, rejected_usage)
+                self._log_event(
+                    spec,
+                    "runner.false_tool_budget.retry",
+                    iteration=iteration,
+                    max_iterations=spec.max_iterations,
+                )
+                logger.warning(
+                    "Model falsely reported exhausted tool budget for {}; retrying once",
+                    spec.session_key or "default",
+                )
+                retry_messages = list(messages_for_model)
+                retry_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[Runtime correction] Tool access is available for this new turn. "
+                            f"This is iteration {iteration + 1} of {spec.max_iterations}; "
+                            "tool calls in earlier user turns are historical and do not consume "
+                            "the current turn's runtime budget. Use the available tools now if "
+                            "the user's request requires action. Do not repeat the exhaustion claim."
+                        ),
+                    }
+                )
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=True)
+                messages_for_model = retry_messages
+                response = await self._request_model(
+                    spec, messages_for_model, hook, context
+                )
             context.response = response
+
             context.tool_calls = list(response.tool_calls)
             reasoning_text, cleaned_content = extract_reasoning(
                 response.reasoning_content,
@@ -739,6 +841,23 @@ class AgentRunner:
             had_injections=had_injections,
         )
 
+    @staticmethod
+    def _claims_false_tool_budget(response: LLMResponse) -> bool:
+        if response.finish_reason == "error" or response.has_tool_calls:
+            return False
+        text = str(response.content or "").lower()
+        english = (
+            ("tool-call budget" in text or "tool call budget" in text)
+            and any(token in text for token in ("this turn", "current turn", "this session"))
+            and any(token in text for token in ("exhausted", "used up", "no remaining"))
+        )
+        chinese = (
+            "工具调用" in text
+            and any(token in text for token in ("当前会话", "本轮", "当前轮"))
+            and any(token in text for token in ("额度", "预算", "次数"))
+            and any(token in text for token in ("耗尽", "用完", "已满", "没有剩余"))
+        )
+        return english or chinese
     def _build_request_kwargs(
         self,
         spec: AgentRunSpec,

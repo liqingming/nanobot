@@ -101,6 +101,19 @@ class FallbackProvider(LLMProvider):
     def get_default_model(self) -> str:
         return self._primary.get_default_model()
 
+    def resolve_context_window_tokens(self, model: str, configured: int) -> int:
+        return self._primary.resolve_context_window_tokens(model, configured)
+
+    def input_token_budget(
+        self,
+        context_window_tokens: int,
+        max_completion_tokens: int,
+        safety_buffer: int = 1024,
+    ) -> int:
+        return self._primary.input_token_budget(
+            context_window_tokens, max_completion_tokens, safety_buffer
+        )
+
     @property
     def supports_progress_deltas(self) -> bool:
         return bool(getattr(self._primary, "supports_progress_deltas", False))

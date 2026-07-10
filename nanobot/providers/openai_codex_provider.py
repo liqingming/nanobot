@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -18,12 +20,12 @@ from nanobot.providers.base import (
     ToolCallRequest,
     resolve_stream_idle_timeout_s,
 )
-from nanobot.utils.oauth_compat import call_with_optional_proxy
 from nanobot.providers.openai_responses import (
     consume_sse_with_reasoning,
     convert_messages,
     convert_tools,
 )
+from nanobot.utils.oauth_compat import call_with_optional_proxy
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
@@ -42,6 +44,30 @@ class OpenAICodexProvider(LLMProvider):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
         self.proxy = proxy or None
+        self._context_window, self._effective_input_window = (
+            _load_codex_model_context(default_model)
+        )
+
+    def resolve_context_window_tokens(self, model: str, configured: int) -> int:
+        hard_window, effective_window = _load_codex_model_context(model)
+        self._context_window = hard_window
+        self._effective_input_window = effective_window
+        if hard_window:
+            return min(configured, hard_window) if configured > 0 else hard_window
+        return configured
+
+    def input_token_budget(
+        self,
+        context_window_tokens: int,
+        max_completion_tokens: int,
+        safety_buffer: int = 1024,
+    ) -> int:
+        if self._context_window and context_window_tokens >= self._context_window:
+            effective = self._effective_input_window or self._context_window
+            return max(0, min(context_window_tokens, effective))
+        return super().input_token_budget(
+            context_window_tokens, max_completion_tokens, safety_buffer
+        )
 
     async def _call_codex(
         self,
@@ -161,6 +187,27 @@ def _strip_model_prefix(model: str) -> str:
     return model
 
 
+def _load_codex_model_context(model: str) -> tuple[int | None, int | None]:
+    """Read the current Codex route limits from the CLI model catalog."""
+    root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    try:
+        data = json.loads((root / "models_cache.json").read_text(encoding="utf-8"))
+        slug = _strip_model_prefix(model)
+        row = next(
+            item
+            for item in data.get("models", [])
+            if isinstance(item, dict) and item.get("slug") == slug
+        )
+        hard = int(row.get("context_window") or row.get("max_context_window") or 0)
+        percent = int(row.get("effective_context_window_percent") or 100)
+        if hard <= 0:
+            return None, None
+        effective = max(1, hard * min(100, max(1, percent)) // 100)
+        return hard, effective
+    except (OSError, ValueError, TypeError, StopIteration, json.JSONDecodeError):
+        return None, None
+
+
 def _build_reasoning_options(reasoning_effort: str | None) -> dict[str, str] | None:
     """Opt in to visible summaries without changing provider-default effort."""
     if reasoning_effort and reasoning_effort.lower() == "none":
@@ -265,11 +312,16 @@ def _codex_error_response(exc: Exception) -> LLMResponse:
     detail = str(exc).strip()
 
     status_code = getattr(exc, "status_code", None)
+    error_type = getattr(exc, "error_type", None)
+    error_code = getattr(exc, "error_code", None)
     error_kind: str | None = None
     default_detail: str | None = None
     should_retry: bool | None = getattr(exc, "should_retry", None)
 
-    if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
+    if error_code == "context_length_exceeded":
+        error_kind = "context_length"
+        should_retry = False
+    elif isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
         error_kind = "timeout"
         default_detail = "timed out waiting for response"
         should_retry = True if should_retry is None else should_retry
@@ -303,8 +355,8 @@ def _codex_error_response(exc: Exception) -> LLMResponse:
         retry_after=retry_after,
         error_status_code=int(status_code) if status_code is not None else None,
         error_kind=error_kind,
-        error_type=getattr(exc, "error_type", None),
-        error_code=getattr(exc, "error_code", None),
+        error_type=error_type,
+        error_code=error_code,
         error_retry_after_s=retry_after,
         error_should_retry=should_retry,
     )

@@ -195,6 +195,41 @@ class GenerationSettings:
     reasoning_effort: str | None = None
 
 
+def resolve_provider_context_window_tokens(
+    provider: Any, model: str, configured: int
+) -> int:
+    resolver = getattr(type(provider), "resolve_context_window_tokens", None)
+    if callable(resolver):
+        resolved = resolver(provider, model, configured)
+        if isinstance(resolved, int) and resolved > 0:
+            return resolved
+    return configured
+
+
+def provider_input_token_budget(
+    provider: Any,
+    context_window_tokens: int,
+    max_completion_tokens: int,
+    safety_buffer: int = 1024,
+) -> int:
+    resolver = getattr(type(provider), "input_token_budget", None)
+    if callable(resolver):
+        resolved = resolver(
+            provider,
+            context_window_tokens,
+            max_completion_tokens,
+            safety_buffer,
+        )
+        if isinstance(resolved, int):
+            return max(0, resolved)
+    return max(
+        0,
+        context_window_tokens
+        - max(0, max_completion_tokens)
+        - max(0, safety_buffer),
+    )
+
+
 _SYNTHETIC_USER_CONTENT = "(conversation continued)"
 
 
@@ -277,6 +312,39 @@ class LLMProvider(ABC):
         self.api_key = api_key
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
+
+    def resolve_context_window_tokens(self, model: str, configured: int) -> int:
+        """Return the provider/model context window, falling back to config."""
+        return configured
+
+    def input_token_budget(
+        self,
+        context_window_tokens: int,
+        max_completion_tokens: int,
+        safety_buffer: int = 1024,
+    ) -> int:
+        """Return the safe model-input budget for context governance."""
+        return max(
+            0,
+            context_window_tokens
+            - max(0, max_completion_tokens)
+            - max(0, safety_buffer),
+        )
+
+    @classmethod
+    def is_context_length_response(cls, response: LLMResponse) -> bool:
+        if response.finish_reason != "error" and not (
+            response.error_type or response.error_code
+        ):
+            return False
+        tokens = " ".join(
+            str(value or "").lower()
+            for value in (response.error_type, response.error_code, response.content)
+        )
+        return (
+            "context_length_exceeded" in tokens
+            or "exceeds the context window" in tokens
+        )
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

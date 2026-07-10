@@ -9,13 +9,14 @@ import pytest
 
 from nanobot.agent.context_governance import (
     BACKFILL_CONTENT,
+    HISTORICAL_TOOL_CALL_KEEP_RECENT,
     MICROCOMPACT_KEEP_RECENT,
     ContextGovernanceConfig,
     ContextGovernor,
 )
 from nanobot.agent.runner import AgentRunSpec
 from nanobot.config.schema import AgentDefaults
-from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
@@ -1037,3 +1038,380 @@ def test_strip_placeholder_keeps_assistant_with_tool_calls():
     ]
     result = ContextGovernor.strip_placeholder_assistant_messages(messages)
     assert result is messages
+
+@pytest.mark.asyncio
+async def test_runner_trims_and_retries_context_length_error(monkeypatch) -> None:
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock()
+    provider.generation = SimpleNamespace(max_tokens=4096)
+    provider.chat_with_retry = AsyncMock(
+        side_effect=[
+            LLMResponse(
+                content="input exceeds context",
+                finish_reason="error",
+                error_type="invalid_request_error",
+                error_code="context_length_exceeded",
+            ),
+            LLMResponse(content="recovered", finish_reason="stop"),
+        ]
+    )
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    initial_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "latest"},
+    ]
+
+    runner = AgentRunner(provider)
+    trimmed_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "latest"},
+    ]
+    runner.context_governor.snip_history = MagicMock(
+        side_effect=[initial_messages, trimmed_messages]
+    )
+    monkeypatch.setattr(
+        "nanobot.agent.runner.estimate_prompt_tokens_chain",
+        lambda *_args, **_kwargs: (1000, "test"),
+    )
+
+    result = await runner.run(
+        AgentRunSpec(
+            initial_messages=initial_messages,
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            context_window_tokens=10_000,
+        )
+    )
+
+    assert result.final_content == "recovered"
+    assert provider.chat_with_retry.await_count == 2
+    first_messages = provider.chat_with_retry.await_args_list[0].kwargs["messages"]
+    retry_messages = provider.chat_with_retry.await_args_list[1].kwargs["messages"]
+    assert first_messages == initial_messages
+    assert retry_messages == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "latest"},
+    ]
+    retry_config = runner.context_governor.snip_history.call_args.args[0]
+    assert retry_config.context_block_limit == 1024
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_retry_other_invalid_request_errors() -> None:
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock()
+    provider.generation = SimpleNamespace(max_tokens=4096)
+    provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(
+            content="invalid parameter",
+            finish_reason="error",
+            error_type="invalid_request_error",
+            error_code="invalid_parameter",
+        )
+    )
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    result = await AgentRunner(provider).run(
+        AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        )
+    )
+
+    assert result.stop_reason == "error"
+    assert provider.chat_with_retry.await_count == 1
+
+@pytest.mark.asyncio
+async def test_runner_does_not_retry_context_error_after_streaming_content() -> None:
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock()
+    provider.generation = SimpleNamespace(max_tokens=4096)
+    calls = 0
+
+    async def chat_stream_with_retry(*, on_content_delta, **_kwargs):
+        nonlocal calls
+        calls += 1
+        await on_content_delta("partial")
+        return LLMResponse(
+            content="input exceeds context",
+            finish_reason="error",
+            error_type="invalid_request_error",
+            error_code="context_length_exceeded",
+        )
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    provider.chat_with_retry = AsyncMock()
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+        async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+            return None
+
+    result = await AgentRunner(provider).run(
+        AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            hook=StreamingHook(),
+        )
+    )
+
+    assert result.stop_reason == "error"
+    assert calls == 1
+    provider.chat_with_retry.assert_not_awaited()
+
+def test_context_window_phrase_in_success_is_not_an_overflow_error() -> None:
+    response = LLMResponse(
+        content="The input exceeds the context window only in this example.",
+        finish_reason="stop",
+    )
+
+    assert not LLMProvider.is_context_length_response(response)
+
+def test_historical_tool_trimming_keeps_recent_calls_and_current_turn() -> None:
+    provider = MagicMock()
+    provider.generation = SimpleNamespace(max_tokens=4096)
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    messages: list[dict] = [{"role": "system", "content": "system"}]
+    total_historical = HISTORICAL_TOOL_CALL_KEEP_RECENT + 6
+    for index in range(total_historical):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "old explanation" if index == 0 else "",
+                    "tool_calls": [
+                        {
+                            "id": f"old-{index}",
+                            "type": "function",
+                            "function": {"name": "exec", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"old-{index}",
+                    "name": "exec",
+                    "content": f"result-{index}",
+                },
+            ]
+        )
+    messages.append({"role": "assistant", "content": "previous turn finished"})
+    messages.append({"role": "user", "content": "new turn"})
+    inflight_start = len(messages)
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "current-call",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "current-call",
+                "name": "exec",
+                "content": "current-result",
+            },
+        ]
+    )
+    original = [dict(message) for message in messages]
+    spec = AgentRunSpec(
+        initial_messages=messages[:inflight_start],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+
+    trimmed = ContextGovernor().prepare_for_model(
+        _governance_config(
+            provider,
+            tools,
+            spec,
+            inflight_start_index=inflight_start,
+        ),
+        messages,
+        set(),
+    )
+
+    call_ids = [
+        str(tool_call["id"])
+        for message in trimmed
+        for tool_call in message.get("tool_calls") or []
+    ]
+    result_ids = [
+        str(message.get("tool_call_id"))
+        for message in trimmed
+        if message.get("role") == "tool"
+    ]
+    assert call_ids == [
+        *(f"old-{index}" for index in range(6, total_historical)),
+        "current-call",
+    ]
+    assert result_ids == call_ids
+    assert any(message.get("content") == "old explanation" for message in trimmed)
+    assert any(message.get("content") == "previous turn finished" for message in trimmed)
+    assert any(message.get("content") == "new turn" for message in trimmed)
+    assert messages == original
+
+
+@pytest.mark.asyncio
+async def test_runner_retries_false_tool_budget_claim_once() -> None:
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock()
+    provider.generation = SimpleNamespace(max_tokens=4096)
+    provider.chat_with_retry = AsyncMock(
+        side_effect=[
+            LLMResponse(
+                content="当前会话的工具调用额度已耗尽，暂时无法运行命令。",
+                finish_reason="stop",
+            ),
+            LLMResponse(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="restart-call",
+                        name="exec",
+                        arguments={"command": "restart"},
+                    )
+                ],
+            ),
+            LLMResponse(content="服务已重启", finish_reason="stop"),
+        ]
+    )
+    tools = MagicMock()
+    tools.get_definitions.return_value = [
+        {"type": "function", "function": {"name": "exec", "parameters": {}}}
+    ]
+    tools.execute = AsyncMock(return_value="restarted")
+
+    result = await AgentRunner(provider).run(
+        AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "重启服务"}],
+            tools=tools,
+            model="test-model",
+            max_iterations=2,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        )
+    )
+
+    assert result.final_content == "服务已重启"
+    assert result.stop_reason == "completed"
+    assert provider.chat_with_retry.await_count == 3
+    tools.execute.assert_awaited_once()
+    correction_messages = provider.chat_with_retry.await_args_list[1].kwargs["messages"]
+    assert "Tool access is available" in correction_messages[-1]["content"]
+    assert all(
+        "工具调用额度已耗尽" not in str(message.get("content") or "")
+        for message in result.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_streamed_false_tool_budget_claim_resumes_and_executes_tool() -> None:
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock()
+    provider.generation = SimpleNamespace(max_tokens=4096)
+    calls = 0
+    streamed: list[str] = []
+    endings: list[bool] = []
+
+    async def chat_stream_with_retry(*, on_content_delta, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            text = "当前会话的工具调用额度已耗尽。"
+            await on_content_delta(text)
+            return LLMResponse(content=text, finish_reason="stop")
+        if calls == 2:
+            return LLMResponse(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCallRequest(id="restart-call", name="exec", arguments={})
+                ],
+            )
+        await on_content_delta("服务已重启")
+        return LLMResponse(content="服务已重启", finish_reason="stop")
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    provider.chat_with_retry = AsyncMock()
+    tools = MagicMock()
+    tools.get_definitions.return_value = [
+        {"type": "function", "function": {"name": "exec", "parameters": {}}}
+    ]
+    tools.execute = AsyncMock(return_value="restarted")
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+        async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+            streamed.append(delta)
+
+        async def on_stream_end(
+            self,
+            context: AgentHookContext,
+            *,
+            resuming: bool,
+        ) -> None:
+            endings.append(resuming)
+
+    result = await AgentRunner(provider).run(
+        AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "重启服务"}],
+            tools=tools,
+            model="test-model",
+            max_iterations=2,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            hook=StreamingHook(),
+        )
+    )
+
+    assert result.final_content == "服务已重启"
+    assert calls == 3
+    assert endings.count(True) >= 2
+    assert endings[-1] is False
+    tools.execute.assert_awaited_once()
+    provider.chat_with_retry.assert_not_awaited()
+    assert streamed[-1] == "服务已重启"
+
+def test_external_tool_quota_message_is_not_session_budget_claim() -> None:
+    from nanobot.agent.runner import AgentRunner
+
+    response = LLMResponse(
+        content="web_search 工具调用额度已耗尽，请检查外部服务套餐。",
+        finish_reason="stop",
+    )
+
+    assert not AgentRunner._claims_false_tool_budget(response)

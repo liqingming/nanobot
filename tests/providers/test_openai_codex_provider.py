@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +19,7 @@ from nanobot.providers.openai_codex_provider import (
     _request_codex,
     _should_retry_status,
 )
+from nanobot.providers.openai_responses.parsing import ResponsesAPIError
 
 
 def _mock_codex_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -585,3 +587,73 @@ async def test_codex_provider_tolerates_oauth_get_token_without_proxy_parameter(
 
     assert response.content == "ok"
     assert seen == {"token_called": True, "request_proxy": "http://127.0.0.1:23458"}
+
+def test_codex_model_catalog_clamps_configured_context_window(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "context_window": 372_000,
+                        "max_context_window": 372_000,
+                        "effective_context_window_percent": 95,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    provider = OpenAICodexProvider(default_model="gpt-5.6-sol")
+
+    assert provider.resolve_context_window_tokens("gpt-5.6-sol", 1_000_000) == 372_000
+    assert provider.input_token_budget(372_000, 65_536) == 353_400
+
+
+def test_codex_model_catalog_falls_back_to_config_when_model_is_unknown(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "known-model",
+                        "context_window": 372_000,
+                        "effective_context_window_percent": 95,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    provider = OpenAICodexProvider(default_model="known-model")
+    assert provider.input_token_budget(372_000, 65_536) == 353_400
+
+    assert provider.resolve_context_window_tokens("unknown-model", 1_000_000) == 1_000_000
+    assert provider.input_token_budget(1_000_000, 65_536) == 933_440
+
+
+def test_codex_response_failed_preserves_context_error_metadata() -> None:
+    error = ResponsesAPIError(
+        {
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "message": "input too long",
+            "param": "input",
+        }
+    )
+
+    response = _codex_error_response(error)
+
+    assert response.finish_reason == "error"
+    assert response.error_type == "invalid_request_error"
+    assert response.error_code == "context_length_exceeded"
+    assert response.error_kind == "context_length"
+    assert response.error_should_retry is False

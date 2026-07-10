@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from nanobot.config.schema import Config, InlineFallbackConfig, ModelPresetConfig, ProviderConfig
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import LLMProvider, resolve_provider_context_window_tokens
 from nanobot.providers.fallback_provider import FallbackProvider
 from nanobot.providers.registry import ProviderSpec, create_dynamic_spec, find_by_name
 
@@ -275,10 +275,14 @@ def build_provider_snapshot(
         fallback.context_window_tokens
         for fallback in _resolve_fallback_presets(config, resolved)
     ]
+    provider = make_provider(config, preset=resolved)
+    configured_window = min([resolved.context_window_tokens, *fallback_windows])
     return ProviderSnapshot(
-        provider=make_provider(config, preset=resolved),
+        provider=provider,
         model=resolved.model,
-        context_window_tokens=min([resolved.context_window_tokens, *fallback_windows]),
+        context_window_tokens=resolve_provider_context_window_tokens(
+            provider, resolved.model, configured_window
+        ),
         signature=provider_signature(config, preset=resolved),
     )
 

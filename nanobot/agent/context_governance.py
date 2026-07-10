@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from nanobot.providers.base import provider_input_token_budget
 from nanobot.utils.helpers import (
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 SNIP_SAFETY_BUFFER = 1024
 MICROCOMPACT_KEEP_RECENT = 10
 MICROCOMPACT_MIN_CHARS = 500
+HISTORICAL_TOOL_CALL_KEEP_RECENT = 64
 INFLIGHT_COMPACT_TARGET_RATIO = 0.85
 COMPACTABLE_TOOLS = frozenset({
     "read_file", "exec", "grep", "find_files",
@@ -83,6 +85,7 @@ class ContextGovernor:
         updated = self.strip_malformed_tool_calls(updated)
         updated = self.drop_orphan_tool_results(updated)
         updated = self.backfill_missing_tool_results(updated)
+        updated = self.trim_historical_tool_exchanges(config, updated)
         updated = self.apply_tool_result_budget(config, updated)
         updated = self.compact_inflight_overflow(config, updated, compacted_tool_call_ids)
         updated = self.snip_history(config, updated)
@@ -102,8 +105,11 @@ class ContextGovernor:
         max_output = config.max_tokens if isinstance(config.max_tokens, int) else (
             provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
         )
-        budget = config.context_block_limit or (
-            config.context_window_tokens - max_output - SNIP_SAFETY_BUFFER
+        budget = config.context_block_limit or provider_input_token_budget(
+            config.provider,
+            config.context_window_tokens,
+            max_output,
+            SNIP_SAFETY_BUFFER,
         )
         return budget if budget > 0 else 0
 
@@ -295,6 +301,74 @@ class ContextGovernor:
                 "content": BACKFILL_CONTENT,
             })
             offset += 1
+        return updated
+
+    @staticmethod
+    def trim_historical_tool_exchanges(
+        config: ContextGovernanceConfig,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Keep only recent completed tool exchanges before the current user turn."""
+        boundary = min(max(0, config.inflight_start_index), len(messages))
+        if boundary <= 0:
+            return messages
+
+        current_user_index = next(
+            (
+                idx
+                for idx in range(boundary - 1, -1, -1)
+                if messages[idx].get("role") == "user"
+            ),
+            boundary,
+        )
+        historical_call_ids: list[str] = []
+        for message in messages[:current_user_index]:
+            if message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls") or []:
+                if isinstance(tool_call, dict) and tool_call.get("id"):
+                    historical_call_ids.append(str(tool_call["id"]))
+
+        drop_count = len(historical_call_ids) - HISTORICAL_TOOL_CALL_KEEP_RECENT
+        if drop_count <= 0:
+            return messages
+        dropped_ids = set(historical_call_ids[:drop_count])
+
+        updated: list[dict[str, Any]] = []
+        for idx, message in enumerate(messages):
+            if idx >= current_user_index:
+                updated.append(message)
+                continue
+            role = message.get("role")
+            if role == "tool" and str(message.get("tool_call_id") or "") in dropped_ids:
+                continue
+            if role != "assistant" or not message.get("tool_calls"):
+                updated.append(message)
+                continue
+
+            kept_calls = [
+                tool_call
+                for tool_call in message.get("tool_calls") or []
+                if not (
+                    isinstance(tool_call, dict)
+                    and str(tool_call.get("id") or "") in dropped_ids
+                )
+            ]
+            repaired = dict(message)
+            if kept_calls:
+                repaired["tool_calls"] = kept_calls
+                updated.append(repaired)
+            else:
+                repaired.pop("tool_calls", None)
+                if repaired.get("content"):
+                    updated.append(repaired)
+
+        logger.debug(
+            "Historical tool-call trimming for {}: dropped={} kept_recent={}",
+            config.session_key or "default",
+            drop_count,
+            HISTORICAL_TOOL_CALL_KEEP_RECENT,
+        )
         return updated
 
     def apply_tool_result_budget(

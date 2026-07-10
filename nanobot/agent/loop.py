@@ -56,7 +56,11 @@ from nanobot.bus.runtime_events import (
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import (
+    LLMProvider,
+    provider_input_token_budget,
+    resolve_provider_context_window_tokens,
+)
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.security.workspace_access import (
     WorkspaceScopeResolver,
@@ -269,10 +273,13 @@ class AgentLoop:
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
         )
-        self.context_window_tokens = (
+        configured_context_window = (
             context_window_tokens
             if context_window_tokens is not None
             else defaults.context_window_tokens
+        )
+        self.context_window_tokens = resolve_provider_context_window_tokens(
+            provider, self.model, configured_context_window
         )
         self.context_block_limit = context_block_limit
         self.max_tool_result_chars = (
@@ -496,7 +503,9 @@ class AgentLoop:
         """Swap model/provider for future turns without disturbing an active one."""
         provider = snapshot.provider
         model = snapshot.model
-        context_window_tokens = snapshot.context_window_tokens
+        context_window_tokens = resolve_provider_context_window_tokens(
+            provider, model, snapshot.context_window_tokens
+        )
         old_model = self.model
         self.provider = provider
         self.model = model
@@ -793,7 +802,12 @@ class AgentLoop:
             reserved_output = int(max_output)
         except (TypeError, ValueError):
             reserved_output = 4096
-        budget = self.context_window_tokens - max(1, reserved_output) - 1024
+        budget = provider_input_token_budget(
+            self.provider,
+            self.context_window_tokens,
+            max(1, reserved_output),
+            1024,
+        )
         return budget if budget > 0 else max(128, self.context_window_tokens // 2)
 
     # ── fork: learning context helpers ────────────────────────────────────

@@ -12,6 +12,7 @@ from nanobot.providers.openai_responses.converters import (
     split_tool_call_id,
 )
 from nanobot.providers.openai_responses.parsing import (
+    ResponsesAPIError,
     consume_sdk_stream,
     consume_sse,
     consume_sse_with_reasoning,
@@ -917,3 +918,23 @@ class TestConsumeSdkStream:
         assert tool_calls[0].arguments == "{bad"
         mock_logger.warning.assert_called_once()
         assert "Failed to parse tool call arguments" in str(mock_logger.warning.call_args)
+
+@pytest.mark.asyncio
+async def test_sdk_failed_event_preserves_structured_context_error() -> None:
+    error = {
+        "type": "invalid_request_error",
+        "code": "context_length_exceeded",
+        "message": "input too long",
+        "param": "input",
+    }
+    event = MagicMock(type="response.failed", error=error)
+
+    async def stream():
+        yield event
+
+    with pytest.raises(ResponsesAPIError) as caught:
+        await consume_sdk_stream(stream())
+
+    assert caught.value.error_type == "invalid_request_error"
+    assert caught.value.error_code == "context_length_exceeded"
+    assert caught.value.param == "input"

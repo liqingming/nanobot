@@ -11,6 +11,23 @@ from loguru import logger
 
 from nanobot.providers.base import LLMResponse, ToolCallRequest, parse_tool_arguments
 
+
+class ResponsesAPIError(RuntimeError):
+    """Structured error emitted inside an otherwise successful SSE response."""
+
+    def __init__(self, detail: Any):
+        self.detail = detail
+        if isinstance(detail, dict):
+            self.error_type = detail.get("type")
+            self.error_code = detail.get("code")
+            self.param = detail.get("param")
+        else:
+            self.error_type = getattr(detail, "type", None)
+            self.error_code = getattr(detail, "code", None)
+            self.param = getattr(detail, "param", None)
+        super().__init__(f"Response failed: {str(detail)[:500]}")
+
+
 FINISH_REASON_MAP = {
     "completed": "stop",
     "incomplete": "length",
@@ -244,7 +261,7 @@ async def consume_sse_with_reasoning(
                         await on_reasoning_delta(summary)
         elif event_type in {"error", "response.failed"}:
             detail = event.get("error") or event.get("message") or event
-            raise RuntimeError(f"Response failed: {str(detail)[:500]}")
+            raise ResponsesAPIError(detail)
 
     return content, tool_calls, finish_reason, usage, reasoning_content
 
@@ -437,6 +454,6 @@ async def consume_sdk_stream(
                                     reasoning_content = (reasoning_content or "") + text
         elif event_type in {"error", "response.failed"}:
             detail = getattr(event, "error", None) or getattr(event, "message", None) or event
-            raise RuntimeError(f"Response failed: {str(detail)[:500]}")
+            raise ResponsesAPIError(detail)
 
     return content, tool_calls, finish_reason, usage, reasoning_content

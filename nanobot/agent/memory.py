@@ -19,6 +19,7 @@ from nanobot.utils.atomic_write import replace_file_with_retry
 
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.providers.base import provider_input_token_budget
 from nanobot.session.manager import Session
 from nanobot.utils.gitstore import GitStore
 from nanobot.utils.helpers import (
@@ -943,7 +944,12 @@ class Consolidator:
     @property
     def _input_token_budget(self) -> int:
         """Available input token budget for consolidation LLM."""
-        return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+        return provider_input_token_budget(
+            self.provider,
+            self.context_window_tokens,
+            self.max_completion_tokens,
+            self._SAFETY_BUFFER,
+        )
 
     def _truncate_to_token_budget(self, text: str) -> str:
         """Truncate text so it fits within the consolidation LLM's token budget."""
