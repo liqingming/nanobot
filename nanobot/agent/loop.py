@@ -1510,6 +1510,9 @@ class AgentLoop:
             self._background_tasks.clear()
         from nanobot.agent.tools.exec_session import DEFAULT_EXEC_SESSION_MANAGER
         await DEFAULT_EXEC_SESSION_MANAGER.shutdown()
+        from nanobot.agent.tools.managed_process import shutdown_managed_tasks
+
+        shutdown_managed_tasks()
         if self._mcp_stacks:
             print("正在断开 MCP 连接…")
         for name, stack in self._mcp_stacks.items():

@@ -39,6 +39,7 @@ Tool signatures are provided automatically via function calling. This section do
 - For long-running or interactive commands, pass `yield_time_ms`; if the process keeps running, continue with `write_stdin`.
 - Use `write_stdin` to poll, provide stdin, close stdin, wait for expected output with `wait_for`, or terminate an existing exec session.
 - Use `list_exec_sessions` to recover active session IDs after context shifts.
+- Use `start_process` for HTTP/dev servers and other background commands. Choose lifecycle `task` for work that stops with nanobot, or `service` for a file-logged process supervised and restarted on failure. Use `process_control` to list, read logs, stop, or restart it.
 
 ## CLI App Attachments
 
