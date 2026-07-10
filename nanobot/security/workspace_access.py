@@ -113,6 +113,7 @@ class WorkspaceScopeResolver:
     default_workspace: str | Path
     default_restrict_to_workspace: bool
     scoped_channel: str = "websocket"
+    api_channel: str = "api"
 
     @property
     def sandbox_status(self) -> WorkspaceSandboxStatus:
@@ -142,6 +143,13 @@ class WorkspaceScopeResolver:
         message_metadata: Any,
         session_metadata: Any,
     ) -> WorkspaceScope:
+        if channel == self.api_channel and isinstance(message_metadata, dict) and WORKSPACE_SCOPE_METADATA_KEY in message_metadata:
+            return workspace_scope_from_metadata(
+                message_metadata,
+                default_workspace=self.default_workspace,
+                default_restrict_to_workspace=self.default_restrict_to_workspace,
+                source_channel=channel,
+            )
         if channel != self.scoped_channel:
             return self.default()
         return resolve_effective_workspace_scope(

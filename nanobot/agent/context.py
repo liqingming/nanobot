@@ -84,6 +84,15 @@ class ContextBuilder:
             return None
         return self._topic_memory_factory.get(session_key)
 
+    def _skills_for_workspace(self, workspace: Path) -> SkillsLoader:
+        if workspace == self.workspace:
+            return self.skills
+        return SkillsLoader(
+            self.data_dir,
+            disabled_skills=self.skills.disabled_skills,
+            extra_skill_roots=project_skill_roots(workspace),
+        )
+
     def build_system_prompt(
         self,
         skill_names: list[str] | None = None,
@@ -121,13 +130,14 @@ class ContextBuilder:
             from nanobot.fork.agent.tools.todo import format_todos
             parts.append("# Active Todos\n\n" + format_todos(todos))
 
-        always_skills = self.skills.get_always_skills()
+        skills = self._skills_for_workspace(root)
+        always_skills = skills.get_always_skills()
         if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
+            always_content = skills.load_skills_for_context(always_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
-        skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
+        skills_summary = skills.build_skills_summary(exclude=set(always_skills))
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 

@@ -24,7 +24,9 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+from nanobot.agent.skills import SkillsLoader, project_skill_roots
 from nanobot.agent.tools.base import Tool
+from nanobot.security.workspace_access import current_workspace_scope
 
 if TYPE_CHECKING:
     from nanobot.agent.skills import SkillsLoader
@@ -35,6 +37,17 @@ class LoadSkillTool(Tool):
 
     def __init__(self, loader: "SkillsLoader") -> None:
         self._loader = loader
+
+    def _effective_loader(self) -> "SkillsLoader":
+        scope = current_workspace_scope()
+        if scope is None or scope.project_path == self._loader.workspace:
+            return self._loader
+        return SkillsLoader(
+            self._loader.workspace,
+            builtin_skills_dir=self._loader.builtin_skills,
+            disabled_skills=self._loader.disabled_skills,
+            extra_skill_roots=project_skill_roots(scope.project_path),
+        )
 
     @property
     def name(self) -> str:
@@ -71,14 +84,15 @@ class LoadSkillTool(Tool):
         if not isinstance(name, str) or not name.strip():
             return "Error: 'name' must be a non-empty string"
         name = name.strip()
-        content = await asyncio.to_thread(self._loader.load_skill, name)
+        loader = self._effective_loader()
+        content = await asyncio.to_thread(loader.load_skill, name)
         if content is None:
             # Help the LLM recover quickly when it picked a wrong name —
             # list what IS available so the next attempt can self-correct.
             available = await asyncio.to_thread(
                 lambda: [
                     s["name"]
-                    for s in self._loader.list_skills(filter_unavailable=False)
+                    for s in loader.list_skills(filter_unavailable=False)
                 ]
             )
             return (

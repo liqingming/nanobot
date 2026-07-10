@@ -239,16 +239,27 @@ export function AgentActivityCluster({
   const scrollFrameRef = useRef<number | null>(null);
   const wasTurnStreamingRef = useRef(isTurnStreaming);
   const wasTurnStreaming = wasTurnStreamingRef.current;
+  const hasExpandableFileEditDetails = fileEditDisplayMode !== "summary"
+    && fileEdits.some((edit) => (
+      edit.status !== "editing"
+      && edit.status !== "error"
+      && hasRenderableFileDiff(edit.diff)
+    ));
+  const fileEditGroupDensity = fileEdits.length === 1 && hasExpandableFileEditDetails
+    ? "diff-only"
+    : "default";
   /** Live work stays open; completed work briefly shows the done state, then tucks away. */
   const outerExpanded = userToggledOuter
     ? outerOpenLocal
-    : isTurnStreaming || completionHoldOpen || (wasTurnStreaming && !isTurnStreaming);
+    : isTurnStreaming
+      || completionHoldOpen
+      || (wasTurnStreaming && !isTurnStreaming)
+      || hasExpandableFileEditDetails;
 
   const hasLiveEditingFiles = isTurnStreaming && hasEditingFiles;
   const singleFilePath = fileCount === 1 ? primaryFilePath : undefined;
   const singleFileTooltipPath = fileCount === 1 ? primaryFileTooltipPath : undefined;
   const hasVisibleActivity = reasoningSteps > 0 || toolCalls > 0 || cliCount > 0 || mcpCount > 0 || fileCount > 0;
-  const hasOnlyFileActivity = fileCount > 0 && messages.every(messageHasOnlyFileActivity);
   const hasNonReasoningActivity = toolCalls > 0 || cliCount > 0 || mcpCount > 0 || fileCount > 0;
   const durationMs = activityDurationMs(messages, isTurnStreaming, now, turnLatencyMs);
   const activityDuration = formatActivityDuration(durationMs);
@@ -427,27 +438,6 @@ export function AgentActivityCluster({
 
   if (!hasVisibleActivity) return null;
 
-  if (hasOnlyFileActivity) {
-    return (
-      <FileEditFlatActivity
-        edits={fileEdits}
-        active={isTurnStreaming}
-        hasBodyBelow={hasBodyBelow}
-        summary={summary}
-        singleFilePath={singleFilePath}
-        singleFileTooltipPath={singleFileTooltipPath}
-        hasLiveEditingFiles={hasLiveEditingFiles}
-        hasFailedFiles={hasFailedFiles}
-        hasDeletedFiles={hasDeletedFiles}
-        added={added}
-        deleted={deleted}
-        hasDiffStats={hasDiffStats}
-        fileEditDisplayMode={fileEditDisplayMode}
-        onOpenFilePreview={onOpenFilePreview}
-      />
-    );
-  }
-
   return (
     <div className={cn("w-full", hasBodyBelow && "mb-2")}>
       <button
@@ -522,6 +512,7 @@ export function AgentActivityCluster({
                   );
                 }
                 if (m.kind === "trace") {
+                  if (messageHasOnlyFileActivity(m)) return null;
                   return (
                     <ActivityTraceTimeline
                       key={m.id}
@@ -538,6 +529,7 @@ export function AgentActivityCluster({
                 <FileEditGroup
                   edits={fileEdits}
                   displayMode={fileEditDisplayMode}
+                  density={fileEditGroupDensity}
                   onOpenFilePreview={onOpenFilePreview}
                 />
               ) : null}
@@ -552,96 +544,6 @@ export function AgentActivityCluster({
 function messageHasOnlyFileActivity(message: UIMessage): boolean {
   if (message.kind !== "trace" || !message.fileEdits?.length) return false;
   return traceLines(message).every((line) => !line.trim() || isFileEditTraceLine(line));
-}
-
-function FileEditFlatActivity({
-  edits,
-  active,
-  hasBodyBelow,
-  summary,
-  singleFilePath,
-  singleFileTooltipPath,
-  hasLiveEditingFiles,
-  hasFailedFiles,
-  hasDeletedFiles,
-  added,
-  deleted,
-  hasDiffStats,
-  fileEditDisplayMode,
-  onOpenFilePreview,
-}: {
-  edits: FileEditSummary[];
-  active: boolean;
-  hasBodyBelow: boolean;
-  summary: string;
-  singleFilePath?: string;
-  singleFileTooltipPath?: string;
-  hasLiveEditingFiles: boolean;
-  hasFailedFiles: boolean;
-  hasDeletedFiles: boolean;
-  added: number;
-  deleted: number;
-  hasDiffStats: boolean;
-  fileEditDisplayMode: FileEditDisplayMode;
-  onOpenFilePreview?: (path: string) => void;
-}) {
-  const diffOnlyRows = edits.length === 1
-    && !!singleFilePath
-    && fileEditDisplayMode !== "summary"
-    && edits.some((edit) => (
-      edit.status !== "editing"
-      && edit.status !== "error"
-      && hasRenderableFileDiff(edit.diff)
-    ));
-  const showRows = edits.length > 1
-    || edits.some((edit) => edit.status === "error" || edit.pending)
-    || (
-      fileEditDisplayMode !== "summary"
-      && edits.some((edit) => hasRenderableFileDiff(edit.diff))
-    );
-  return (
-    <div className={cn("w-full", hasBodyBelow && "mb-2")} aria-label={summary}>
-      <div
-        className={cn(
-          "flex max-w-full items-center gap-1.5 px-1 py-1",
-          "text-[12.5px] text-muted-foreground/72",
-        )}
-      >
-        <StreamingLabelSheen active={active} className="min-w-0">
-          {singleFilePath
-            ? fileActivityVerb(hasLiveEditingFiles, hasFailedFiles, hasDeletedFiles)
-            : summary}
-        </StreamingLabelSheen>
-        {singleFilePath ? (
-          <FileReferenceChip
-            path={singleFilePath}
-            tooltipPath={singleFileTooltipPath}
-            previewPath={singleFileTooltipPath || singleFilePath}
-            onOpen={onOpenFilePreview}
-            active={hasLiveEditingFiles}
-            className="-my-0.5 min-w-0"
-            textClassName="text-xs"
-            testId="activity-header-file-reference"
-          />
-        ) : null}
-        {hasDiffStats ? (
-          <span className="inline-flex min-w-0 items-center gap-1 text-muted-foreground/85">
-            <DiffPair added={added} deleted={deleted} />
-          </span>
-        ) : null}
-      </div>
-      {showRows ? (
-        <div className="mt-0.5 pl-4">
-          <FileEditGroup
-            edits={edits}
-            displayMode={fileEditDisplayMode}
-            density={diffOnlyRows ? "diff-only" : "default"}
-            onOpenFilePreview={onOpenFilePreview}
-          />
-        </div>
-      ) : null}
-    </div>
-  );
 }
 
 function shortFileName(path: string): string {

@@ -509,6 +509,110 @@ describe("AgentActivityCluster", () => {
     }
   });
 
+  it("expands new file diffs through the unified file edit activity path", () => {
+    localStorage.setItem(
+      "nanobot-webui.settings-preferences",
+      JSON.stringify({ fileEditDisplayMode: "diff" }),
+    );
+
+    try {
+      render(
+        <AgentActivityCluster
+          messages={[{
+            id: "t-new-file-diff",
+            role: "tool",
+            kind: "trace",
+            content: "write_file()",
+            traces: ["write_file()"],
+            fileEdits: [{
+              call_id: "call-new-file",
+              tool: "write_file",
+              path: "src/new-feature.ts",
+              phase: "end",
+              added: 3,
+              deleted: 0,
+              approximate: false,
+              status: "done",
+              diff: unifiedFileDiff([
+                "--- src/new-feature.ts",
+                "+++ src/new-feature.ts",
+                "@@ -0,0 +1,3 @@",
+                "+export const enabled = true;",
+                "+export function run() {",
+                "+  return enabled;",
+              ]),
+            }],
+            createdAt: 3,
+          }]}
+          isTurnStreaming={false}
+          hasBodyBelow={false}
+        />,
+      );
+
+      expect(screen.getByRole("button", { name: /edited new-feature\.ts/i })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+      expect(screen.getByTestId("agent-activity-scroll")).toBeInTheDocument();
+      expect(screen.getByTestId("file-edit-diff")).toBeInTheDocument();
+      expect(screen.getByText("export const enabled = true;")).toBeInTheDocument();
+      expect(screen.queryByText("write_file()")).not.toBeInTheDocument();
+    } finally {
+      localStorage.removeItem("nanobot-webui.settings-preferences");
+    }
+  });
+
+  it("keeps mixed old-file edits expanded when diff display is enabled", () => {
+    localStorage.setItem(
+      "nanobot-webui.settings-preferences",
+      JSON.stringify({ fileEditDisplayMode: "diff" }),
+    );
+
+    try {
+      render(
+        <AgentActivityCluster
+          messages={activityMessages(" before editing", {
+            id: "t-existing-file-diff",
+            role: "tool",
+            kind: "trace",
+            content: "edit_file()",
+            traces: ["edit_file()"],
+            fileEdits: [{
+              call_id: "call-existing-file",
+              tool: "edit_file",
+              path: "src/app.tsx",
+              phase: "end",
+              added: 1,
+              deleted: 1,
+              approximate: false,
+              status: "done",
+              diff: unifiedFileDiff([
+                "--- src/app.tsx",
+                "+++ src/app.tsx",
+                "@@ -10,2 +10,2 @@",
+                "-  return before;",
+                "+  return after;",
+              ]),
+            }],
+            createdAt: 3,
+          })}
+          isTurnStreaming={false}
+          hasBodyBelow={false}
+        />,
+      );
+
+      expect(screen.getByRole("button", { name: /edited app\.tsx/i })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+      expect(screen.getByTestId("agent-activity-scroll")).toBeInTheDocument();
+      expect(screen.getByText("thinking before editing")).toBeInTheDocument();
+      expect(screen.getByText("return after;")).toBeInTheDocument();
+    } finally {
+      localStorage.removeItem("nanobot-webui.settings-preferences");
+    }
+  });
+
   it("renders folded separators between separated file edit hunks", () => {
     localStorage.setItem(
       "nanobot-webui.settings-preferences",

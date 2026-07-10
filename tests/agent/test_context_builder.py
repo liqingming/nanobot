@@ -504,3 +504,23 @@ class TestBuildMessages:
         user_msg = messages[-1]["content"]
         assert isinstance(user_msg, list)
         assert any(b.get("type") == "image_url" for b in user_msg)
+
+
+def test_build_system_prompt_uses_request_workspace_claude_skills(tmp_path):
+    default_workspace = tmp_path / "default"
+    data_dir = tmp_path / "data"
+    request_workspace = tmp_path / "request_project"
+    default_workspace.mkdir(parents=True)
+    data_dir.mkdir(parents=True)
+    request_workspace.mkdir(parents=True)
+    _write_skill(
+        request_workspace / ".claude" / "skills",
+        "request_skill",
+        "Request workspace skill",
+    )
+
+    builder = ContextBuilder(workspace=default_workspace, data_dir=data_dir)
+    prompt = builder.build_system_prompt(workspace=request_workspace)
+
+    assert "request_skill" in prompt
+    assert "Request workspace skill" in prompt

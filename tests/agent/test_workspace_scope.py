@@ -368,3 +368,45 @@ async def test_spawn_tool_forwards_current_workspace_scope(tmp_path: Path) -> No
 
     assert result == "spawned"
     assert manager.seen["workspace_scope"] == scope
+
+
+def test_api_channel_honors_message_workspace_scope(tmp_path):
+    from nanobot.security.workspace_access import WORKSPACE_SCOPE_METADATA_KEY, WorkspaceScopeResolver
+
+    default = tmp_path / "default"
+    project = tmp_path / "project"
+    default.mkdir()
+    project.mkdir()
+    resolver = WorkspaceScopeResolver(default_workspace=default, default_restrict_to_workspace=False)
+
+    scope = resolver.for_turn(
+        channel="api",
+        message_metadata={
+            WORKSPACE_SCOPE_METADATA_KEY: {
+                "project_path": str(project),
+                "access_mode": "full",
+            }
+        },
+        session_metadata={},
+    )
+
+    assert scope.project_path == project.resolve()
+    assert scope.source_channel == "api"
+
+
+def test_api_channel_without_workspace_scope_uses_default(tmp_path):
+    from nanobot.security.workspace_access import WorkspaceScopeResolver
+
+    default = tmp_path / "default"
+    project = tmp_path / "project"
+    default.mkdir()
+    project.mkdir()
+    resolver = WorkspaceScopeResolver(default_workspace=default, default_restrict_to_workspace=False)
+
+    scope = resolver.for_turn(
+        channel="api",
+        message_metadata={},
+        session_metadata={"workspace_scope": {"project_path": str(project), "access_mode": "full"}},
+    )
+
+    assert scope.project_path == default.resolve()

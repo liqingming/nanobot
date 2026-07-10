@@ -291,6 +291,52 @@ def test_status_help_shows_workspace_and_config_options():
     assert "-c" in stripped_output
 
 
+def test_runtime_data_dir_for_custom_workspace_uses_cache(tmp_path: Path):
+    workspace = tmp_path / "project-workspace"
+
+    assert cli_commands._runtime_data_dir_for_workspace(workspace) == get_workspace_cache_dir(workspace)
+
+
+def test_serve_uses_cache_data_dir_for_custom_workspace(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "instance" / "config.json"
+    workspace = tmp_path / "project-workspace"
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "config-workspace")
+    config.api.host = "127.0.0.1"
+    config.api.port = 0
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps(config.model_dump(mode="json", by_alias=True)), encoding="utf-8")
+    workspace.mkdir(parents=True)
+    data_dir = get_workspace_cache_dir(workspace)
+
+    fake_loop = MagicMock()
+    fake_loop._connect_mcp = AsyncMock()
+    fake_loop.close_mcp = AsyncMock()
+    fake_app = MagicMock()
+
+    with patch("nanobot.cli.commands.sync_workspace_templates") as sync_templates, \
+         patch("nanobot.cli.commands.AgentLoop.from_config", return_value=fake_loop) as from_config, \
+         patch("nanobot.api.server.create_app", return_value=fake_app), \
+         patch("aiohttp.web.run_app"):
+        result = runner.invoke(
+            app,
+            [
+                "serve",
+                "--config", str(config_path),
+                "--workspace", str(workspace),
+                "--host", "127.0.0.1",
+                "--port", "0",
+            ],
+        )
+
+    assert result.exit_code == 0
+    sync_templates.assert_called_once_with(data_dir)
+    assert from_config.call_args.kwargs["data_dir"] == data_dir
+    session_manager = from_config.call_args.kwargs["session_manager"]
+    assert data_dir in session_manager.sessions_dir.parents
+    assert workspace not in session_manager.sessions_dir.parents
+
+
 def test_status_uses_explicit_config_and_workspace(tmp_path: Path):
     config_path = tmp_path / "instance" / "config.json"
     config_workspace = tmp_path / "config-workspace"

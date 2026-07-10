@@ -28,6 +28,11 @@ from nanobot.utils.media_decode import (
 from nanobot.utils.media_decode import (
     save_base64_data_url as _save_base64_data_url,
 )
+from nanobot.security.workspace_access import (
+    WORKSPACE_SCOPE_METADATA_KEY,
+    WorkspaceScopeError,
+    validate_workspace_scope_payload,
+)
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 __all__ = (
@@ -161,13 +166,15 @@ def _parse_json_content(body: dict) -> tuple[str, list[str]]:
     return text, media_paths
 
 
-async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | None, str | None]:
-    """Parse multipart/form-data. Returns (text, media_paths, session_id, model)."""
+async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | None, str | None, str | None, float | None]:
+    """Parse multipart/form-data. Returns (text, media_paths, session_id, model, workspace, timeout)."""
     media_dir = get_media_dir("api")
     reader = await request.multipart()
     text = ""
     session_id = None
     model = None
+    workspace = None
+    timeout = None
     media_paths: list[str] = []
 
     while True:
@@ -180,6 +187,11 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
             session_id = (await part.read()).decode("utf-8").strip()
         elif part.name == "model":
             model = (await part.read()).decode("utf-8").strip()
+        elif part.name == "workspace":
+            workspace = (await part.read()).decode("utf-8").strip()
+        elif part.name == "timeout":
+            raw_timeout = (await part.read()).decode("utf-8").strip()
+            timeout = float(raw_timeout) if raw_timeout else None
         elif part.name == "files":
             raw = await part.read()
             if len(raw) > MAX_FILE_SIZE:
@@ -195,7 +207,7 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
     if not text:
         text = "请分析上传的文件"
 
-    return text, media_paths, session_id, model
+    return text, media_paths, session_id, model, workspace, timeout
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +227,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
     stream = False
     try:
+        requested_workspace = None
+        requested_timeout = None
         if content_type.startswith("multipart/"):
-            text, media_paths, session_id, requested_model = await _parse_multipart(request)
+            text, media_paths, session_id, requested_model, requested_workspace, requested_timeout = await _parse_multipart(request)
         else:
             try:
                 body = await request.json()
@@ -224,6 +238,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                 return _error_json(400, "Invalid JSON body")
             stream = body.get("stream", False)
             requested_model = body.get("model")
+            requested_workspace = body.get("workspace")
+            requested_timeout = body.get("timeout")
             text, media_paths = _parse_json_content(body)
             session_id = body.get("session_id")
     except ValueError as e:
@@ -236,6 +252,28 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
     if requested_model and requested_model != model_name:
         return _error_json(400, f"Only configured model '{model_name}' is available")
+
+    request_timeout_s = timeout_s
+    if requested_timeout is not None:
+        try:
+            request_timeout_s = float(requested_timeout)
+        except (TypeError, ValueError):
+            return _error_json(400, "timeout must be a number")
+        if request_timeout_s <= 0:
+            return _error_json(400, "timeout must be greater than 0")
+
+    metadata: dict[str, Any] = {}
+    if requested_workspace:
+        try:
+            scope = validate_workspace_scope_payload(
+                {"project_path": str(requested_workspace), "access_mode": "full"},
+                default_workspace=agent_loop.workspace,
+                default_restrict_to_workspace=agent_loop.restrict_to_workspace,
+                source_channel="api",
+            )
+        except WorkspaceScopeError as exc:
+            return _error_json(exc.status, exc.message)
+        metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()
 
     session_key = f"api:{session_id}" if session_id else API_SESSION_KEY
     session_locks: dict[str, asyncio.Lock] = request.app["session_locks"]
@@ -283,8 +321,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             chat_id=API_CHAT_ID,
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
+                            metadata=metadata,
                         ),
-                        timeout=timeout_s,
+                        timeout=request_timeout_s,
                     )
                     if not emitted_content:
                         response_text = _response_text(response)
@@ -327,8 +366,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
+                        metadata=metadata,
                     ),
-                    timeout=timeout_s,
+                    timeout=request_timeout_s,
                 )
                 response_text = _response_text(response)
 
@@ -342,8 +382,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             channel="api",
                             chat_id=API_CHAT_ID,
                             persist_user_message=False,
+                            metadata=metadata,
                         ),
-                        timeout=timeout_s,
+                        timeout=request_timeout_s,
                     )
                     response_text = _response_text(retry_response)
                     if not response_text or not response_text.strip():
@@ -351,7 +392,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         response_text = fallback
 
             except asyncio.TimeoutError:
-                return _error_json(504, f"Request timed out after {timeout_s}s")
+                return _error_json(504, f"Request timed out after {request_timeout_s}s")
             except Exception:
                 logger.exception("Error processing request for session {}", session_key)
                 return _error_json(500, "Internal server error", err_type="server_error")

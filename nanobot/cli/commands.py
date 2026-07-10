@@ -76,7 +76,7 @@ from nanobot.cli.gateway import create_gateway_app  # noqa: E402
 from nanobot.cli.markdown import terminal_markdown  # noqa: E402
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner  # noqa: E402
 from nanobot.command.builtin import BUILTIN_COMMAND_SPECS  # noqa: E402
-from nanobot.config.paths import get_workspace_path, is_default_workspace  # noqa: E402
+from nanobot.config.paths import get_workspace_cache_dir, get_workspace_path, is_default_workspace  # noqa: E402
 from nanobot.config.schema import Config  # noqa: E402
 from nanobot.utils.evaluator import evaluate_response  # noqa: E402
 from nanobot.utils.helpers import safe_filename, sync_workspace_templates  # noqa: E402
@@ -909,6 +909,13 @@ def _tui_command_palette() -> list[tuple[str, str, str]]:
     return deduped
 
 
+def _runtime_data_dir_for_workspace(workspace_path: Path) -> Path:
+    """Return where nanobot runtime metadata should live for a workspace."""
+    if is_default_workspace(workspace_path):
+        return workspace_path
+    return get_workspace_cache_dir(workspace_path)
+
+
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
     """Load config and optionally override the active workspace."""
     from nanobot.config.loader import load_config, resolve_config_env_vars, set_config_path
@@ -1309,12 +1316,14 @@ def serve(
             "Set api.api_key in config to prevent unauthenticated access.[/red]"
         )
         raise typer.Exit(1)
-    sync_workspace_templates(runtime_config.workspace_path)
+    data_dir = _runtime_data_dir_for_workspace(runtime_config.workspace_path)
+    sync_workspace_templates(data_dir)
     bus = MessageBus()
-    session_manager = SessionManager(runtime_config.workspace_path)
+    session_manager = SessionManager(data_dir)
     try:
         agent_loop = AgentLoop.from_config(
             runtime_config, bus,
+            data_dir=data_dir,
             session_manager=session_manager,
             image_generation_provider_configs=image_gen_provider_configs(runtime_config),
             hook_factories=[create_file_edit_activity_hook],
@@ -2044,11 +2053,7 @@ def agent(
 
     # For non-default workspaces, store nanobot metadata in the central cache dir
     # (~/.nanobot/caches/<name>_<hash>/) so project directories stay clean.
-    if is_default_workspace(config.workspace_path):
-        data_dir = config.workspace_path
-    else:
-        from nanobot.config.paths import get_workspace_cache_dir
-        data_dir = get_workspace_cache_dir(config.workspace_path)
+    data_dir = _runtime_data_dir_for_workspace(config.workspace_path)
     sync_workspace_templates(data_dir)
 
     bus = MessageBus()

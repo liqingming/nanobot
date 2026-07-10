@@ -37,6 +37,8 @@ def _make_mock_agent(response_text: str = "mock response") -> MagicMock:
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
     agent._last_usage = {"prompt_tokens": 100, "completion_tokens": 50}
+    agent.workspace = "."
+    agent.restrict_to_workspace = False
     return agent
 
 
@@ -261,6 +263,7 @@ async def test_successful_request_uses_fixed_api_session(aiohttp_client, mock_ag
         session_key=API_SESSION_KEY,
         channel="api",
         chat_id=API_CHAT_ID,
+        metadata={},
     )
 
 
@@ -541,3 +544,42 @@ async def test_process_direct_accepts_media() -> None:
     assert captured_msg is not None
     assert captured_msg.media == ["/tmp/image.png", "/tmp/report.pdf"]
     assert captured_msg.content == "analyze this"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_json_request_passes_workspace_and_timeout_to_agent(aiohttp_client, tmp_path) -> None:
+    agent = _make_mock_agent()
+    app = create_app(agent, model_name="test-model", request_timeout=10.0)
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "workspace": str(tmp_path),
+            "timeout": 30,
+        },
+    )
+
+    assert resp.status == 200
+    kwargs = agent.process_direct.call_args.kwargs
+    assert kwargs["metadata"]["workspace_scope"]["project_path"] == str(tmp_path.resolve())
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_invalid_workspace_returns_400(aiohttp_client, tmp_path) -> None:
+    agent = _make_mock_agent()
+    app = create_app(agent, model_name="test-model")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "workspace": str(tmp_path / "missing"),
+        },
+    )
+
+    assert resp.status == 400
