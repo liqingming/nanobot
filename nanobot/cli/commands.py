@@ -280,8 +280,10 @@ def _topic_cache_size_bytes(
     data_dir: Path,
     session_key: str,
     session_path: str | None = None,
+    transcript_path: str | None = None,
 ) -> int:
     total = _path_tree_size(Path(session_path)) if session_path else 0
+    total += _path_tree_size(Path(transcript_path)) if transcript_path else 0
     total += _path_tree_size(_topic_memory_dir(data_dir, session_key))
     return total
 
@@ -2193,7 +2195,7 @@ def agent(
                         pass
                 tui.set_topic(name)
                 tui.load_session_history(
-                    s.messages,
+                    agent_loop.sessions.display_history(s.key, s.messages),
                     tool_registry=agent_loop.tools,
                     workspace=agent_loop.workspace,
                 )
@@ -2232,6 +2234,7 @@ def agent(
                         data_dir=agent_loop.context.data_dir,
                         session_key=key,
                         session_path=str(info.get("path") or "") or None,
+                        transcript_path=str(info.get("transcript_path") or "") or None,
                     )
                     items.append((name, _format_topic_popup_label(name, size)))
                 return items

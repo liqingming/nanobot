@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import uuid
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
+from nanobot.session.transcript_archive import TranscriptArchive
 from nanobot.utils.atomic_write import replace_file_with_retry
 from nanobot.utils.helpers import (
     ensure_dir,
@@ -160,6 +162,7 @@ class Session:
             "role": role,
             "content": content,
             "timestamp": datetime.now().isoformat(),
+            "_transcript_id": uuid.uuid4().hex,
             **kwargs
         }
         self.messages.append(msg)
@@ -441,6 +444,7 @@ class SessionManager:
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
+        self.transcripts = TranscriptArchive(self.sessions_dir)
         self._cache: dict[str, Session] = {}
 
     @staticmethod
@@ -673,6 +677,9 @@ class SessionManager:
         write-back caching (e.g. rclone VFS, NFS, FUSE mounts) do not lose
         the most recent writes.
         """
+        self._ensure_transcript_ids(session.messages)
+        self.transcripts.sync(session.key, session.messages)
+
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
 
@@ -714,6 +721,17 @@ class SessionManager:
             raise
 
         self._cache[session.key] = session
+
+    @staticmethod
+    def _ensure_transcript_ids(messages: list[dict[str, Any]]) -> None:
+        for message in messages:
+            if not isinstance(message.get("_transcript_id"), str):
+                message["_transcript_id"] = uuid.uuid4().hex
+
+    def display_history(self, key: str, live_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        archived = self.transcripts.read(key)
+        seen = {m.get("_transcript_id") for m in archived}
+        return archived + [m for m in live_messages if m.get("_transcript_id") not in seen]
 
     def flush_all(self) -> int:
         """Re-save every cached session with fsync for durable shutdown.
@@ -759,6 +777,7 @@ class SessionManager:
         if session_dir.exists():
             shutil.rmtree(session_dir, ignore_errors=True)
             deleted = True
+        self.transcripts.delete(key)
         return deleted
 
     def fork_session_before_user_index(
@@ -956,6 +975,7 @@ class SessionManager:
                                     "title": title,
                                     "preview": preview,
                                     "path": str(path),
+                                    "transcript_path": str(self.transcripts.path_for(key)),
                                 }
                             )
             except Exception:

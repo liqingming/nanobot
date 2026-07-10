@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import os
 import time
+import uuid
 from contextlib import AsyncExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -2213,6 +2214,7 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
+            entry.setdefault("_transcript_id", uuid.uuid4().hex)
             session.messages.append(entry)
             if role == "assistant":
                 last_assistant_idx = len(session.messages) - 1
