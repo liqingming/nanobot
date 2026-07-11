@@ -561,12 +561,14 @@ async def test_json_request_passes_workspace_and_timeout_to_agent(aiohttp_client
             "messages": [{"role": "user", "content": "hello"}],
             "workspace": str(tmp_path),
             "timeout": 30,
+            "tool_policy": {"blocked_grep_paths": ["Assets"]},
         },
     )
 
     assert resp.status == 200
     kwargs = agent.process_direct.call_args.kwargs
     assert kwargs["metadata"]["workspace_scope"]["project_path"] == str(tmp_path.resolve())
+    assert kwargs["metadata"]["tool_policy"] == {"blocked_grep_paths": ["Assets"]}
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")

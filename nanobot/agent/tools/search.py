@@ -16,6 +16,7 @@ from nanobot.agent.tools.filesystem import ListDirTool, _FsTool
 
 _DEFAULT_HEAD_LIMIT = 250
 _DEFAULT_FILE_HEAD_LIMIT = 200
+_TOOL_POLICY_METADATA_KEY = "tool_policy"
 T = TypeVar("T")
 _TYPE_GLOB_MAP = {
     "py": ("*.py", "*.pyi"),
@@ -102,6 +103,25 @@ def _matches_query(rel_path: str, query: str | None) -> bool:
 
 class _SearchTool(_FsTool):
     _IGNORE_DIRS = set(ListDirTool._IGNORE_DIRS)
+
+    @staticmethod
+    def _blocked_request_paths(policy_key: str) -> set[str]:
+        request_ctx = current_request_context()
+        policy = request_ctx.metadata.get(_TOOL_POLICY_METADATA_KEY) if request_ctx else None
+        raw_paths = policy.get(policy_key) if isinstance(policy, dict) else None
+        if not isinstance(raw_paths, list):
+            return set()
+        return {str(path).strip().replace("\\", "/").rstrip("/").lower() for path in raw_paths}
+
+    @classmethod
+    def _reject_policy_path(cls, path: str, policy_key: str, tool_name: str) -> str | None:
+        normalized = path.strip().replace("\\", "/").rstrip("/").lower()
+        if normalized in cls._blocked_request_paths(policy_key):
+            return (
+                f"Error: path '{path or '.'}' is blocked by the request tool_policy for {tool_name}. "
+                "Use a changed file path or a specific module/subdirectory."
+            )
+        return None
 
     def _display_path(self, target: Path, root: Path) -> str:
         workspace = self._display_workspace()
@@ -206,18 +226,6 @@ class FindFilesTool(_SearchTool):
             for filename in sorted(filenames):
                 yield current / filename
 
-    @staticmethod
-    def _reject_unbounded_review_search(path: str) -> str | None:
-        request_ctx = current_request_context()
-        session_key = str(request_ctx.session_key or "") if request_ctx else ""
-        if session_key.startswith("api:review_") and (not path.strip() or path.strip() in {".", "./"}):
-            return (
-                "Error: unbounded find_files search is disabled for review sessions. "
-                "Use a changed file path or a specific business directory such as "
-                "Assets/Script/Game/moduls/<Module>."
-            )
-        return None
-
     async def execute(
         self,
         path: str = ".",
@@ -231,7 +239,7 @@ class FindFilesTool(_SearchTool):
         **kwargs: Any,
     ) -> str:
         try:
-            if rejection := self._reject_unbounded_review_search(path):
+            if rejection := self._reject_policy_path(path, "blocked_find_files_paths", "find_files"):
                 return ToolResult.error(rejection)
             target = self._resolve(path or ".")
             if not target.exists():
@@ -442,6 +450,8 @@ class GrepTool(_SearchTool):
         **kwargs: Any,
     ) -> str:
         try:
+            if rejection := self._reject_policy_path(path, "blocked_grep_paths", "grep"):
+                return ToolResult.error(rejection)
             target = self._resolve(path or ".")
             if not target.exists():
                 return ToolResult.error(f"Error: Path not found: {path}")

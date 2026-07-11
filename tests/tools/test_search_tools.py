@@ -54,7 +54,7 @@ async def test_find_files_filters_by_query_glob_and_type(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["", ".", "./"])
-async def test_find_files_rejects_unbounded_root_search_for_review_session(tmp_path: Path, path: str) -> None:
+async def test_find_files_rejects_paths_from_request_tool_policy(tmp_path: Path, path: str) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text("pass\n", encoding="utf-8")
     tool = FindFilesTool(workspace=tmp_path, allowed_dir=tmp_path)
@@ -62,17 +62,18 @@ async def test_find_files_rejects_unbounded_root_search_for_review_session(tmp_p
         channel="api",
         chat_id="default",
         session_key="api:review_123_code_review",
+        metadata={"tool_policy": {"blocked_find_files_paths": ["", ".", "./"]}},
     ))
     try:
         result = await tool.execute(path=path, query="main")
     finally:
         reset_request_context(token)
 
-    assert "unbounded find_files search is disabled" in str(result)
+    assert "blocked by the request tool_policy for find_files" in str(result)
 
 
 @pytest.mark.asyncio
-async def test_find_files_allows_scoped_search_for_review_session(tmp_path: Path) -> None:
+async def test_find_files_without_policy_is_not_restricted_for_review_session(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text("pass\n", encoding="utf-8")
     tool = FindFilesTool(workspace=tmp_path, allowed_dir=tmp_path)
@@ -131,6 +132,49 @@ async def test_find_files_rejects_paths_outside_workspace(tmp_path: Path) -> Non
     result = await tool.execute(path=str(outside))
 
     assert result.startswith("Error:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["", ".", "./", "Assets", "Assets/Script", "Assets/Script/Game", "Assets/Script/Game/moduls", "Assets/ScriptGenerated", "Assets/ResourcesAssets"])
+async def test_grep_rejects_paths_from_request_tool_policy(tmp_path: Path, path: str) -> None:
+    (tmp_path / "Assets" / "Script" / "Game" / "moduls" / "Dragon").mkdir(parents=True)
+    tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
+    token = bind_request_context(RequestContext(
+        channel="api",
+        chat_id="default",
+        session_key="api:review_123_code_review",
+        metadata={"tool_policy": {"blocked_grep_paths": ["", ".", "./", "Assets", "Assets/Script", "Assets/Script/Game", "Assets/Script/Game/moduls", "Assets/ScriptGenerated", "Assets/ResourcesAssets"]}},
+    ))
+    try:
+        result = await tool.execute(pattern="needle", path=path)
+    finally:
+        reset_request_context(token)
+
+    assert "blocked by the request tool_policy for grep" in str(result)
+    assert "specific module/subdirectory" in str(result)
+
+
+@pytest.mark.asyncio
+async def test_grep_allows_specific_module_for_review_session(tmp_path: Path) -> None:
+    module = tmp_path / "Assets" / "Script" / "Game" / "moduls" / "Dragon"
+    module.mkdir(parents=True)
+    (module / "DragonData.cs").write_text("needle\n", encoding="utf-8")
+    tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
+    token = bind_request_context(RequestContext(
+        channel="api",
+        chat_id="default",
+        session_key="api:review_123_code_review",
+    ))
+    try:
+        result = await tool.execute(
+            pattern="needle",
+            path="Assets/Script/Game/moduls/Dragon",
+            fixed_strings=True,
+        )
+    finally:
+        reset_request_context(token)
+
+    assert result.splitlines() == ["Assets/Script/Game/moduls/Dragon/DragonData.cs"]
 
 
 @pytest.mark.asyncio

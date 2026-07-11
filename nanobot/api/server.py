@@ -166,8 +166,8 @@ def _parse_json_content(body: dict) -> tuple[str, list[str]]:
     return text, media_paths
 
 
-async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | None, str | None, str | None, float | None]:
-    """Parse multipart/form-data. Returns (text, media_paths, session_id, model, workspace, timeout)."""
+async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | None, str | None, str | None, float | None, Any]:
+    """Parse multipart/form-data and return message, media, routing fields, and tool policy."""
     media_dir = get_media_dir("api")
     reader = await request.multipart()
     text = ""
@@ -175,6 +175,7 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
     model = None
     workspace = None
     timeout = None
+    tool_policy: Any = None
     media_paths: list[str] = []
 
     while True:
@@ -192,6 +193,9 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
         elif part.name == "timeout":
             raw_timeout = (await part.read()).decode("utf-8").strip()
             timeout = float(raw_timeout) if raw_timeout else None
+        elif part.name == "tool_policy":
+            raw_policy = (await part.read()).decode("utf-8").strip()
+            tool_policy = json.loads(raw_policy) if raw_policy else None
         elif part.name == "files":
             raw = await part.read()
             if len(raw) > MAX_FILE_SIZE:
@@ -207,7 +211,7 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
     if not text:
         text = "请分析上传的文件"
 
-    return text, media_paths, session_id, model, workspace, timeout
+    return text, media_paths, session_id, model, workspace, timeout, tool_policy
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +233,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     try:
         requested_workspace = None
         requested_timeout = None
+        requested_tool_policy: Any = None
         if content_type.startswith("multipart/"):
-            text, media_paths, session_id, requested_model, requested_workspace, requested_timeout = await _parse_multipart(request)
+            text, media_paths, session_id, requested_model, requested_workspace, requested_timeout, requested_tool_policy = await _parse_multipart(request)
         else:
             try:
                 body = await request.json()
@@ -240,6 +245,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             requested_model = body.get("model")
             requested_workspace = body.get("workspace")
             requested_timeout = body.get("timeout")
+            requested_tool_policy = body.get("tool_policy")
             text, media_paths = _parse_json_content(body)
             session_id = body.get("session_id")
     except ValueError as e:
@@ -263,6 +269,18 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             return _error_json(400, "timeout must be greater than 0")
 
     metadata: dict[str, Any] = {}
+    if requested_tool_policy is not None:
+        if not isinstance(requested_tool_policy, dict):
+            return _error_json(400, "tool_policy must be an object")
+        normalized_policy: dict[str, list[str]] = {}
+        for key in ("blocked_find_files_paths", "blocked_grep_paths"):
+            paths = requested_tool_policy.get(key)
+            if paths is None:
+                continue
+            if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+                return _error_json(400, f"tool_policy.{key} must be an array of strings")
+            normalized_policy[key] = list(paths)
+        metadata["tool_policy"] = normalized_policy
     if session_id and str(session_id).startswith("review_"):
         metadata["review_session"] = True
     if requested_workspace:
