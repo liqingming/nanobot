@@ -266,6 +266,19 @@ class AwaitUserInputTool(Tool, _GoalToolsMixin):
     def __init__(self, sessions: Any, runtime_events: RuntimeEventBus | None = None) -> None:
         _GoalToolsMixin.__init__(self, sessions, runtime_events)
 
+    @classmethod
+    def create(cls, ctx: Any) -> Tool:
+        sess = getattr(ctx, "sessions", None)
+        assert sess is not None  # guarded by enabled()
+        return cls(
+            sessions=sess,
+            runtime_events=getattr(ctx, "runtime_events", None),
+        )
+
+    @classmethod
+    def enabled(cls, ctx: Any) -> bool:
+        return getattr(ctx, "sessions", None) is not None
+
     @property
     def name(self) -> str:
         return "await_user_input"

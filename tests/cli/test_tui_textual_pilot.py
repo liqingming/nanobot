@@ -906,6 +906,25 @@ async def test_stream_delta_only_inserts_idle_thinking_after_long_gap() -> None:
 
 
 @pytest.mark.asyncio
+async def test_completed_response_removes_initial_thinking_placeholder() -> None:
+    """A visible plan must replace, not leave behind, the initial thinking timer."""
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.stream_start()
+        await pilot.pause()
+        tui.add_response("计划已确认")
+        await pilot.pause()
+
+        text = _output_log_text(app.query_one("#output"))
+        assert "计划已确认" in text
+        assert "思考中" not in text
+
+
+@pytest.mark.asyncio
 async def test_idle_thinking_after_tool_completes_does_not_crash() -> None:
     """add_tool_result also schedules idle thinking — same regression path
     must not surface LookupError on shutdown.

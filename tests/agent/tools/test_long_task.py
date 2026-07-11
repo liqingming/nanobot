@@ -216,6 +216,8 @@ async def test_long_task_and_complete_goal_registered(tmp_path):
     assert lt is not None and lt.name == "long_task"
     assert cg is not None and cg.name == "complete_goal"
     assert wait is not None and wait.name == "await_user_input"
+    assert isinstance(wait, AwaitUserInputTool)
+    assert wait._sessions is loop.sessions
 
 
 @pytest.mark.asyncio

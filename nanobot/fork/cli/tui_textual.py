@@ -1345,6 +1345,7 @@ class TextualTUI(TUIBase):
         self._suppress_segment_sep: bool = False
         self._idle_thinking_task: Any = None  # asyncio.Task scheduling the "still thinking" spinner
         self._idle_placeholder_visible: bool = False  # whether the idle thinking line is in #output
+        self._initial_thinking_placeholder_visible: bool = False  # stream_start placeholder before visible output
         # When idle thinking is shown, _tool_placeholder_line is moved to its
         # line so the spinner updates that line. This backup preserves the
         # original (stream_delta / tool) anchor so cancel_idle can restore it
@@ -1771,6 +1772,7 @@ class TextualTUI(TUIBase):
         metadata: dict | None = None,
         ts: str | None = None,
     ) -> None:
+        self._clear_initial_thinking_placeholder()
         ts = ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._write_response(content, ts, metadata)
 
@@ -2112,6 +2114,7 @@ class TextualTUI(TUIBase):
             # Match the idle thinking style — _tick will overwrite this with
             # the same format on each frame anyway.
             out.write(Text("  ⠋ 思考中...", style="grey50"))
+            self._initial_thinking_placeholder_visible = True
             out.scroll_end(animate=False)
         except Exception:
             self._stream_header_line = 0
@@ -2122,6 +2125,7 @@ class TextualTUI(TUIBase):
         self._app._safe_call(self._app.start_thinking_spinner)
 
     def tool_phase_start(self) -> None:
+        self._clear_initial_thinking_placeholder()
         self._activity_phase = "tool_phase"
         self._cancel_idle_thinking()
         # Petrify the previous tool's spinner line into a static "→ tool" trace
@@ -2148,6 +2152,18 @@ class TextualTUI(TUIBase):
         # Textual's context (active_app ContextVar must be set, otherwise
         # set_interval's task silently crashes on shutdown).
         self._app._safe_call(self._app.start_thinking_spinner)
+
+    def _clear_initial_thinking_placeholder(self) -> None:
+        """Remove the stream-start thinking line once visible activity replaces it."""
+        if not self._initial_thinking_placeholder_visible:
+            return
+        self._initial_thinking_placeholder_visible = False
+        try:
+            self._app.stop_thinking_spinner()
+            out = self._app.query_one("#output", _OutputLog)
+            out.truncate_to(self._tool_placeholder_line)
+        except Exception:
+            pass
 
     def _cancel_idle_thinking(self) -> None:
         """Stop any pending idle-thinking spinner task and remove the
@@ -2279,6 +2295,7 @@ class TextualTUI(TUIBase):
             self._stream_render_task = None
 
     def stream_delta(self, delta: str) -> None:
+        self._clear_initial_thinking_placeholder()
         self._activity_phase = "stream_delta"
         self._cancel_idle_thinking()
         self._app.stop_thinking_spinner()
@@ -2298,6 +2315,7 @@ class TextualTUI(TUIBase):
         self._schedule_idle_thinking(delay=2.0)
 
     def flush_stream(self, metadata: dict | None = None) -> None:
+        self._clear_initial_thinking_placeholder()
         self._activity_phase = "flush_stream"
         self._cancel_idle_thinking()
         self._cancel_stream_render()
