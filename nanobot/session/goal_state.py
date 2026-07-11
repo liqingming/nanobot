@@ -43,6 +43,30 @@ def sustained_goal_active(metadata: Mapping[str, Any] | None) -> bool:
     return isinstance(goal, dict) and goal.get("status") == "active"
 
 
+def sustained_goal_waiting_for_user(metadata: Mapping[str, Any] | None) -> bool:
+    """True when an active goal deliberately yielded for a real user reply."""
+    goal = parse_goal_state(goal_state_raw(metadata))
+    return isinstance(goal, dict) and goal.get("status") == "active" and bool(
+        goal.get("awaiting_user_input")
+    )
+
+
+def clear_goal_waiting_for_user(metadata: MutableMapping[str, Any]) -> bool:
+    """Resume an active goal after its next real inbound user message."""
+    goal = parse_goal_state(goal_state_raw(metadata))
+    if not isinstance(goal, dict) or goal.get("status") != "active":
+        return False
+    if not goal.get("awaiting_user_input"):
+        return False
+    metadata[GOAL_STATE_KEY] = {
+        **goal,
+        "awaiting_user_input": False,
+        "awaiting_user_input_reason": "",
+    }
+    discard_legacy_goal_state_key(metadata)
+    return True
+
+
 def sustained_goal_turn(
     metadata: Mapping[str, Any] | None,
     *,
@@ -86,6 +110,9 @@ def goal_state_runtime_lines(metadata: Mapping[str, Any] | None) -> list[str]:
     hint = str(goal.get("ui_summary") or "").strip()
     if hint:
         out.append(f"Summary: {hint}")
+    if goal.get("awaiting_user_input"):
+        reason = str(goal.get("awaiting_user_input_reason") or "").strip()
+        out.append(f"Waiting for user input: {reason or 'yes'}")
     return out
 
 

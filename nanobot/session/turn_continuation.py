@@ -16,6 +16,7 @@ from nanobot.session.goal_state import (
     goal_state_runtime_lines,
     sustained_goal_active,
     sustained_goal_turn,
+    sustained_goal_waiting_for_user,
 )
 
 INTERNAL_CONTINUATION_META = "_internal_continuation"
@@ -200,6 +201,8 @@ def _goal_continuation_available(
     if not sustained_goal_turn(session_metadata, message_metadata=message_metadata):
         return False
     if not sustained_goal_active(session_metadata):
+        return False
+    if sustained_goal_waiting_for_user(session_metadata):
         return False
     try:
         rounds = int((session_metadata or {}).get(_GOAL_CONTINUATION_ROUNDS_KEY) or 0)

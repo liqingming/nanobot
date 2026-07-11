@@ -10,6 +10,7 @@ import pytest
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.long_task import (
+    AwaitUserInputTool,
     CompleteGoalTool,
     LongTaskTool,
 )
@@ -211,5 +212,24 @@ async def test_long_task_and_complete_goal_registered(tmp_path):
 
     lt = loop.tools.get("long_task")
     cg = loop.tools.get("complete_goal")
+    wait = loop.tools.get("await_user_input")
     assert lt is not None and lt.name == "long_task"
     assert cg is not None and cg.name == "complete_goal"
+    assert wait is not None and wait.name == "await_user_input"
+
+
+@pytest.mark.asyncio
+async def test_await_user_input_marks_active_goal_without_completing_it(tmp_path):
+    sm = SessionManager(tmp_path)
+    lt = LongTaskTool(sessions=sm)
+    wait = AwaitUserInputTool(sessions=sm)
+    rc = RequestContext(channel="websocket", chat_id="c1", session_key="websocket:c1")
+    lt.set_context(rc)
+    wait.set_context(rc)
+    await lt.execute(goal="Ship phase one")
+    out = await wait.execute(reason="Reply start phase one")
+    assert "paused" in out
+    blob = sm.get_or_create("websocket:c1").metadata[GOAL_STATE_KEY]
+    assert blob["status"] == "active"
+    assert blob["awaiting_user_input"] is True
+    assert blob["awaiting_user_input_reason"] == "Reply start phase one"

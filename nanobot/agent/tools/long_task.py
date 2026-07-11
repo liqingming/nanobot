@@ -249,3 +249,50 @@ class CompleteGoalTool(Tool, _GoalToolsMixin):
         if tail:
             return f"Goal marked complete ({ended}). Recap:\n{tail}"
         return f"Goal marked complete ({ended})."
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        reason=StringSchema(
+            "What user input is needed before the active goal may continue.",
+            max_length=2000,
+        ),
+        required=["reason"],
+    )
+)
+class AwaitUserInputTool(Tool, _GoalToolsMixin):
+    """Pause an active sustained goal until the next real user message arrives."""
+
+    def __init__(self, sessions: Any, runtime_events: RuntimeEventBus | None = None) -> None:
+        _GoalToolsMixin.__init__(self, sessions, runtime_events)
+
+    @property
+    def name(self) -> str:
+        return "await_user_input"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Pause the active sustained goal before asking the user for a required decision, "
+            "approval, clarification, credential, or other reply. Call this immediately before "
+            "your one user-facing question. Nanobot will not internally continue the goal until "
+            "the next real user message arrives; the goal itself remains active."
+        )
+
+    async def execute(self, reason: str, **kwargs: Any) -> str:
+        sess = self._session()
+        if sess is None:
+            return ToolResult.error("Error: await_user_input requires an active chat session.")
+        prior = parse_goal_state(goal_state_raw(sess.metadata))
+        if not isinstance(prior, dict) or prior.get("status") != "active":
+            return ToolResult.error("Error: await_user_input requires an active sustained goal.")
+        sess.metadata[GOAL_STATE_KEY] = {
+            **prior,
+            "awaiting_user_input": True,
+            "awaiting_user_input_reason": reason.strip()[:2000],
+            "awaiting_user_input_at": _iso_now(),
+        }
+        discard_legacy_goal_state_key(sess.metadata)
+        self._sessions.save(sess)
+        await self._publish_goal_state_changed(sess.metadata)
+        return "Goal paused for the next real user message. Ask the user once, then stop."

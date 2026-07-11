@@ -268,6 +268,7 @@ async def test_topic_bar_shows_workspace_and_topic() -> None:
         await pilot.pause()
         tui.set_topic("feature-diff")
         await pilot.pause()
+        assert app.title == "nanobot — feature-diff"
         bar = app.query_one("#topic-bar")
         renderable = bar.render()
         text = getattr(renderable, "plain", str(renderable))

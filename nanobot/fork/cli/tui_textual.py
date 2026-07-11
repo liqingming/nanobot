@@ -2397,10 +2397,15 @@ class TextualTUI(TUIBase):
     def set_topic(self, name: str) -> None:
         self._topic = name
         self._app.update_topic_bar(self._workspace_label, name)
-        # app.title only updates Textual's Header widget, not the terminal tab.
-        # Send OSC 0 directly via the driver to update the terminal/tab title.
+        title = f"nanobot — {name}" if name else "nanobot"
+        # Keep Textual's public title state in sync. Its driver owns the
+        # terminal tab title lifecycle, so writing only a raw OSC sequence is
+        # not sufficient on every backend.
+        self._app.title = title
+        # Some terminals do not refresh their tab from Textual's title change
+        # while the application is already mounted. Keep the OSC write as a
+        # compatibility fallback.
         try:
-            title = f"nanobot — {name}" if name else "nanobot"
             self._app._driver.write(f"\033]0;{title}\007")
         except Exception:
             pass

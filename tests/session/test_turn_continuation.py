@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from nanobot.bus.events import InboundMessage
-from nanobot.session.goal_state import GOAL_STATE_KEY
+from nanobot.session.goal_state import GOAL_STATE_KEY, clear_goal_waiting_for_user
 from nanobot.session.turn_continuation import (
     INTERNAL_CONTINUATION_KIND_META,
     INTERNAL_CONTINUATION_META,
@@ -157,3 +157,35 @@ def test_save_skip_unchanged_for_standalone_current_message():
         history_count=1,
         user_persisted_early=False,
     ) == 2
+
+
+@pytest.mark.asyncio
+async def test_waiting_goal_does_not_schedule_internal_continuation_and_resumes_on_user_input():
+    meta = {
+        GOAL_STATE_KEY: {
+            "status": "active",
+            "objective": "Finish phase one",
+            "awaiting_user_input": True,
+            "awaiting_user_input_reason": "Reply start phase one",
+        }
+    }
+    ctx = SimpleNamespace(
+        session=SimpleNamespace(metadata=meta),
+        msg=InboundMessage(channel="websocket", sender_id="u1", chat_id="c1", content="start"),
+        session_key="websocket:c1",
+        pending_queue=asyncio.Queue(),
+        stop_reason="max_iterations",
+        final_content="Please reply start phase one.",
+        all_messages=[],
+        suppress_response=False,
+        visible_run_started_at=1234.5,
+    )
+    assert should_stream_budget_response(
+        stop_reason="max_iterations",
+        pending_queue_available=True,
+        session_metadata=meta,
+    )
+    assert await maybe_continue_turn(ctx) is False
+    assert ctx.pending_queue.empty()
+    assert clear_goal_waiting_for_user(meta) is True
+    assert meta[GOAL_STATE_KEY]["awaiting_user_input"] is False

@@ -70,6 +70,7 @@ from nanobot.security.workspace_access import (
 from nanobot.session import turn_continuation
 from nanobot.session.automation_turns import automation_history_overrides
 from nanobot.session.goal_state import (
+    clear_goal_waiting_for_user,
     goal_state_runtime_lines,
     runner_wall_llm_timeout_s,
     sustained_goal_active,
@@ -1887,6 +1888,8 @@ class AgentLoop:
         # ensure it exists in case this handler is invoked independently.
         if ctx.session is None:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
+        if not turn_continuation.internal_continuation_inbound(msg.metadata):
+            clear_goal_waiting_for_user(ctx.session.metadata)
         await self._runtime_events().session_turn_started(msg, ctx.session_key)
         self.workspace_scopes.persist_message_scope(ctx.session, msg)
 
