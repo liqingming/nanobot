@@ -2683,9 +2683,9 @@ def agent(
                         # Live system message (e.g. todo diff pushed by TodoWriteTool).
                         # Must be displayed mid-turn, not aggregated into the final reply.
                         if msg.metadata.get("_system_message"):
-                            clear_idle = getattr(tui, "clear_idle_thinking", None)
-                            if callable(clear_idle):
-                                clear_idle()
+                            clear_initial = getattr(tui, "clear_initial_thinking", None)
+                            if callable(clear_initial):
+                                clear_initial()
                             if msg.content:
                                 tui.add_system(msg.content)
                             # Also refresh the bar in case todos changed.

@@ -957,6 +957,34 @@ async def test_completed_response_removes_initial_thinking_placeholder() -> None
 
 
 @pytest.mark.asyncio
+async def test_todo_plan_clears_initial_thinking_but_keeps_idle_thinking() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.stream_start()
+        await pilot.pause()
+        assert tui._initial_thinking_placeholder_visible is True
+
+        tui._tool_placeholder_line_backup = tui._tool_placeholder_line
+        tui._tool_placeholder_line = len(app.query_one("#output").lines)
+        app.query_one("#output").write("  ⠋ 思考中...")
+        tui._idle_placeholder_visible = True
+
+        tui.clear_initial_thinking()
+        tui.add_system("[~] 定位两个参数的 Jenkins 入口和传递链")
+        await pilot.pause()
+
+        assert tui._initial_thinking_placeholder_visible is False
+        assert tui._idle_placeholder_visible is True
+        text = _output_log_text(app.query_one("#output"))
+        assert "[~] 定位两个参数的 Jenkins 入口和传递链" in text
+        assert text.count("思考中") == 1
+
+
+@pytest.mark.asyncio
 async def test_idle_thinking_after_tool_completes_does_not_crash() -> None:
     """add_tool_result also schedules idle thinking — same regression path
     must not surface LookupError on shutdown.

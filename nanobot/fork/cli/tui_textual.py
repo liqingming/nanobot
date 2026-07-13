@@ -486,6 +486,17 @@ if _TEXTUAL_AVAILABLE:
             if n >= len(self.lines):
                 return
             self.lines = self.lines[:n]
+            self._refresh_line_metrics()
+
+        def remove_line(self, index: int) -> bool:
+            """Remove one rendered line without discarding later tool activity."""
+            if not 0 <= index < len(self.lines):
+                return False
+            del self.lines[index]
+            self._refresh_line_metrics()
+            return True
+
+        def _refresh_line_metrics(self) -> None:
             self._widest_line_width = (
                 max(line.cell_length for line in self.lines) if self.lines else 0
             )
@@ -1328,6 +1339,7 @@ class TextualTUI(TUIBase):
         self._stream_buf: str = ""
         self._stream_ts: str = ""
         self._stream_header_line: int = 0  # output-log line index where stream header was written
+        self._initial_thinking_placeholder_line: int | None = None
         self._tool_placeholder_line: int = 0  # output-log line index of the current thinking/executing placeholder
         self._flushed_parts: list[str] = []  # intermediate LLM text flushed between tool calls
         self._tool_hint: str = ""
@@ -2135,6 +2147,7 @@ class TextualTUI(TUIBase):
             out.write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{self._stream_ts}[/dim]")
             out.write("")
             self._tool_placeholder_line = len(out.lines)
+            self._initial_thinking_placeholder_line = self._tool_placeholder_line
             # Match the idle thinking style — _tick will overwrite this with
             # the same format on each frame anyway.
             out.write(Text("  ⠋ 思考中...", style="grey50"))
@@ -2142,6 +2155,7 @@ class TextualTUI(TUIBase):
             out.scroll_end(animate=False)
         except Exception:
             self._stream_header_line = 0
+            self._initial_thinking_placeholder_line = None
             self._tool_placeholder_line = 0
         # Use _safe_call so the spinner timer task is created inside
         # Textual's active_app context even if stream_start is invoked
@@ -2182,10 +2196,22 @@ class TextualTUI(TUIBase):
         if not self._initial_thinking_placeholder_visible:
             return
         self._initial_thinking_placeholder_visible = False
+        initial_line = self._initial_thinking_placeholder_line
+        self._initial_thinking_placeholder_line = None
         try:
-            self._app.stop_thinking_spinner()
+            # A later idle/tool spinner may be actively animating at another
+            # line. Stop the timer only while it still owns the initial line.
+            if initial_line == self._tool_placeholder_line:
+                self._app.stop_thinking_spinner()
             out = self._app.query_one("#output", _OutputLog)
-            out.truncate_to(self._tool_placeholder_line)
+            if initial_line is not None and out.remove_line(initial_line):
+                if self._tool_placeholder_line > initial_line:
+                    self._tool_placeholder_line -= 1
+                if (
+                    self._tool_placeholder_line_backup is not None
+                    and self._tool_placeholder_line_backup > initial_line
+                ):
+                    self._tool_placeholder_line_backup -= 1
         except Exception:
             pass
 
@@ -2218,6 +2244,15 @@ class TextualTUI(TUIBase):
             if self._tool_placeholder_line_backup is not None:
                 self._tool_placeholder_line = self._tool_placeholder_line_backup
                 self._tool_placeholder_line_backup = None
+
+    def clear_initial_thinking(self) -> None:
+        """Remove only the stream-start thinking placeholder.
+
+        Todo plans are visible progress, so they replace the initial waiting
+        state. Do not cancel a later idle-thinking spinner: it represents the
+        model's active post-tool deliberation and should remain visible.
+        """
+        self._clear_initial_thinking_placeholder()
 
     def clear_idle_thinking(self) -> None:
         """Remove the stale idle-thinking placeholder before visible progress.
