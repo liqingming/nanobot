@@ -168,6 +168,26 @@ async def test_grep_rejects_subpaths_of_request_tool_policy(tmp_path: Path) -> N
     assert "blocked by the request tool_policy for grep" in str(result)
 
 
+@pytest.mark.asyncio
+async def test_grep_allows_explicit_leaf_module_despite_blocked_parent(tmp_path: Path) -> None:
+    module = tmp_path / "Assets" / "Script" / "Game" / "moduls" / "DragonInvadeActivity"
+    module.mkdir(parents=True)
+    (module / "UI_item_resource.cs").write_text("void UpdateView() {}\n", encoding="utf-8")
+    tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="default", session_key="api:review_123_code_review",
+        metadata={"tool_policy": {
+            "blocked_grep_paths": ["Assets/Script/Game/moduls"],
+            "allowed_grep_paths": ["Assets/Script/Game/moduls/DragonInvadeActivity"],
+        }},
+    ))
+    try:
+        result = await tool.execute(pattern="UpdateView", path="Assets/Script/Game/moduls/DragonInvadeActivity", fixed_strings=True)
+    finally:
+        reset_request_context(token)
+    assert "UI_item_resource.cs" in str(result)
+
+
 async def test_grep_allows_specific_module_for_review_session(tmp_path: Path) -> None:
     module = tmp_path / "Assets" / "Script" / "Game" / "moduls" / "Dragon"
     module.mkdir(parents=True)

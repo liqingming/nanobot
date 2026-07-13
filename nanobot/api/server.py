@@ -279,7 +279,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         if not isinstance(requested_tool_policy, dict):
             return _error_json(400, "tool_policy must be an object")
         normalized_policy: dict[str, list[str]] = {}
-        for key in ("blocked_find_files_paths", "blocked_grep_paths", "blocked_read_file_paths"):
+        for key in ("blocked_find_files_paths", "blocked_grep_paths", "blocked_read_file_paths", "allowed_grep_paths"):
             paths = requested_tool_policy.get(key)
             if paths is None:
                 continue

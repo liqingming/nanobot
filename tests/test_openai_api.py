@@ -586,14 +586,14 @@ async def test_json_request_passes_workspace_and_timeout_to_agent(aiohttp_client
             "messages": [{"role": "user", "content": "hello"}],
             "workspace": str(tmp_path),
             "timeout": 30,
-            "tool_policy": {"blocked_grep_paths": ["Assets"], "blocked_read_file_paths": ["Assets/ResourcesAssets"]},
+            "tool_policy": {"blocked_grep_paths": ["Assets"], "blocked_read_file_paths": ["Assets/ResourcesAssets"], "allowed_grep_paths": ["Assets/Script/Game/moduls/DragonInvadeActivity"]},
         },
     )
 
     assert resp.status == 200
     kwargs = agent.process_direct.call_args.kwargs
     assert kwargs["metadata"]["workspace_scope"]["project_path"] == str(tmp_path.resolve())
-    assert kwargs["metadata"]["tool_policy"] == {"blocked_grep_paths": ["Assets"], "blocked_read_file_paths": ["Assets/ResourcesAssets"]}
+    assert kwargs["metadata"]["tool_policy"] == {"blocked_grep_paths": ["Assets"], "blocked_read_file_paths": ["Assets/ResourcesAssets"], "allowed_grep_paths": ["Assets/Script/Game/moduls/DragonInvadeActivity"]}
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
