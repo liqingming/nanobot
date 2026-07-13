@@ -1077,6 +1077,40 @@ async def test_run_agent_loop_goal_continue_message_reads_latest_metadata(
 
 
 @pytest.mark.asyncio
+async def test_run_agent_loop_does_not_continue_while_goal_waits_for_user(
+    tmp_path: Path,
+) -> None:
+    from nanobot.agent.runner import AgentRunResult
+
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:waiting-goal")
+    session.metadata[GOAL_STATE_KEY] = {
+        "status": "active",
+        "objective": "Wait for the user to upload a screenshot.",
+        "awaiting_user_input": True,
+    }
+    seen: dict[str, bool] = {}
+
+    async def fake_run(spec):
+        assert callable(spec.goal_active_predicate)
+        seen["continues"] = spec.goal_active_predicate()
+        return AgentRunResult(
+            final_content="Please upload the screenshot.",
+            messages=[{"role": "assistant", "content": "Please upload the screenshot."}],
+        )
+
+    loop.runner.run = fake_run  # type: ignore[method-assign]
+    await loop._run_agent_loop(
+        [],
+        session=session,
+        channel="websocket",
+        chat_id="waiting-goal",
+        session_key=session.key,
+    )
+
+    assert seen["continues"] is False
+
+
 async def test_process_direct_skip_user_persist_does_not_save_retry_user(
     tmp_path: Path,
 ) -> None:

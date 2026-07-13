@@ -74,6 +74,7 @@ from nanobot.session.goal_state import (
     goal_state_runtime_lines,
     runner_wall_llm_timeout_s,
     sustained_goal_active,
+    sustained_goal_waiting_for_user,
 )
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META
 from nanobot.session.keys import UNIFIED_SESSION_KEY, session_key_for_channel
@@ -1138,7 +1139,15 @@ class AgentLoop:
                     metadata=session_metadata,
                     message_metadata=metadata,
                 ),
-                goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
+                # await_user_input keeps the goal active for bookkeeping, but
+                # must suppress synthetic continuation turns until a real user
+                # message clears its waiting flag in _state_restore.
+                goal_active_predicate=lambda: (
+                    sustained_goal_active(session.metadata)
+                    and not sustained_goal_waiting_for_user(session.metadata)
+                    if session is not None
+                    else False
+                ),
                 goal_continue_message=_goal_continue,
                 finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
                     pending_queue_available=pending_queue is not None and session is not None,
