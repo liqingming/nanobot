@@ -917,6 +917,12 @@ def _should_hide_stale_todos_on_new_turn(todos: list[dict[str, Any]]) -> bool:
 _CLI_UNNAMED_SESSION_LABEL = "未命名会话"
 
 
+def _mark_cli_session_unnamed(session: Any) -> None:
+    """Mark a CLI session as unnamed without deciding whether to persist it."""
+    session.metadata["cli_unnamed"] = True
+    session.metadata.pop("cli_title", None)
+
+
 def _cli_session_display_name(session_info: dict[str, Any], cli_channel: str) -> str | None:
     """Return a human-facing CLI session name, or None for another channel."""
     key = str(session_info.get("key") or "")
@@ -2235,9 +2241,12 @@ def agent(
                 workspace=agent_loop.workspace,
             )
 
-            # A fresh CLI start is intentionally unnamed. It becomes visible in
-            # /resume only after it is persisted (by /clear or a user turn).
+            # A fresh CLI start is intentionally unnamed. Mark it in memory so
+            # the first persisted user turn has a stable display name, but do
+            # not save it yet or unused launches would clutter /resume.
             fresh_chat_id = f"session_{uuid.uuid4().hex}"
+            fresh_session = agent_loop.sessions.get_or_create(f"{cli_channel}:{fresh_chat_id}")
+            _mark_cli_session_unnamed(fresh_session)
             topic_state: dict[str, str] = {"chat_id": fresh_chat_id}
 
             def _load_topic(name: str) -> None:
@@ -2459,8 +2468,7 @@ def agent(
                 """Leave the old session intact and enter a persisted unnamed one."""
                 fresh_id = f"session_{uuid.uuid4().hex}"
                 fresh = agent_loop.sessions.get_or_create(f"{cli_channel}:{fresh_id}")
-                fresh.metadata["cli_unnamed"] = True
-                fresh.metadata.pop("cli_title", None)
+                _mark_cli_session_unnamed(fresh)
                 agent_loop.sessions.save(fresh)
                 await _switch_topic(fresh.key)
                 tui.set_topic("")

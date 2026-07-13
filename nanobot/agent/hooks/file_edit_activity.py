@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+import re
 from typing import Any
 
 from nanobot.agent.hook import (
@@ -93,9 +94,14 @@ class FileEditActivityHook(AgentHook):
         key = self._tool_call_key(tool_call)
         trackers = self._trackers_by_call.get(key, [])
         if trackers:
-            await self._emit([
-                build_file_edit_error_event(tracker, str(error)) for tracker in trackers
-            ])
+            # apply_patch validates a batch atomically. Its error names the
+            # specific edit that failed, so do not falsely mark every other
+            # tracked file as failed when none of them was applied.
+            failed_trackers = self._trackers_matching_error_path(trackers, str(error))
+            if failed_trackers:
+                await self._emit([
+                    build_file_edit_error_event(tracker, str(error)) for tracker in failed_trackers
+                ])
             self._trackers_by_call.pop(key, None)
 
     async def on_finally(self, context: AgentRunHookContext) -> None:
@@ -118,6 +124,21 @@ class FileEditActivityHook(AgentHook):
     async def _emit(self, events: list[dict[str, Any]]) -> None:
         if self._on_progress is not None:
             await invoke_file_edit_progress(self._on_progress, events)
+
+    @staticmethod
+    def _trackers_matching_error_path(
+        trackers: list[FileEditTracker], error: str
+    ) -> list[FileEditTracker]:
+        """Return only trackers whose path is explicitly named by a tool error."""
+        match = re.search(r"(?:not found|multiple times) in (?P<path>.+?)(?:\r?\n|$)", error)
+        if match is None:
+            return []
+        raw_path = match.group("path").strip().replace("\\", "/")
+        return [
+            tracker
+            for tracker in trackers
+            if tracker.display_path == raw_path or tracker.path.as_posix() == raw_path
+        ]
 
     @staticmethod
     def _tool_call_key(tool_call: ToolCallRequest) -> str:

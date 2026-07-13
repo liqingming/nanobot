@@ -245,6 +245,7 @@ class ContextBuilder:
         candidates: list[tuple[str, Path]] = [
             ("~/.claude/CLAUDE.md", Path.home() / ".claude" / "CLAUDE.md"),
             ("CLAUDE.md", root / "CLAUDE.md"),
+            (".claude/CLAUDE.md", root / ".claude" / "CLAUDE.md"),
         ]
         for filename in self.BOOTSTRAP_FILES:
             data_path = self.data_dir / filename

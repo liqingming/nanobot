@@ -210,10 +210,13 @@ class TestLoadBootstrapFiles:
         workspace = tmp_path / "project"
         global_claude = home / ".claude" / "CLAUDE.md"
         workspace_claude = workspace / "CLAUDE.md"
+        local_claude = workspace / ".claude" / "CLAUDE.md"
         global_claude.parent.mkdir(parents=True)
-        workspace.mkdir()
+        local_claude.parent.mkdir(parents=True)
+        workspace.mkdir(exist_ok=True)
         global_claude.write_text("Global Claude rules.", encoding="utf-8")
         workspace_claude.write_text("Workspace Claude rules.", encoding="utf-8")
+        local_claude.write_text("Local Claude rules.", encoding="utf-8")
         (workspace / "AGENTS.md").write_text("Nanobot rules.", encoding="utf-8")
         monkeypatch.setattr(Path, "home", lambda: home)
 
@@ -224,8 +227,11 @@ class TestLoadBootstrapFiles:
         assert "Global Claude rules." in result
         assert "## CLAUDE.md" in result
         assert "Workspace Claude rules." in result
+        assert "## .claude/CLAUDE.md" in result
+        assert "Local Claude rules." in result
         assert result.index("## ~/.claude/CLAUDE.md") < result.index("## CLAUDE.md")
-        assert result.index("## CLAUDE.md") < result.index("## AGENTS.md")
+        assert result.index("## CLAUDE.md") < result.index("## .claude/CLAUDE.md")
+        assert result.index("## .claude/CLAUDE.md") < result.index("## AGENTS.md")
 
     def test_workspace_claude_md_does_not_fallback_to_data_dir(self, tmp_path, monkeypatch):
         home = tmp_path / "home"

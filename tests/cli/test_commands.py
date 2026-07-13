@@ -291,6 +291,14 @@ def test_status_help_shows_workspace_and_config_options():
     assert "-c" in stripped_output
 
 
+def test_mark_cli_session_unnamed_clears_existing_title() -> None:
+    session = type("Session", (), {"metadata": {"cli_title": "旧名称"}})()
+
+    cli_commands._mark_cli_session_unnamed(session)
+
+    assert session.metadata == {"cli_unnamed": True}
+
+
 def test_cli_session_display_name_prefers_rename_and_marks_unnamed() -> None:
     assert cli_commands._cli_session_display_name(
         {"key": "cli:session-a", "metadata": {"cli_title": "重构"}}, "cli"

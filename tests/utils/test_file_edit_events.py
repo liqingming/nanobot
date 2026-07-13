@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import pytest
 
+from nanobot.agent.hook import AgentHookContext
+from nanobot.agent.hooks.file_edit_activity import FileEditActivityHook
 from nanobot.agent.tools.apply_patch import ApplyPatchTool
 from nanobot.agent.tools.filesystem import EditFileTool, WriteFileTool
 from nanobot.utils.file_edit_events import (
@@ -175,6 +178,41 @@ def test_apply_patch_prepares_trackers_for_each_touched_file(tmp_path: Path) -> 
     assert (by_path["src/existing.py"]["added"], by_path["src/existing.py"]["deleted"]) == (1, 1)
     assert by_path["src/new.py"]["diff"]["format"] == "unified"
     assert by_path["src/existing.py"]["diff"]["format"] == "unified"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_error_marks_only_the_named_file(tmp_path: Path) -> None:
+    for name in ("first.py", "failed.py", "last.py"):
+        (tmp_path / name).write_text("before\n", encoding="utf-8")
+    tool = _patch_tool(tmp_path)
+    params = {
+        "edits": [
+            {"path": "first.py", "action": "replace", "old_text": "before", "new_text": "after"},
+            {"path": "failed.py", "action": "replace", "old_text": "missing", "new_text": "after"},
+            {"path": "last.py", "action": "replace", "old_text": "before", "new_text": "after"},
+        ]
+    }
+    progress_events: list[list[dict]] = []
+
+    async def on_progress(_content: str, *, file_edit_events: list[dict]) -> None:
+        progress_events.append(file_edit_events)
+
+    hook = FileEditActivityHook(on_progress=on_progress, workspace=tmp_path)
+    call = type("ToolCall", (), {"id": "call-patch", "name": "apply_patch"})()
+
+    context = AgentHookContext(iteration=0, messages=[])
+    await hook.before_execute_tool(context, call, tool, params)
+    await hook.on_execute_tool_error(
+        context,
+        call,
+        tool,
+        params,
+        "Error applying patch: old_text not found in failed.py",
+    )
+
+    error_events = progress_events[-1]
+    assert [event["path"] for event in error_events] == ["failed.py"]
+    assert error_events[0]["status"] == "error"
 
 
 def test_apply_patch_trackers_use_normalized_patch_paths(tmp_path: Path) -> None:
