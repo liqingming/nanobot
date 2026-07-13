@@ -314,6 +314,27 @@ def test_resolve_cli_session_key_uses_display_name_or_legacy_key() -> None:
     assert cli_commands._resolve_cli_session_key(sessions, "cli", "不存在") is None
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/exit",
+        "/skills",
+        "/clear",
+        "/rename 批量修改github仓库",
+        "/commit_memory show",
+        "/todos clear",
+        "/resume 批量修改github仓库",
+    ],
+)
+def test_cli_local_commands_skip_pre_submit_echo(text: str) -> None:
+    assert cli_commands._is_cli_local_command(text)
+
+
+@pytest.mark.parametrize("text", ["hello", "/continue", "/goal 修复问题"])
+def test_agent_turn_inputs_keep_pre_submit_echo(text: str) -> None:
+    assert not cli_commands._is_cli_local_command(text)
+
+
 def test_tui_command_palette_uses_claude_style_session_commands() -> None:
     commands = {command: (description, action) for command, description, action in cli_commands._tui_command_palette()}
 

@@ -644,6 +644,30 @@ def _is_exit_command(command: str) -> bool:
     return command.lower() in EXIT_COMMANDS
 
 
+def _is_cli_local_command(text: str) -> bool:
+    """Return whether interactive CLI handles *text* without an agent turn.
+
+    Both TUI backends invoke pre-submit before the CLI callback for slash text
+    typed with arguments, because such text is no longer an exact palette item.
+    Keep this classifier beside the CLI dispatcher so local commands never get
+    rendered as user messages or start a speculative thinking animation.
+    """
+    command = text.strip()
+    return (
+        _is_exit_command(command)
+        or command == "/skills"
+        or command == "/clear"
+        or command == "/rename"
+        or command.startswith("/rename ")
+        or command == "/commit_memory"
+        or command.startswith("/commit_memory ")
+        or command == "/todos"
+        or command.startswith("/todos ")
+        or command == "/resume"
+        or command.startswith("/resume ")
+    )
+
+
 async def _read_interactive_input_async() -> str:
     """Read user input using prompt_toolkit (handles paste, history, display).
 
@@ -2338,7 +2362,7 @@ def agent(
                     setter(phase)
 
             def _pre_submit(text: str) -> None:
-                if not is_processing:
+                if not is_processing and not _is_cli_local_command(text):
                     tui.add_user_echo(text)
                     tui.stream_start()
                     _pre_submitted[0] = True
