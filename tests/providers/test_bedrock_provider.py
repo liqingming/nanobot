@@ -229,7 +229,7 @@ def test_parse_response_maps_text_tools_reasoning_usage_and_stop_reason() -> Non
 
     assert result.content == "hello"
     assert result.finish_reason == "tool_calls"
-    assert result.usage["prompt_tokens"] == 10
+    assert result.usage["prompt_tokens"] == 12
     assert result.usage["cached_tokens"] == 2
     assert result.reasoning_content == "think"
     assert result.thinking_blocks == [{"type": "thinking", "thinking": "think", "signature": "sig"}]
@@ -279,6 +279,25 @@ async def test_chat_stream_aggregates_text_tool_use_and_usage() -> None:
     assert result.usage == {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
     assert result.tool_calls[0].name == "search"
     assert result.tool_calls[0].arguments == {"q": "x"}
+
+
+def test_usage_counts_bedrock_cache_tokens_in_prompt_total() -> None:
+    usage = BedrockProvider._usage({
+        "inputTokens": 800,
+        "outputTokens": 200,
+        "totalTokens": 1000,
+        "cacheReadInputTokens": 1200,
+        "cacheWriteInputTokens": 300,
+    })
+
+    assert usage == {
+        "prompt_tokens": 2300,
+        "completion_tokens": 200,
+        "total_tokens": 2500,
+        "cached_tokens": 1200,
+        "cache_read_input_tokens": 1200,
+        "cache_creation_input_tokens": 300,
+    }
 
 
 async def _append_delta(deltas: list[str], text: str) -> None:

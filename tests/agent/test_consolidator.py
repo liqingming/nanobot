@@ -186,6 +186,36 @@ class TestConsolidatorTokenBudget:
         await consolidator.maybe_consolidate_by_tokens(session)
         consolidator.archive.assert_not_called()
 
+    async def test_background_probe_reuses_safe_exact_estimate(self, consolidator):
+        consolidator.context_window_tokens = 10_000
+        consolidator.max_completion_tokens = 1
+        consolidator._SAFETY_BUFFER = 0
+        session = Session(key="test:background-probe")
+        session.add_message("user", "first")
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(100, "tiktoken"))
+
+        await consolidator.maybe_consolidate_by_tokens(session)
+        session.add_message("assistant", "small follow-up")
+        await consolidator.maybe_consolidate_by_tokens(session, background=True)
+
+        assert consolidator.estimate_session_prompt_tokens.call_count == 1
+
+    async def test_background_probe_rechecks_when_prior_estimate_is_near_budget(self, consolidator):
+        consolidator.context_window_tokens = 10_000
+        consolidator.max_completion_tokens = 1
+        consolidator._SAFETY_BUFFER = 0
+        session = Session(key="test:background-near-budget")
+        session.add_message("user", "first")
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(9_000, "tiktoken"))
+
+        await consolidator.maybe_consolidate_by_tokens(session)
+        session.add_message("assistant", "small follow-up")
+        await consolidator.maybe_consolidate_by_tokens(session, background=True)
+
+        assert consolidator.estimate_session_prompt_tokens.call_count == 2
+
     async def test_estimate_uses_full_unconsolidated_tail(self, consolidator):
         """Consolidation pressure must see messages hidden by the replay window."""
         session = Session(key="test:full-tail")

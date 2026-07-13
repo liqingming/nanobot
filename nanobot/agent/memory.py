@@ -797,6 +797,10 @@ class Consolidator:
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
+        # Exact preflight probes are authoritative. Background post-save probes
+        # may reuse a deliberately conservative upper bound; the next foreground
+        # turn always rebuilds the full prompt before calling the model.
+        self._background_probe_cache: dict[str, tuple[int, int, int]] = {}
 
     def set_provider(
         self,
@@ -1009,11 +1013,35 @@ class Consolidator:
             self.store.raw_archive(messages, session_key=session_key)
             return None
 
+    def _background_probe_upper_bound(self, session: Session, budget: int) -> int | None:
+        """Return a safe cached estimate for a cheap post-save check, if possible."""
+        cached = self._background_probe_cache.get(session.key)
+        if cached is None:
+            return None
+        estimated, message_count, last_consolidated = cached
+        if last_consolidated != session.last_consolidated or message_count > len(session.messages):
+            return None
+        # Reuse only when the prior exact probe was far below the limit and the
+        # newly appended tail is small. This is an upper bound for persisted
+        # messages; foreground preflight still catches dynamic prompt changes.
+        added = sum(estimate_message_tokens(message) for message in session.messages[message_count:])
+        if estimated > budget // 2 or added > max(1024, budget // 10):
+            return None
+        return estimated + added
+
+    def _remember_exact_probe(self, session: Session, estimated: int) -> None:
+        self._background_probe_cache[session.key] = (
+            estimated,
+            len(session.messages),
+            session.last_consolidated,
+        )
+
     async def maybe_consolidate_by_tokens(
         self,
         session: Session,
         *,
         replay_max_messages: int | None = None,
+        background: bool = False,
     ) -> None:
         """Loop: archive old messages until prompt fits within safe budget.
 
@@ -1038,14 +1066,35 @@ class Consolidator:
                 session,
                 replay_max_messages,
             )
-            try:
-                estimated, source = await asyncio.to_thread(
-                    self.estimate_session_prompt_tokens,
-                    session,
+            estimated: int | None = (
+                self._background_probe_upper_bound(session, budget) if background else None
+            )
+            source = "background_upper_bound" if estimated is not None else ""
+            if estimated is not None:
+                logger.debug(
+                    "Token consolidation background fast path {}: estimate={}/{}",
+                    session.key,
+                    estimated,
+                    budget,
                 )
-            except Exception:
-                logger.exception("Token estimation failed for {}", session.key)
-                estimated, source = 0, "error"
+            else:
+                probe_started_at = asyncio.get_running_loop().time()
+                try:
+                    estimated, source = await asyncio.to_thread(
+                        self.estimate_session_prompt_tokens,
+                        session,
+                    )
+                except Exception:
+                    logger.exception("Token estimation failed for {}", session.key)
+                    estimated, source = 0, "error"
+                logger.debug(
+                    "Token consolidation probe {}: estimate={}, source={}, duration_ms={:.1f}",
+                    session.key,
+                    estimated,
+                    source,
+                    (asyncio.get_running_loop().time() - probe_started_at) * 1000,
+                )
+                self._remember_exact_probe(session, estimated)
             if estimated <= 0:
                 self._persist_last_summary(session, last_summary)
                 return
@@ -1104,6 +1153,7 @@ class Consolidator:
                     # the next invocation can retry a fresh chunk.
                     break
 
+                probe_started_at = asyncio.get_running_loop().time()
                 try:
                     estimated, source = await asyncio.to_thread(
                         self.estimate_session_prompt_tokens,
@@ -1112,6 +1162,14 @@ class Consolidator:
                 except Exception:
                     logger.exception("Token estimation failed for {}", session.key)
                     estimated, source = 0, "error"
+                logger.debug(
+                    "Token consolidation probe {}: estimate={}, source={}, duration_ms={:.1f}",
+                    session.key,
+                    estimated,
+                    source,
+                    (asyncio.get_running_loop().time() - probe_started_at) * 1000,
+                )
+                self._remember_exact_probe(session, estimated)
                 if estimated <= 0:
                     break
 

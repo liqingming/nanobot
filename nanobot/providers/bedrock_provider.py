@@ -435,16 +435,19 @@ class BedrockProvider(LLMProvider):
     def _usage(usage: dict[str, Any] | None) -> dict[str, int]:
         if not usage:
             return {}
-        prompt = int(usage.get("inputTokens") or 0)
+        # Bedrock reports cache-read/write tokens separately from inputTokens.
+        # Normalize prompt_tokens to the complete request input, matching the
+        # Anthropic provider and the OpenAI-compatible prompt_tokens contract.
+        input_tokens = int(usage.get("inputTokens") or 0)
         completion = int(usage.get("outputTokens") or 0)
-        total = int(usage.get("totalTokens") or prompt + completion)
+        cache_read = int(usage.get("cacheReadInputTokens") or 0)
+        cache_write = int(usage.get("cacheWriteInputTokens") or 0)
+        prompt = input_tokens + cache_read + cache_write
         result = {
             "prompt_tokens": prompt,
             "completion_tokens": completion,
-            "total_tokens": total,
+            "total_tokens": prompt + completion,
         }
-        cache_read = int(usage.get("cacheReadInputTokens") or 0)
-        cache_write = int(usage.get("cacheWriteInputTokens") or 0)
         if cache_read:
             result["cached_tokens"] = cache_read
             result["cache_read_input_tokens"] = cache_read

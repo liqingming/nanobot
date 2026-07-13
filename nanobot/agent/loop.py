@@ -1682,6 +1682,7 @@ class AgentLoop:
             self.consolidator.maybe_consolidate_by_tokens(
                 session,
                 replay_max_messages=self._max_messages,
+                background=True,
             )
         )
         content = final_content or "Background task completed."
@@ -2123,6 +2124,7 @@ class AgentLoop:
                 self.consolidator.maybe_consolidate_by_tokens(
                     ctx.session,
                     replay_max_messages=self._max_messages,
+                    background=True,
                 )
             )
         self._clear_pending_user_turn(ctx.session)

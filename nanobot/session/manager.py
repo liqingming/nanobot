@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import time
 import uuid
 from contextlib import suppress
 from copy import deepcopy
@@ -677,8 +678,11 @@ class SessionManager:
         write-back caching (e.g. rclone VFS, NFS, FUSE mounts) do not lose
         the most recent writes.
         """
+        started_at = time.perf_counter()
         self._ensure_transcript_ids(session.messages)
+        transcript_started_at = time.perf_counter()
         self.transcripts.sync(session.key, session.messages)
+        transcript_ms = (time.perf_counter() - transcript_started_at) * 1000
 
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
@@ -721,6 +725,14 @@ class SessionManager:
             raise
 
         self._cache[session.key] = session
+        logger.debug(
+            "Session save {}: messages={}, bytes={}, transcript_ms={:.1f}, total_ms={:.1f}",
+            session.key,
+            len(session.messages),
+            path.stat().st_size if path.exists() else 0,
+            transcript_ms,
+            (time.perf_counter() - started_at) * 1000,
+        )
 
     @staticmethod
     def _ensure_transcript_ids(messages: list[dict[str, Any]]) -> None:

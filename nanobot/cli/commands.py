@@ -2397,11 +2397,13 @@ def agent(
                 tui.stop_thinking()
                 usage = agent_loop._last_usage
                 if usage and agent_loop.context_window_tokens:
-                    ctx_used = (
-                        usage.get("prompt_tokens", 0)
-                        + usage.get("cache_read_input_tokens", 0)
+                    # Providers normalize prompt_tokens as the complete request
+                    # input. Cache fields are a subset/breakdown, never an
+                    # additional amount to add to context usage.
+                    tui.update_context_usage(
+                        usage.get("prompt_tokens", 0),
+                        agent_loop.context_window_tokens,
                     )
-                    tui.update_context_usage(ctx_used, agent_loop.context_window_tokens)
                 # Refresh the todo bar unless this turn never produced a fresh
                 # TodoWrite update. In that case keep the old plan hidden so a
                 # stale in-progress badge does not reappear above the input.
