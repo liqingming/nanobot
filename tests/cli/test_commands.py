@@ -291,6 +291,38 @@ def test_status_help_shows_workspace_and_config_options():
     assert "-c" in stripped_output
 
 
+def test_cli_session_display_name_prefers_rename_and_marks_unnamed() -> None:
+    assert cli_commands._cli_session_display_name(
+        {"key": "cli:session-a", "metadata": {"cli_title": "重构"}}, "cli"
+    ) == "重构"
+    assert cli_commands._cli_session_display_name(
+        {"key": "cli:session-a", "metadata": {"cli_unnamed": True}}, "cli"
+    ) == "未命名会话"
+    assert cli_commands._cli_session_display_name(
+        {"key": "telegram:session-a", "metadata": {}}, "cli"
+    ) is None
+
+
+def test_resolve_cli_session_key_uses_display_name_or_legacy_key() -> None:
+    sessions = [
+        {"key": "cli:session-a", "metadata": {"cli_title": "重构"}},
+        {"key": "cli:legacy-topic", "metadata": {}},
+    ]
+
+    assert cli_commands._resolve_cli_session_key(sessions, "cli", "重构") == "cli:session-a"
+    assert cli_commands._resolve_cli_session_key(sessions, "cli", "legacy-topic") == "cli:legacy-topic"
+    assert cli_commands._resolve_cli_session_key(sessions, "cli", "不存在") is None
+
+
+def test_tui_command_palette_uses_claude_style_session_commands() -> None:
+    commands = {command: (description, action) for command, description, action in cli_commands._tui_command_palette()}
+
+    assert "/new" not in commands
+    assert commands["/rename"] == ("Rename the current CLI session.", "edit")
+    assert commands["/clear"] == ("Clear context and start an unnamed empty session.", "submit")
+    assert commands["/resume"] == ("Switch to a saved CLI session.", "edit")
+
+
 def test_runtime_data_dir_for_custom_workspace_uses_cache(tmp_path: Path):
     workspace = tmp_path / "project-workspace"
 
@@ -3169,7 +3201,8 @@ def test_fork_tui_command_palette_includes_all_builtin_commands() -> None:
 
     commands = {item[0] for item in _tui_command_palette()}
 
-    assert {spec.command for spec in BUILTIN_COMMAND_SPECS} <= commands
+    assert {spec.command for spec in BUILTIN_COMMAND_SPECS if spec.command != "/new"} <= commands
+    assert "/new" not in commands
 
 
 def test_fork_tui_command_palette_includes_cli_local_commands() -> None:
@@ -3177,7 +3210,7 @@ def test_fork_tui_command_palette_includes_cli_local_commands() -> None:
 
     commands = {item[0] for item in _tui_command_palette()}
 
-    assert {"/resume", "/todos", "/continue", "/commit_memory", "/exit"} <= commands
+    assert {"/rename", "/clear", "/resume", "/todos", "/continue", "/commit_memory", "/exit"} <= commands
 
 
 def test_fork_tui_command_palette_marks_argument_commands_for_edit() -> None:

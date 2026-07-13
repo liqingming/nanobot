@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import sys
+import uuid
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext, suppress
 from datetime import datetime
@@ -889,13 +890,53 @@ def _should_hide_stale_todos_on_new_turn(todos: list[dict[str, Any]]) -> bool:
     return bool(todos) and not _todos_all_completed(todos)
 
 
+_CLI_UNNAMED_SESSION_LABEL = "未命名会话"
+
+
+def _cli_session_display_name(session_info: dict[str, Any], cli_channel: str) -> str | None:
+    """Return a human-facing CLI session name, or None for another channel."""
+    key = str(session_info.get("key") or "")
+    prefix = f"{cli_channel}:"
+    if not key.startswith(prefix):
+        return None
+    metadata = session_info.get("metadata")
+    if isinstance(metadata, dict):
+        title = metadata.get("cli_title")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+        if metadata.get("cli_unnamed") is True:
+            return _CLI_UNNAMED_SESSION_LABEL
+    return key[len(prefix):]
+
+
+def _resolve_cli_session_key(
+    session_infos: list[dict[str, Any]], cli_channel: str, query: str
+) -> str | None:
+    """Resolve a /resume argument against a visible name or legacy session ID."""
+    normalized = query.strip()
+    if not normalized:
+        return None
+    matches = [
+        str(info["key"])
+        for info in session_infos
+        if _cli_session_display_name(info, cli_channel) == normalized
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    direct_key = f"{cli_channel}:{normalized}"
+    return direct_key if any(str(info.get("key")) == direct_key for info in session_infos) else None
+
+
 def _tui_command_palette() -> list[tuple[str, str, str]]:
     items = [
         (spec.command, spec.description, "edit" if spec.arg_hint else "submit")
         for spec in BUILTIN_COMMAND_SPECS
+        if spec.command != "/new"
     ]
     items.extend([
-        ("/resume", "Switch or resume a CLI topic.", "submit"),
+        ("/rename", "Rename the current CLI session.", "edit"),
+        ("/clear", "Clear context and start an unnamed empty session.", "submit"),
+        ("/resume", "Switch to a saved CLI session.", "edit"),
         ("/todos", "Show or clear the current topic todo list.", "submit"),
         ("/continue", "Continue the last interrupted task.", "submit"),
         ("/commit_memory", "Promote or preview pending memory consolidation.", "submit"),
@@ -2170,8 +2211,9 @@ def agent(
                 workspace=agent_loop.workspace,
             )
 
-            # Mutable topic state — fresh session by default; user picks via startup popup
-            fresh_chat_id = datetime.now().strftime("topic_%Y%m%d_%H%M%S")
+            # A fresh CLI start is intentionally unnamed. It becomes visible in
+            # /resume only after it is persisted (by /clear or a user turn).
+            fresh_chat_id = f"session_{uuid.uuid4().hex}"
             topic_state: dict[str, str] = {"chat_id": fresh_chat_id}
 
             def _load_topic(name: str) -> None:
@@ -2193,7 +2235,10 @@ def agent(
                         )
                     except Exception:
                         pass
-                tui.set_topic(name)
+                display_name = _cli_session_display_name(
+                    {"key": s.key, "metadata": s.metadata}, cli_channel
+                )
+                tui.set_topic("" if display_name == _CLI_UNNAMED_SESSION_LABEL else display_name or name)
                 tui.load_session_history(
                     agent_loop.sessions.display_history(s.key, s.messages),
                     tool_registry=agent_loop.tools,
@@ -2224,44 +2269,31 @@ def agent(
 
             def _topic_popup_items(session_infos: list[dict[str, Any]]) -> list[tuple[str, str]]:
                 items: list[tuple[str, str]] = []
-                prefix = f"{cli_channel}:"
                 for info in session_infos:
                     key = str(info.get("key") or "")
-                    if not key.startswith(prefix):
+                    display_name = _cli_session_display_name(info, cli_channel)
+                    if display_name is None:
                         continue
-                    name = key[len(prefix):]
                     size = _topic_cache_size_bytes(
                         data_dir=agent_loop.context.data_dir,
                         session_key=key,
                         session_path=str(info.get("path") or "") or None,
                         transcript_path=str(info.get("transcript_path") or "") or None,
                     )
-                    items.append((name, _format_topic_popup_label(name, size)))
+                    items.append((key, _format_topic_popup_label(display_name, size)))
                 return items
 
             # Show startup topic picker if existing sessions are available
             async def _startup_picker() -> None:
                 await asyncio.sleep(0.05)
                 sessions_list = agent_loop.sessions.list_sessions()
-                prefix = f"{cli_channel}:"
                 topics = [
-                    s["key"][len(prefix):]
+                    _cli_session_display_name(s, cli_channel)
                     for s in sessions_list
-                    if s["key"].startswith(prefix)
+                    if _cli_session_display_name(s, cli_channel) is not None
                 ]
                 if topics:
-                    options = [("[ 新建话题 ]", "[ 新建话题 ]")]
-                    options.extend(_topic_popup_items(sessions_list))
-                    def _on_startup_select(name: str):
-                        if name == "[ 新建话题 ]":
-                            async def _confirm_new_topic(typed: str) -> None:
-                                new_name = typed or datetime.now().strftime("topic_%Y%m%d_%H%M%S")
-                                await _switch_topic(new_name)
-                                tui.add_system(f"已创建话题: {new_name}")
-                            tui.enter_new_topic_mode(_confirm_new_topic)
-                            return None
-                        return _switch_topic(name)
-                    tui.show_topic_popup(options, _on_startup_select)
+                    tui.show_topic_popup(_topic_popup_items(sessions_list), _switch_topic)
 
             asyncio.create_task(_startup_picker())
 
@@ -2382,17 +2414,50 @@ def agent(
                 if pending_queue:
                     await _send_message(pending_queue.pop(0))
 
-            async def _switch_topic(name: str) -> None:
+            async def _switch_topic(session_key: str) -> None:
+                """Switch to a persisted session key, keeping its display name separate."""
+                prefix = f"{cli_channel}:"
+                if not session_key.startswith(prefix):
+                    return
                 # Fork: drop the previous topic's per-session learning state so
                 # the loop's learning dicts don't grow unbounded as topics pile up.
                 old_key = f"{cli_channel}:{topic_state['chat_id']}"
-                new_key = f"{cli_channel}:{name}"
-                if old_key != new_key:
+                if old_key != session_key:
                     agent_loop.clear_session_learning(old_key)
                 _todo_bar_waiting_for_new_plan[0] = False
-                topic_state["chat_id"] = name
+                topic_state["chat_id"] = session_key[len(prefix):]
                 tui.reset_history()
-                _load_topic(name)
+                _load_topic(topic_state["chat_id"])
+
+            async def _clear_context() -> None:
+                """Leave the old session intact and enter a persisted unnamed one."""
+                fresh_id = f"session_{uuid.uuid4().hex}"
+                fresh = agent_loop.sessions.get_or_create(f"{cli_channel}:{fresh_id}")
+                fresh.metadata["cli_unnamed"] = True
+                fresh.metadata.pop("cli_title", None)
+                agent_loop.sessions.save(fresh)
+                await _switch_topic(fresh.key)
+                tui.set_topic("")
+                tui.add_system("已清空上下文，当前为空白未命名会话。使用 /rename 命名，或 /resume 切换会话。")
+
+            async def _rename_current(title: str) -> None:
+                name = title.strip()
+                if not name:
+                    tui.add_system("会话名称不能为空。")
+                    return
+                current_key = f"{cli_channel}:{topic_state['chat_id']}"
+                for info in agent_loop.sessions.list_sessions():
+                    if str(info.get("key")) == current_key:
+                        continue
+                    if _cli_session_display_name(info, cli_channel) == name:
+                        tui.add_system(f"会话名称已存在: {name}")
+                        return
+                session = agent_loop.sessions.get_or_create(current_key)
+                session.metadata["cli_title"] = name
+                session.metadata.pop("cli_unnamed", None)
+                agent_loop.sessions.save(session)
+                tui.set_topic(name)
+                tui.add_system(f"已重命名当前会话: {name}")
 
             async def _on_submit(user_input: str) -> None:
                 text = user_input.strip()
@@ -2407,23 +2472,22 @@ def agent(
                     tui.add_system(_format_skills_command(agent_loop.context.skills))
                     return
 
-                if text.startswith("/new"):
+                if text == "/clear":
                     if is_processing:
-                        tui.add_system("请等待当前响应完成后再新建话题。")
+                        tui.add_system("请等待当前响应完成后再清空上下文。")
                         return
-                    parts = text.split(None, 1)
-                    if len(parts) > 1 and parts[1].strip():
-                        # /new <name> — name provided directly, no need for input mode
-                        name = parts[1].strip()
-                        await _switch_topic(name)
-                        tui.add_system(f"已创建并切换到话题: {name}")
+                    await _clear_context()
+                    return
+
+                if text == "/rename" or text.startswith("/rename "):
+                    if is_processing:
+                        tui.add_system("请等待当前响应完成后再重命名会话。")
+                        return
+                    name = text[len("/rename"):].strip()
+                    if name:
+                        await _rename_current(name)
                     else:
-                        # /new with no args — enter topic-name input mode
-                        async def _confirm_new_topic_cmd(typed: str) -> None:
-                            name = typed or datetime.now().strftime("topic_%Y%m%d_%H%M%S")
-                            await _switch_topic(name)
-                            tui.add_system(f"已创建并切换到话题: {name}")
-                        tui.enter_new_topic_mode(_confirm_new_topic_cmd)
+                        tui.enter_new_topic_mode(_rename_current)
                     return
 
                 if text == "/continue":
@@ -2483,36 +2547,31 @@ def agent(
                     tui.add_system(f"{header}\n{format_todos(s.todos)}")
                     return
 
-                if text.startswith("/resume"):
+                if text == "/resume" or text.startswith("/resume "):
                     if is_processing:
                         tui.add_system("请等待当前响应完成后再切换话题。")
                         return
                     arg = text[7:].strip()
+                    sessions_list = agent_loop.sessions.list_sessions()
                     if arg:
-                        # /resume <name> — direct switch
-                        await _switch_topic(arg)
-                        tui.add_system(f"已切换到话题: {arg}")
+                        session_key = _resolve_cli_session_key(sessions_list, cli_channel, arg)
+                        if session_key is None:
+                            tui.add_system(f"未找到会话: {arg}")
+                            return
+                        await _switch_topic(session_key)
+                        tui.add_system(f"已切换到会话: {arg}")
                     else:
                         # /resume — interactive picker
-                        sessions_list = agent_loop.sessions.list_sessions()
-                        prefix = f"{cli_channel}:"
-                        topics = [
-                            s["key"][len(prefix):]
-                            for s in sessions_list
-                            if s["key"].startswith(prefix)
-                        ]
-                        if not topics:
-                            tui.add_system("当前没有已保存的话题。")
+                        items = _topic_popup_items(sessions_list)
+                        if not items:
+                            tui.add_system("当前没有已保存的会话。")
                             return
 
-                        async def _on_topic_select(name: str) -> None:
-                            await _switch_topic(name)
-                            tui.add_system(f"已切换到话题: {name}")
+                        async def _on_topic_select(session_key: str) -> None:
+                            await _switch_topic(session_key)
+                            tui.add_system("已切换会话。")
 
-                        tui.show_topic_popup(
-                            _topic_popup_items(sessions_list),
-                            _on_topic_select,
-                        )
+                        tui.show_topic_popup(items, _on_topic_select)
                     return
                 # ─────────────────────────────────────────────────────────────
 

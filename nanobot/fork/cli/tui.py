@@ -483,8 +483,9 @@ class PromptTUI(TUIBase):
             c.print()
             c.print("  [bold]命令[/bold]")
             c.print("    [cyan]exit  quit  /exit  /quit  :q[/cyan]   退出 nanobot")
-            c.print("    [cyan]/new [名称][/cyan]                   新建话题")
-            c.print("    [cyan]/resume [名称][/cyan]                切换/恢复话题（无参数时交互选择）")
+            c.print("    [cyan]/rename [名称][/cyan]                重命名当前会话")
+            c.print("    [cyan]/clear[/cyan]                        清空上下文并创建空白会话")
+            c.print("    [cyan]/resume [名称][/cyan]                切换会话（无参数时交互选择）")
             c.print()
             c.print(f"  [dim]{rule}[/dim]")
             c.print()
@@ -697,7 +698,7 @@ class PromptTUI(TUIBase):
             wrap_lines=True,
             get_line_prefix=lambda lineno, wrap_count: (
                 (
-                    HTML("<b fg='ansiyellow'>话题名: </b>")
+                    HTML("<b fg='ansiyellow'>会话名: </b>")
                     if self._input_mode == "new_topic"
                     else HTML("<b fg='ansiblue'>You: </b>")
                 )

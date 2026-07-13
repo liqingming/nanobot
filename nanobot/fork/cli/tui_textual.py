@@ -1375,6 +1375,7 @@ class TextualTUI(TUIBase):
         self._new_topic_cb: Callable[[str], Awaitable[None]] | None = None
 
         # Popup state
+        self._popup_max_visible = 6
         self._all_commands: list[tuple[str, str]] = []
         self._command_edit_values: set[str] = set()
         self._popup_mode: str = "hidden"
@@ -1514,6 +1515,17 @@ class TextualTUI(TUIBase):
 
     # ── Popup helpers ──────────────────────────────────────────────────────
 
+    def _popup_visible_range(self) -> tuple[int, int]:
+        """Return the slice that keeps the selected popup item on screen."""
+        count = len(self._popup_items)
+        if not count:
+            return 0, 0
+        visible = self._popup_max_visible
+        start = max(0, self._popup_idx - visible + 1)
+        if start + visible > count:
+            start = max(0, count - visible)
+        return start, min(count, start + visible)
+
     def _refresh_popup(self) -> None:
         items = self._popup_items
         idx = self._popup_idx
@@ -1521,8 +1533,12 @@ class TextualTUI(TUIBase):
         if not items or mode == "hidden":
             self._app.update_popup([], False)
             return
+        start, end = self._popup_visible_range()
         lines: list[str] = []
-        for i, (value, label) in enumerate(items):
+        if start:
+            lines.append(f"[dim]  ↑ 还有 {start} 项[/dim]")
+        for i in range(start, end):
+            value, label = items[i]
             selected = i == idx
             prefix = " ▶ " if selected else "   "
             if selected:
@@ -1535,6 +1551,8 @@ class TextualTUI(TUIBase):
                     lines.append(f"[dim]{prefix}{value:<12}  {label}[/dim]")
                 else:
                     lines.append(f"[dim]{prefix}{label or value}[/dim]")
+        if end < len(items):
+            lines.append(f"[dim]  ↓ 还有 {len(items) - end} 项[/dim]")
         self._app.update_popup(lines, True)
 
     def _on_input_changed(self, text: str) -> None:
@@ -2017,7 +2035,13 @@ class TextualTUI(TUIBase):
             return None
         added = int(event.get("added") or 0)
         deleted = int(event.get("deleted") or 0)
-        diff = event.get("diff") if isinstance(event.get("diff"), str) else ""
+        raw_diff = event.get("diff")
+        if isinstance(event.get("diff_text"), str):
+            diff = event["diff_text"]
+        elif isinstance(raw_diff, dict):
+            diff = raw_diff.get("text") if isinstance(raw_diff.get("text"), str) else ""
+        else:
+            diff = raw_diff if isinstance(raw_diff, str) else ""
         total_lines = int(event.get("diff_total_lines") or 0)
         if total_lines <= 0 and diff:
             total_lines = len(diff.splitlines())
@@ -2480,7 +2504,7 @@ class TextualTUI(TUIBase):
     def enter_new_topic_mode(
         self,
         callback: Callable[[str], Awaitable[None]],
-        placeholder: str = "话题名: ",
+        placeholder: str = "会话名: ",
     ) -> None:
         """Generic free-text input mode.
 

@@ -278,6 +278,38 @@ async def test_topic_bar_shows_workspace_and_topic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_command_popup_scrolls_with_selection_and_shows_remaining_count() -> None:
+    tui = TextualTUI()
+    tui.set_commands([(f"/command-{i}", f"Command {i}") for i in range(8)])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _press_text(pilot, "/")
+        await pilot.pause()
+
+        assert tui._popup_idx == 0
+        assert tui._popup_visible_range() == (0, 6)
+        popup = app.query_one("#popup")
+        text = getattr(popup.render(), "plain", str(popup.render()))
+        assert "command-0" in text
+        assert "command-5" in text
+        assert "command-6" not in text
+        assert "↓ 还有 2 项" in text
+
+        await pilot.press(*(["down"] * 6))
+        await pilot.pause()
+
+        assert tui._popup_idx == 6
+        assert tui._popup_visible_range() == (1, 7)
+        text = getattr(popup.render(), "plain", str(popup.render()))
+        assert "↑ 还有 1 项" in text
+        assert "command-0" not in text
+        assert "command-6" in text
+        assert "↓ 还有 1 项" in text
+
+
+@pytest.mark.asyncio
 async def test_topic_popup_can_show_cache_label_but_select_topic_value() -> None:
     tui = TextualTUI()
     selected: list[str] = []
@@ -978,6 +1010,29 @@ async def test_clear_idle_thinking_removes_stale_placeholder_before_progress() -
         assert tui._idle_placeholder_visible is False
         assert "📊 进度: 1/3" in text
         assert "思考中" not in text
+
+@pytest.mark.asyncio
+async def test_file_edit_event_renders_apply_patch_diff_text() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.add_file_edit_events([{
+            "phase": "end",
+            "path": "src/example.py",
+            "added": 1,
+            "deleted": 1,
+            "diff": {"format": "unified", "text": "@@ -1 +1 @@\n-old\n+new"},
+            "diff_text": "@@ -1 +1 @@\n-old\n+new",
+        }])
+        await pilot.pause()
+
+        text = _output_log_text(app.query_one("#output"))
+        assert "src/example.py" in text
+        assert "+new" in text
+        assert "-old" in text
 
 @pytest.mark.asyncio
 async def test_normal_submit_does_not_pollute_history_for_slash_text() -> None:
