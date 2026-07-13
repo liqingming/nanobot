@@ -153,6 +153,31 @@ async def test_api_routes_allow_requests_without_configured_api_key(aiohttp_clie
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
+async def test_request_max_iterations_is_passed_as_turn_metadata(aiohttp_client, app, mock_agent) -> None:
+    client = await aiohttp_client(app)
+    response = await client.post(
+        "/v1/chat/completions", headers=AUTH_HEADERS,
+        json={"model": "test-model", "max_iterations": 4, "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status == 200
+    assert mock_agent.process_direct.await_args.kwargs["metadata"]["max_iterations"] == 4
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0, -1, True, "4", 4.5])
+async def test_invalid_request_max_iterations_returns_400(aiohttp_client, app, value) -> None:
+    client = await aiohttp_client(app)
+    response = await client.post(
+        "/v1/chat/completions", headers=AUTH_HEADERS,
+        json={"model": "test-model", "max_iterations": value, "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status == 400
+    assert (await response.json())["error"]["message"] == "max_iterations must be a positive integer"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
 async def test_no_user_message_returns_400(aiohttp_client, app) -> None:
     client = await aiohttp_client(app)
     resp = await client.post(

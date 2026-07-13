@@ -1045,6 +1045,10 @@ class AgentLoop:
                 **fields,
             )
 
+        requested_max_iterations = (metadata or {}).get("max_iterations")
+        effective_max_iterations = self.max_iterations
+        if isinstance(requested_max_iterations, int) and not isinstance(requested_max_iterations, bool) and requested_max_iterations > 0:
+            effective_max_iterations = requested_max_iterations
         append_session_runtime_log(
             runtime_log_path,
             "agent_loop.run.start",
@@ -1053,7 +1057,7 @@ class AgentLoop:
             channel=channel,
             chat_id=chat_id,
             initial_messages=len(initial_messages),
-            max_iterations=self.max_iterations,
+            max_iterations=effective_max_iterations,
         )
         effective_scope = self.workspace_scopes.for_turn(
             channel=channel,
@@ -1109,7 +1113,7 @@ class AgentLoop:
                 initial_messages=initial_messages,
                 tools=effective_tools,
                 model=self.model,
-                max_iterations=self.max_iterations,
+                max_iterations=effective_max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=hook,
                 error_message="Sorry, I encountered an error calling the AI model.",
@@ -1163,7 +1167,7 @@ class AgentLoop:
         self._last_usage = result.usage
         self._last_tool_events = list(result.tool_events or [])
         if result.stop_reason == "max_iterations":
-            logger.warning("Max iterations ({}) reached", self.max_iterations)
+            logger.warning("Max iterations ({}) reached", effective_max_iterations)
             should_stream = turn_continuation.should_stream_budget_response(
                 stop_reason=result.stop_reason,
                 pending_queue_available=pending_queue is not None and session is not None,

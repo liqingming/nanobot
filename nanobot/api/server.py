@@ -233,6 +233,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     try:
         requested_workspace = None
         requested_timeout = None
+        requested_max_iterations = None
         requested_tool_policy: Any = None
         if content_type.startswith("multipart/"):
             text, media_paths, session_id, requested_model, requested_workspace, requested_timeout, requested_tool_policy = await _parse_multipart(request)
@@ -245,6 +246,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             requested_model = body.get("model")
             requested_workspace = body.get("workspace")
             requested_timeout = body.get("timeout")
+            requested_max_iterations = body.get("max_iterations")
             requested_tool_policy = body.get("tool_policy")
             text, media_paths = _parse_json_content(body)
             session_id = body.get("session_id")
@@ -269,6 +271,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             return _error_json(400, "timeout must be greater than 0")
 
     metadata: dict[str, Any] = {}
+    if requested_max_iterations is not None:
+        if not isinstance(requested_max_iterations, int) or isinstance(requested_max_iterations, bool) or requested_max_iterations <= 0:
+            return _error_json(400, "max_iterations must be a positive integer")
+        metadata["max_iterations"] = requested_max_iterations
     if requested_tool_policy is not None:
         if not isinstance(requested_tool_policy, dict):
             return _error_json(400, "tool_policy must be an object")
