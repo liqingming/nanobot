@@ -155,6 +155,19 @@ async def test_grep_rejects_paths_from_request_tool_policy(tmp_path: Path, path:
 
 
 @pytest.mark.asyncio
+async def test_grep_rejects_subpaths_of_request_tool_policy(tmp_path: Path) -> None:
+    tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="default", session_key="api:review_123_code_review",
+        metadata={"tool_policy": {"blocked_grep_paths": ["Assets/ResourcesAssets"]}},
+    ))
+    try:
+        result = await tool.execute(pattern="needle", path="Assets/ResourcesAssets/Prefabs/Test")
+    finally:
+        reset_request_context(token)
+    assert "blocked by the request tool_policy for grep" in str(result)
+
+
 async def test_grep_allows_specific_module_for_review_session(tmp_path: Path) -> None:
     module = tmp_path / "Assets" / "Script" / "Game" / "moduls" / "Dragon"
     module.mkdir(parents=True)

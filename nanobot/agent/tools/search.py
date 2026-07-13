@@ -116,7 +116,7 @@ class _SearchTool(_FsTool):
     @classmethod
     def _reject_policy_path(cls, path: str, policy_key: str, tool_name: str) -> str | None:
         normalized = path.strip().replace("\\", "/").rstrip("/").lower()
-        if normalized in cls._blocked_request_paths(policy_key):
+        if any(normalized == blocked or normalized.startswith(blocked + "/") for blocked in cls._blocked_request_paths(policy_key)):
             return (
                 f"Error: path '{path or '.'}' is blocked by the request tool_policy for {tool_name}. "
                 "Use a changed file path or a specific module/subdirectory."

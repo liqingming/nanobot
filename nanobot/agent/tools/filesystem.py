@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
+from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.file_state import FileStates, _hash_file, current_file_states
 from nanobot.agent.tools.path_utils import resolve_workspace_path
 from nanobot.agent.tools.schema import (
@@ -32,6 +33,18 @@ class _FsTool(Tool):
     """Shared base for filesystem tools — common init and path resolution."""
 
     config_key = "file"
+    _TOOL_POLICY_METADATA_KEY = "tool_policy"
+
+    @staticmethod
+    def _reject_policy_path(path: str, policy_key: str, tool_name: str) -> str | None:
+        request_ctx = current_request_context()
+        policy = request_ctx.metadata.get(_FsTool._TOOL_POLICY_METADATA_KEY) if request_ctx else None
+        raw_paths = policy.get(policy_key) if isinstance(policy, dict) else None
+        blocked = {str(item).strip().replace("\\", "/").rstrip("/").lower() for item in raw_paths or []}
+        normalized = path.strip().replace("\\", "/").rstrip("/").lower()
+        if any(normalized == item or normalized.startswith(item + "/") for item in blocked):
+            return f"Error: path '{path or '.'}' is blocked by the request tool_policy for {tool_name}."
+        return None
 
     @classmethod
     def config_cls(cls):
@@ -287,6 +300,8 @@ class ReadFileTool(_FsTool):
         try:
             if not path:
                 return ToolResult.error("Error reading file: Unknown path")
+            if rejection := self._reject_policy_path(path, "blocked_read_file_paths", "read_file"):
+                return ToolResult.error(rejection)
 
             # Device path blacklist
             if _is_blocked_device(path):
