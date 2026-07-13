@@ -336,8 +336,12 @@ def test_agent_turn_inputs_keep_pre_submit_echo(text: str) -> None:
 
 
 def test_tui_command_palette_uses_claude_style_session_commands() -> None:
-    commands = {command: (description, action) for command, description, action in cli_commands._tui_command_palette()}
+    palette = cli_commands._tui_command_palette()
+    commands = {command: (description, action) for command, description, action in palette}
 
+    assert [command for command, _description, _action in palette] == sorted(
+        command for command, _description, _action in palette
+    )
     assert "/new" not in commands
     assert commands["/rename"] == ("Rename the current CLI session.", "edit")
     assert commands["/clear"] == ("Clear context and start an unnamed empty session.", "submit")

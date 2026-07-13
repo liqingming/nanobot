@@ -973,7 +973,7 @@ def _tui_command_palette() -> list[tuple[str, str, str]]:
             continue
         seen.add(command)
         deduped.append((command, description, action))
-    return deduped
+    return sorted(deduped, key=lambda item: item[0].lower())
 
 
 def _runtime_data_dir_for_workspace(workspace_path: Path) -> Path:

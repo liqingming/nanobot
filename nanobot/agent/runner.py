@@ -796,14 +796,15 @@ class AgentRunner:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-            # Check for mid-turn injections BEFORE signaling stream end.
-            # If injections are found we keep the stream alive (resuming=True)
+            # Check real mid-turn injections before signaling stream end. A
+            # sustained goal persists across user turns; it must not manufacture
+            # another user message after a model has completed this turn.
+            # If real injections are found we keep the stream alive (resuming=True)
             # so streaming channels don't prematurely finalize the card.
             should_continue, injection_cycles = await self._try_drain_injections(
                 spec, messages, assistant_message, injection_cycles,
                 phase="after final response",
                 iteration=iteration,
-                allow_goal_continue=True,
             )
             if should_continue:
                 had_injections = True

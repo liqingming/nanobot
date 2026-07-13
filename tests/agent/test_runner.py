@@ -26,6 +26,61 @@ def _make_loop(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_active_goal_does_not_continue_after_normal_final_response():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="done", tool_calls=[]))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "finish this"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=16000,
+        goal_active_predicate=lambda: True,
+        goal_continue_message="Continue the active goal.",
+    ))
+
+    assert result.final_content == "done"
+    assert provider.chat_with_retry.await_count == 1
+    assert all(message.get("content") != "Continue the active goal." for message in result.messages)
+
+
+@pytest.mark.asyncio
+async def test_real_injection_still_continues_after_normal_final_response():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="first", tool_calls=[]),
+        LLMResponse(content="second", tool_calls=[]),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    injections = [[{"role": "user", "content": "real follow-up"}], []]
+
+    async def drain_injections(**_kwargs):
+        return injections.pop(0)
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "start"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=16000,
+        injection_callback=drain_injections,
+        goal_active_predicate=lambda: True,
+    ))
+
+    assert result.final_content == "second"
+    assert provider.chat_with_retry.await_count == 2
+    assert any(message.get("content") == "real follow-up" for message in result.messages)
+
+
+@pytest.mark.asyncio
 async def test_runner_preserves_reasoning_fields_and_tool_results():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
