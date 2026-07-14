@@ -298,17 +298,20 @@ def test_system_prompt_is_only_an_interactive_local_command() -> None:
     assert "system-prompt" not in _strip_ansi(result.stdout)
 
 
-def test_format_prompt_inspection_separates_system_history_and_current_context() -> None:
+def test_format_prompt_inspection_shows_system_and_current_context_only() -> None:
     rendered = cli_commands._format_prompt_inspection(
         [
             {"role": "system", "content": "system rules"},
             {"role": "assistant", "content": "prior response"},
+            {"role": "tool", "content": "large tool output"},
             {"role": "user", "content": "current runtime context"},
         ]
     )
 
+    assert "## 历史摘要\n\n未展开 2 条历史消息（assistant 1、tool 1，约 31 字符）。" in rendered
     assert "## System Prompt\n\nsystem rules" in rendered
-    assert "## 历史消息 1（assistant）\n\nprior response" in rendered
+    assert "prior response" not in rendered
+    assert "large tool output" not in rendered
     assert "## 当前请求上下文（检查占位消息）\n\ncurrent runtime context" in rendered
 
 

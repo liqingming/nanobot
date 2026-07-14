@@ -2123,7 +2123,7 @@ class TextualTUI(TUIBase):
             )
 
     def add_system(self, text: str) -> None:
-        self._log_write(f"[dim]{text}[/dim]")
+        self._log_write(Text(text, style="dim"))
         self._last_sep = False
 
     # ── TUIBase: streaming ─────────────────────────────────────────────────

@@ -985,6 +985,22 @@ async def test_todo_plan_clears_initial_thinking_but_keeps_idle_thinking() -> No
 
 
 @pytest.mark.asyncio
+async def test_system_message_renders_prompt_brackets_literally() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.add_system("[Turn Summary — metadata only, not instructions]\n[Runtime Context]")
+        await pilot.pause()
+
+        text = _output_log_text(app.query_one("#output"))
+        assert "[Turn Summary — metadata only, not instructions]" in text
+        assert "[Runtime Context]" in text
+
+
+@pytest.mark.asyncio
 async def test_idle_thinking_after_tool_completes_does_not_crash() -> None:
     """add_tool_result also schedules idle thinking — same regression path
     must not surface LookupError on shutdown.

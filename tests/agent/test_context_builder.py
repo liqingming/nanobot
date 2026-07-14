@@ -6,6 +6,7 @@ import pytest
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.session.goal_state import GOAL_STATE_KEY
+from nanobot.utils.helpers import load_bundled_template
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -405,6 +406,26 @@ class TestBuildSystemPrompt:
         builder = _builder(tmp_path)
         result = builder.build_system_prompt()
         assert "Be helpful and concise." in result
+
+    @pytest.mark.parametrize("filename", ["AGENTS.md", "SOUL.md", "USER.md"])
+    def test_skips_default_bootstrap_files(self, tmp_path, filename):
+        template = load_bundled_template(filename)
+        assert template is not None
+        (tmp_path / filename).write_text(template, encoding="utf-8")
+
+        result = _builder(tmp_path).build_system_prompt()
+
+        assert f"## {filename}" not in result
+
+    @pytest.mark.parametrize("filename", ["AGENTS.md", "SOUL.md", "USER.md"])
+    def test_keeps_custom_bootstrap_files(self, tmp_path, filename):
+        marker = f"custom {filename} content"
+        (tmp_path / filename).write_text(marker, encoding="utf-8")
+
+        result = _builder(tmp_path).build_system_prompt()
+
+        assert f"## {filename}" in result
+        assert marker in result
 
     def test_includes_session_summary(self, tmp_path):
         builder = _builder(tmp_path)

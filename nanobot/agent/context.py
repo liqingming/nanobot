@@ -264,6 +264,8 @@ class ContextBuilder:
                 continue
             seen_paths.add(resolved)
             content = file_path.read_text(encoding="utf-8")
+            if label in self.BOOTSTRAP_FILES and self._is_template_content(content, label):
+                continue
             parts.append(f"## {label}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""

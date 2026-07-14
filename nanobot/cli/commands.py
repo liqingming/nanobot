@@ -239,23 +239,30 @@ def _format_skills_command(skills_loader: Any) -> str:
 
 
 def _format_prompt_inspection(messages: list[dict[str, Any]]) -> str:
-    """Render the exact message list built for a local prompt inspection."""
-    parts = ["# 当前请求上下文（只读检查）"]
-    for index, message in enumerate(messages, start=1):
+    """Render the inspectable parts of an exact message list without dumping history."""
+    system = messages[0].get("content", "") if messages else ""
+    current = messages[-1].get("content", "") if len(messages) > 1 else ""
+    if not isinstance(system, str):
+        system = json.dumps(system, ensure_ascii=False, indent=2)
+    if not isinstance(current, str):
+        current = json.dumps(current, ensure_ascii=False, indent=2)
+
+    history = messages[1:-1] if len(messages) > 2 else []
+    counts: dict[str, int] = {}
+    chars = 0
+    for message in history:
         role = str(message.get("role", "unknown"))
-        if index == 1 and role == "system":
-            heading = "## System Prompt"
-        elif role == "user" and index == len(messages):
-            heading = "## 当前请求上下文（检查占位消息）"
-        else:
-            heading = f"## 历史消息 {index - 1}（{role}）"
+        counts[role] = counts.get(role, 0) + 1
         content = message.get("content", "")
-        if isinstance(content, str):
-            rendered = content
-        else:
-            rendered = json.dumps(content, ensure_ascii=False, indent=2)
-        parts.append(f"{heading}\n\n{rendered}")
-    return "\n\n---\n\n".join(parts)
+        chars += len(content) if isinstance(content, str) else len(json.dumps(content, ensure_ascii=False))
+    history_summary = "、".join(f"{role} {count}" for role, count in counts.items()) or "无"
+
+    return "\n\n---\n\n".join([
+        "# 当前请求上下文（只读检查）",
+        f"## 历史摘要\n\n未展开 {len(history)} 条历史消息（{history_summary}，约 {chars:,} 字符）。",
+        f"## System Prompt\n\n{system}",
+        f"## 当前请求上下文（检查占位消息）\n\n{current}",
+    ])
 
 
 def _format_topic_cache_size(size_bytes: int | None) -> str:
