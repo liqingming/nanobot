@@ -56,7 +56,8 @@ def test_system_prompt_reflects_current_dream_memory_contract(tmp_path) -> None:
 
     assert "memory/history.jsonl" in prompt
     assert "automatically managed by Dream" in prompt
-    assert "do not edit directly" in prompt
+    # The untouched default AGENTS.md is intentionally not injected.
+    assert "do not edit directly" not in prompt
 
 
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
@@ -270,8 +271,8 @@ def test_partial_dream_processing_shows_only_remainder(tmp_path) -> None:
     assert "recent question about K8s" in prompt
 
 
-def test_execution_rules_in_system_prompt(tmp_path) -> None:
-    """Execution rules should appear in the system prompt via default SOUL.md."""
+def test_default_soul_is_not_injected_into_system_prompt(tmp_path) -> None:
+    """Untouched default SOUL.md should not consume system prompt context."""
     from nanobot.utils.helpers import sync_workspace_templates
 
     workspace = _make_workspace(tmp_path)
@@ -279,10 +280,10 @@ def test_execution_rules_in_system_prompt(tmp_path) -> None:
     builder = ContextBuilder(workspace)
 
     prompt = builder.build_system_prompt()
-    assert "single-step tasks" in prompt
-    assert "multi-step tasks" in prompt
-    assert "Read before you write" in prompt
-    assert "verify the result" in prompt
+    assert "single-step tasks" not in prompt
+    assert "multi-step tasks" not in prompt
+    assert "Read before you write" not in prompt
+    assert "verify the result" not in prompt
 
 
 def test_identity_has_no_behavioral_instructions(tmp_path) -> None:
@@ -416,11 +417,9 @@ def test_template_memory_md_is_skipped(tmp_path) -> None:
     builder = ContextBuilder(workspace)
     prompt = builder.build_system_prompt()
 
-    # The "# Memory\n\n## Long-term Memory" block is produced only by
-    # build_system_prompt() when MEMORY.md is injected.  The memory skill
-    # also contains "# Memory" but is followed by "## Structure", not
-    # "## Long-term Memory".
-    assert "# Memory\n\n## Long-term Memory" not in prompt
+    # The memory skill contains "# Memory" but must not cause the blank
+    # default MEMORY.md scaffold to be injected.
+    assert "# Long-term Memory" not in prompt
     assert "This file is automatically updated by nanobot" not in prompt
 
 
@@ -437,7 +436,8 @@ def test_customized_memory_md_is_injected(tmp_path) -> None:
     builder = ContextBuilder(workspace)
     prompt = builder.build_system_prompt()
 
-    assert "# Memory\n\n## Long-term Memory" in prompt
+    assert "# Long-term Memory\n\nUser prefers dark mode" in prompt
+    assert "# Memory\n\n## Long-term Memory" not in prompt
     assert "User prefers dark mode" in prompt
 
 # -- fork skill auto-suggest reminders live in user content, not system prompt --

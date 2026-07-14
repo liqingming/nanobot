@@ -1,6 +1,7 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import hashlib
 import mimetypes
 import platform
 from pathlib import Path
@@ -58,6 +59,13 @@ class ContextBuilder:
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
     _MAX_RECENT_HISTORY = 50
     _MAX_HISTORY_TOKENS = 8_000
+    # Default bootstrap contents observed in this user's existing local data
+    # directories before the bundled templates changed.  Keep these fingerprints
+    # narrow: any other content remains user-authored and is injected normally.
+    _LEGACY_DEFAULT_BOOTSTRAP_HASHES = {
+        "AGENTS.md": {"15d53dd70ccb682673b87ef7d7c526d54db61e7a6b877253088370a7a0058cd4"},
+        "SOUL.md": {"4c94411ddfd965484aa8ac9981561324b8035c026bb903d5d379adea41ec53e8"},
+    }
 
     def __init__(
         self,
@@ -124,7 +132,7 @@ class ContextBuilder:
         if topic_mem:
             mem_parts.append(f"### Topic Memory\n{topic_mem}")
         if mem_parts:
-            parts.append("# Memory\n\n" + "\n\n".join(mem_parts))
+            parts.append("\n\n".join(mem_parts))
 
         if todos:
             from nanobot.fork.agent.tools.todo import format_todos
@@ -270,13 +278,15 @@ class ContextBuilder:
 
         return "\n\n".join(parts) if parts else ""
 
-    @staticmethod
-    def _is_template_content(content: str, template_path: str) -> bool:
-        """Check if *content* is identical to the bundled template."""
+    @classmethod
+    def _is_template_content(cls, content: str, template_path: str) -> bool:
+        """Check whether content is a current or locally observed default template."""
+        normalized = content.strip()
         tpl = load_bundled_template(template_path)
-        if tpl is not None:
-            return content.strip() == tpl.strip()
-        return False
+        if tpl is not None and normalized == tpl.strip():
+            return True
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return digest in cls._LEGACY_DEFAULT_BOOTSTRAP_HASHES.get(template_path, set())
 
     _SKILL_MATCH_MIN_TOKEN_LEN = 4
     _SKILL_MATCH_MAX_SUGGESTIONS = 3

@@ -38,11 +38,29 @@ class TestMemoryStoreBasicIO:
     def test_get_memory_context_returns_empty_when_missing(self, store):
         assert store.get_memory_context() == ""
 
-    def test_get_memory_context_returns_formatted_content(self, store):
-        store.write_memory("important fact")
+    def test_get_memory_context_returns_content_without_extra_heading(self, store):
+        store.write_memory("# Long-term Memory\n\nimportant fact")
         ctx = store.get_memory_context()
-        assert "Long-term Memory" in ctx
-        assert "important fact" in ctx
+        assert ctx == "# Long-term Memory\n\nimportant fact"
+
+    def test_get_memory_context_removes_untouched_template_sections(self, store):
+        store.write_memory(
+            "# Long-term Memory\n\n"
+            "This file stores important information that should persist across sessions.\n\n"
+            "## User Information\n\n(Important facts about the user)\n\n"
+            "## Preferences\n\n(User preferences learned over time)\n\n"
+            "## Project Context\n\nA real project fact.\n\n"
+            "## Important Notes\n\n(Things to remember)\n\n"
+            "---\n\n*This file is automatically updated by nanobot when important information should be remembered.*\n"
+        )
+
+        ctx = store.get_memory_context()
+
+        assert "A real project fact." in ctx
+        assert "Important facts about the user" not in ctx
+        assert "User preferences learned over time" not in ctx
+        assert "Things to remember" not in ctx
+        assert "automatically updated by nanobot" not in ctx
 
 
 class TestHistoryWithCursor:

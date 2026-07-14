@@ -271,8 +271,19 @@ class MemoryStore:
     # -- context injection (used by context.py) ------------------------------
 
     def get_memory_context(self) -> str:
+        """Return meaningful long-term memory without its untouched template scaffolding."""
         long_term = self.read_memory()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+        if not long_term:
+            return ""
+        for section in (
+            "## User Information\n\n(Important facts about the user)\n\n",
+            "## Preferences\n\n(User preferences learned over time)\n\n",
+            "## Project Context\n\n(Information about ongoing projects)\n\n",
+            "## Important Notes\n\n(Things to remember)\n\n",
+        ):
+            long_term = long_term.replace(section, "")
+        footer = "\n---\n\n*This file is automatically updated by nanobot when important information should be remembered.*"
+        return long_term.replace(footer, "").strip()
 
     # -- history.jsonl — append-only, JSONL format ---------------------------
 

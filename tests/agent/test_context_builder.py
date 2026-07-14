@@ -1,5 +1,6 @@
 """Tests for ContextBuilder — system prompt and message assembly."""
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -412,6 +413,17 @@ class TestBuildSystemPrompt:
         template = load_bundled_template(filename)
         assert template is not None
         (tmp_path / filename).write_text(template, encoding="utf-8")
+
+        result = _builder(tmp_path).build_system_prompt()
+
+        assert f"## {filename}" not in result
+
+    @pytest.mark.parametrize("filename", ["AGENTS.md", "SOUL.md"])
+    def test_skips_locally_observed_legacy_default_bootstrap_files(self, tmp_path, filename, monkeypatch):
+        content = f"legacy default {filename}\nsecond line"
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        monkeypatch.setitem(ContextBuilder._LEGACY_DEFAULT_BOOTSTRAP_HASHES, filename, {digest})
+        (tmp_path / filename).write_text(content.replace("\n", "\r\n"), encoding="utf-8", newline="")
 
         result = _builder(tmp_path).build_system_prompt()
 
