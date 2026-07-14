@@ -14,12 +14,15 @@ Tool signatures are provided automatically via function calling. This section do
 ## Discovery and Reading
 
 - Use `find_files` or `list_dir` to locate workspace paths before `read_file` when a path is uncertain.
+- When the user, a prior tool result, or a known project layout identifies a target directory, search that directory first. Do not begin from `.` or the workspace root unless narrower evidence is unavailable.
 - Use `grep` for content search inside the workspace; prefer it over shell grep for ordinary searches.
 - `grep` defaults to `output_mode="files_with_matches"`; use `output_mode="content"` for matching lines with context.
 - Use `fixed_strings=true` for literal keywords containing regex characters.
 - Use `output_mode="count"` to size a broad search before reading full matches.
 - Use `head_limit` and `offset` to page across large result sets.
 - Binary or oversized files may be skipped to keep results readable.
+- Batch independent discovery calls in one tool turn: after choosing a narrow directory, issue related `find_files`, `grep`, `list_dir`, and bounded `read_file` calls together. Do not request the model again between independent read-only calls; reserve the next model turn for interpreting their combined evidence.
+- Read only the relevant file range after search has identified a symbol or section. Large raw outputs are retained on disk; do not repeatedly request or reintroduce their full contents unless needed to make the next decision.
 
 ## File and Coding Workflows
 

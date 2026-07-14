@@ -11,6 +11,7 @@ from nanobot.agent.context_governance import (
     BACKFILL_CONTENT,
     HISTORICAL_TOOL_CALL_KEEP_RECENT,
     MICROCOMPACT_KEEP_RECENT,
+    MICROCOMPACT_SOFT_CHAR_BUDGET,
     ContextGovernanceConfig,
     ContextGovernor,
 )
@@ -493,6 +494,85 @@ def _microcompact_messages(*, total: int, tool_name: str, content: str) -> list[
             "content": content,
         })
     return messages
+
+
+def test_prepare_for_model_reuses_overflow_probe_when_prompt_fits(monkeypatch) -> None:
+    provider = MagicMock()
+    provider.generation = SimpleNamespace(max_tokens=0)
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    messages = _microcompact_messages(total=1, tool_name="read_file", content="result")
+    spec = AgentRunSpec(
+        initial_messages=messages,
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        context_window_tokens=20_000,
+    )
+    probe = MagicMock(return_value=(100, "test"))
+    monkeypatch.setattr("nanobot.agent.context_governance.estimate_prompt_tokens_chain", probe)
+
+    result = ContextGovernor().prepare_for_model(
+        _governance_config(provider, tools, spec), messages, set()
+    )
+
+    assert result is messages
+    assert probe.call_count == 1
+
+
+def test_microcompact_soft_budget_compacts_only_stale_read_results() -> None:
+    provider = MagicMock()
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    total = MICROCOMPACT_KEEP_RECENT + 4
+    content = "x" * (MICROCOMPACT_SOFT_CHAR_BUDGET // 2)
+    messages = _microcompact_messages(total=total, tool_name="grep", content=content)
+    spec = AgentRunSpec(
+        initial_messages=messages,
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+
+    compacted_ids: set[str] = set()
+    result = ContextGovernor().compact_inflight_soft_budget(
+        _governance_config(provider, tools, spec), messages, compacted_ids
+    )
+
+    tool_messages = [message for message in result if message.get("role") == "tool"]
+    compacted = [
+        message for message in tool_messages
+        if "compacted to fit context" in str(message.get("content", ""))
+    ]
+    assert [message["tool_call_id"] for message in compacted] == ["c0", "c1", "c2", "c3"]
+    assert [message["tool_call_id"] for message in tool_messages[-MICROCOMPACT_KEEP_RECENT:]] == [
+        f"c{i}" for i in range(4, total)
+    ]
+    assert compacted_ids == {"c0", "c1", "c2", "c3"}
+
+
+def test_microcompact_soft_budget_preserves_recent_and_short_results() -> None:
+    provider = MagicMock()
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    messages = _microcompact_messages(
+        total=MICROCOMPACT_KEEP_RECENT + 4,
+        tool_name="read_file",
+        content="short",
+    )
+    spec = AgentRunSpec(
+        initial_messages=messages,
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+
+    assert ContextGovernor().compact_inflight_soft_budget(
+        _governance_config(provider, tools, spec), messages, set()
+    ) is messages
 
 
 def test_microcompact_skips_when_prompt_under_hard_budget(monkeypatch):

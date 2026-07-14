@@ -304,6 +304,8 @@ class TestBundledToolContract:
         assert "Use the narrowest structured tool" in content
         assert "Do not use `exec` as a universal workaround" in content
         assert "## File and Coding Workflows" in content
+        assert "search that directory first" in content
+        assert "Batch independent discovery calls" in content
         assert "apply_patch" in content
         assert "## Web and External Information" in content
         assert "## Messaging and Media" in content

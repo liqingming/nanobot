@@ -29,6 +29,11 @@ if TYPE_CHECKING:
 SNIP_SAFETY_BUFFER = 1024
 MICROCOMPACT_KEEP_RECENT = 10
 MICROCOMPACT_MIN_CHARS = 500
+# Keep enough recent evidence for the next model decision, but do not let a
+# long read/search-heavy tool chain accumulate every earlier raw result until
+# it nearly exhausts the provider context window.
+MICROCOMPACT_SOFT_CHAR_BUDGET = 48_000
+MICROCOMPACT_SOFT_TARGET_CHARS = 32_000
 HISTORICAL_TOOL_CALL_KEEP_RECENT = 64
 INFLIGHT_COMPACT_TARGET_RATIO = 0.85
 COMPACTABLE_TOOLS = frozenset({
@@ -87,8 +92,13 @@ class ContextGovernor:
         updated = self.backfill_missing_tool_results(updated)
         updated = self.trim_historical_tool_exchanges(config, updated)
         updated = self.apply_tool_result_budget(config, updated)
-        updated = self.compact_inflight_overflow(config, updated, compacted_tool_call_ids)
-        updated = self.snip_history(config, updated)
+        updated = self.compact_inflight_soft_budget(
+            config, updated, compacted_tool_call_ids
+        )
+        updated, exact_estimate = self._compact_inflight_overflow_with_estimate(
+            config, updated, compacted_tool_call_ids
+        )
+        updated = self.snip_history(config, updated, exact_estimate=exact_estimate)
         updated = self.drop_orphan_tool_results(updated)
         return self.backfill_missing_tool_results(updated)
 
@@ -392,6 +402,46 @@ class ContextGovernor:
                 updated[idx]["content"] = normalized
         return updated
 
+    def compact_inflight_soft_budget(
+        self,
+        config: ContextGovernanceConfig,
+        messages: list[dict[str, Any]],
+        compacted_tool_call_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        """Compact stale in-flight read/search results before they dominate a prompt.
+
+        This deliberately uses character accounting instead of a provider token probe:
+        it is a cheap fast path for the common case and retains the newest results
+        needed by the next model decision. Exact token accounting remains in the
+        overflow guard below.
+        """
+        candidates = self._inflight_compaction_candidates(
+            config, messages, compacted_tool_call_ids, include_recent=False
+        )
+        if not candidates:
+            return messages
+        total_chars = sum(
+            len(message.get("content", ""))
+            for message in messages
+            if message.get("role") == "tool" and isinstance(message.get("content"), str)
+        )
+        if total_chars <= MICROCOMPACT_SOFT_CHAR_BUDGET:
+            return messages
+
+        updated = messages
+        for idx, tool_call_id in candidates:
+            if total_chars <= MICROCOMPACT_SOFT_TARGET_CHARS:
+                break
+            if updated is messages:
+                updated = [dict(message) for message in messages]
+            content = updated[idx].get("content")
+            if isinstance(content, str):
+                total_chars -= len(content)
+            compacted_tool_call_ids.add(tool_call_id)
+            self._compact_tool_result_at(updated, idx)
+            total_chars += len(updated[idx].get("content", ""))
+        return updated
+
     def compact_inflight_overflow(
         self,
         config: ContextGovernanceConfig,
@@ -399,9 +449,21 @@ class ContextGovernor:
         compacted_tool_call_ids: set[str],
     ) -> list[dict[str, Any]]:
         """Compact in-flight tool results only when the request would overflow."""
+        updated, _ = self._compact_inflight_overflow_with_estimate(
+            config, messages, compacted_tool_call_ids
+        )
+        return updated
+
+    def _compact_inflight_overflow_with_estimate(
+        self,
+        config: ContextGovernanceConfig,
+        messages: list[dict[str, Any]],
+        compacted_tool_call_ids: set[str],
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """Overflow guard that returns its exact estimate for downstream reuse."""
         budget = self.input_budget(config)
         if budget <= 0:
-            return messages
+            return messages, None
 
         tools = config.tools.get_definitions()
         updated = self._apply_recorded_compactions(messages, compacted_tool_call_ids)
@@ -412,7 +474,7 @@ class ContextGovernor:
             tools,
         )
         if estimate <= budget:
-            return updated
+            return updated, estimate
 
         target = int(budget * INFLIGHT_COMPACT_TARGET_RATIO)
         candidates = self._inflight_compaction_candidates(
@@ -421,7 +483,7 @@ class ContextGovernor:
             compacted_tool_call_ids,
         )
         if not candidates:
-            return updated
+            return updated, estimate
 
         for candidate_idx, (idx, tool_call_id) in enumerate(candidates):
             is_newest_candidate = candidate_idx == len(candidates) - 1
@@ -451,12 +513,14 @@ class ContextGovernor:
             source,
             len(compacted_tool_call_ids),
         )
-        return updated
+        return updated, estimate
 
     def snip_history(
         self,
         config: ContextGovernanceConfig,
         messages: list[dict[str, Any]],
+        *,
+        exact_estimate: int | None = None,
     ) -> list[dict[str, Any]]:
         if not messages or not config.context_window_tokens:
             return messages
@@ -466,12 +530,14 @@ class ContextGovernor:
             return messages
 
         tools = config.tools.get_definitions()
-        estimate, _ = estimate_prompt_tokens_chain(
-            config.provider,
-            config.model,
-            messages,
-            tools,
-        )
+        estimate = exact_estimate
+        if estimate is None:
+            estimate, _ = estimate_prompt_tokens_chain(
+                config.provider,
+                config.model,
+                messages,
+                tools,
+            )
         if estimate <= budget:
             return messages
 
@@ -551,6 +617,8 @@ class ContextGovernor:
         config: ContextGovernanceConfig,
         messages: list[dict[str, Any]],
         compacted_tool_call_ids: set[str],
+        *,
+        include_recent: bool = True,
     ) -> list[tuple[int, str]]:
         compactable: list[tuple[int, str]] = []
         for idx, msg in enumerate(messages):
@@ -570,6 +638,8 @@ class ContextGovernor:
             return []
         primary_count = max(0, len(compactable) - MICROCOMPACT_KEEP_RECENT)
         primary = compactable[:primary_count]
+        if not include_recent:
+            return primary
         # Hard overflow beats the keep-recent preference. Return recent results
         # after stale ones so the newest result is naturally last.
         fallback = compactable[primary_count:]
