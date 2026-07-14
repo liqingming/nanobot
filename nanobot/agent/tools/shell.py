@@ -17,7 +17,7 @@ from loguru import logger
 from pydantic import Field
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
-from nanobot.agent.tools.context import current_request_session_key
+from nanobot.agent.tools.context import current_request_context, current_request_session_key
 from nanobot.agent.tools.exec_session import (
     DEFAULT_EXEC_SESSION_MANAGER,
     DEFAULT_MAX_OUTPUT_CHARS,
@@ -318,6 +318,10 @@ class ExecTool(Tool):
         max_output_tokens: int | None = None,
         **kwargs: Any,
     ) -> str:
+        request_ctx = current_request_context()
+        policy = request_ctx.metadata.get("tool_policy") if request_ctx else None
+        if isinstance(policy, dict) and policy.get("disable_exec") is True:
+            return ToolResult.error("Error: exec is blocked by the request tool_policy.")
         command = command or cmd
         working_dir = working_dir or workdir
         if not command:

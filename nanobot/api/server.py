@@ -286,6 +286,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
                 return _error_json(400, f"tool_policy.{key} must be an array of strings")
             normalized_policy[key] = list(paths)
+        if "disable_exec" in requested_tool_policy:
+            if not isinstance(requested_tool_policy["disable_exec"], bool):
+                return _error_json(400, "tool_policy.disable_exec must be a boolean")
+            normalized_policy["disable_exec"] = requested_tool_policy["disable_exec"]
         metadata["tool_policy"] = normalized_policy
     if session_id and str(session_id).startswith("review_"):
         metadata["review_session"] = True

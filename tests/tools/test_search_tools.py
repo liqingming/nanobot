@@ -14,6 +14,7 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.subagent import SubagentManager, SubagentStatus
 from nanobot.agent.tools.search import FindFilesTool, GrepTool
+from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import WebSearchConfig
@@ -169,6 +170,19 @@ async def test_grep_rejects_subpaths_of_request_tool_policy(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_exec_rejects_request_with_disable_exec_policy(tmp_path: Path) -> None:
+    tool = ExecTool(working_dir=str(tmp_path))
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="default", session_key="api:review_123_code_review",
+        metadata={"tool_policy": {"disable_exec": True}},
+    ))
+    try:
+        result = await tool.execute(command="git diff --check", shell="cmd")
+    finally:
+        reset_request_context(token)
+    assert "exec is blocked by the request tool_policy" in str(result)
+
+
 async def test_grep_allows_explicit_leaf_module_despite_blocked_parent(tmp_path: Path) -> None:
     module = tmp_path / "Assets" / "Script" / "Game" / "moduls" / "DragonInvadeActivity"
     module.mkdir(parents=True)
