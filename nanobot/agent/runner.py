@@ -941,6 +941,9 @@ class AgentRunner:
             "model": spec.model,
             "retry_mode": spec.provider_retry_mode,
             "on_retry_wait": spec.retry_wait_callback,
+            "on_retry_event": lambda fields: self._log_event(
+                spec, "runner.model.retry", **fields
+            ),
         }
         if spec.temperature is not None:
             kwargs["temperature"] = spec.temperature

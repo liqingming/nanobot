@@ -92,6 +92,56 @@ async def test_llm_error_not_appended_to_session_messages():
     assert response_event["error_content"] == error_content
     assert response_event["error_kind"] == "server_error"
 
+
+@pytest.mark.asyncio
+async def test_runner_forwards_provider_retry_event_to_runtime_log() -> None:
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    captured: list[dict] = []
+    provider = MagicMock(spec=LLMProvider)
+
+    async def _chat_with_retry(**kwargs):
+        kwargs["on_retry_event"]({
+            "attempt": 1,
+            "retry_mode": "standard",
+            "error_kind": "rate_limit",
+            "error_status_code": 429,
+            "error_type": "rate_limit_error",
+            "error_code": "rate_limit_exceeded",
+            "retry_after_s": 10.0,
+            "error_summary": "rate limit exceeded",
+        })
+        return LLMResponse(content="ok")
+
+    provider.chat_with_retry = _chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    runner = AgentRunner(provider)
+
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        event_logger=lambda event, fields: (
+            captured.append(fields) if event == "runner.model.retry" else None
+        ),
+    ))
+
+    assert result.final_content == "ok"
+    assert captured == [{
+        "attempt": 1,
+        "retry_mode": "standard",
+        "error_kind": "rate_limit",
+        "error_status_code": 429,
+        "error_type": "rate_limit_error",
+        "error_code": "rate_limit_exceeded",
+        "retry_after_s": 10.0,
+        "error_summary": "rate limit exceeded",
+    }]
+
+
 @pytest.mark.asyncio
 async def test_llm_arrearage_error_surfaces_clear_message():
     """Arrearage errors yield a clear user-facing message, not a raw dump (#3006)."""

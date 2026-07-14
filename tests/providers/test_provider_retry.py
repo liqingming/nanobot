@@ -58,6 +58,45 @@ async def test_chat_with_retry_retries_transient_error_then_succeeds(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_chat_with_retry_reports_structured_transient_error(monkeypatch) -> None:
+    provider = ScriptedProvider([
+        LLMResponse(
+            content="rate limit: " + "x" * 600,
+            finish_reason="error",
+            error_status_code=429,
+            error_kind="rate_limit",
+            error_type="rate_limit_error",
+            error_code="rate_limit_exceeded",
+            error_retry_after_s=12.5,
+        ),
+        LLMResponse(content="ok"),
+    ])
+    events: list[dict] = []
+
+    async def _fake_sleep(_delay: int) -> None:
+        return None
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_retry_event=events.append,
+    )
+
+    assert response.content == "ok"
+    assert events == [{
+        "attempt": 1,
+        "retry_mode": "standard",
+        "error_kind": "rate_limit",
+        "error_status_code": 429,
+        "error_type": "rate_limit_error",
+        "error_code": "rate_limit_exceeded",
+        "retry_after_s": 12.5,
+        "error_summary": "rate limit: " + "x" * 488,
+    }]
+
+
+@pytest.mark.asyncio
 async def test_chat_with_retry_does_not_retry_non_transient_error(monkeypatch) -> None:
     provider = ScriptedProvider([
         LLMResponse(content="401 unauthorized", finish_reason="error"),

@@ -789,6 +789,7 @@ class LLMProvider(ABC):
         on_stream_recover: Callable[[], Awaitable[None]] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        on_retry_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> LLMResponse:
         """Call chat_stream() with retry on transient provider failures."""
         if max_tokens is self._SENTINEL or max_tokens is None:
@@ -829,6 +830,7 @@ class LLMProvider(ABC):
             messages,
             retry_mode=retry_mode,
             on_retry_wait=on_retry_wait,
+            on_retry_event=on_retry_event,
             should_retry_guard=lambda: not has_streamed_content,
             on_stream_recover=_recover_stream if on_stream_recover else None,
         )
@@ -844,6 +846,7 @@ class LLMProvider(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        on_retry_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures.
 
@@ -872,6 +875,7 @@ class LLMProvider(ABC):
             messages,
             retry_mode=retry_mode,
             on_retry_wait=on_retry_wait,
+            on_retry_event=on_retry_event,
         )
 
     @classmethod
@@ -977,6 +981,7 @@ class LLMProvider(ABC):
         *,
         retry_mode: str,
         on_retry_wait: Callable[[str], Awaitable[None]] | None,
+        on_retry_event: Callable[[dict[str, Any]], None] | None = None,
         should_retry_guard: Callable[[], bool] | None = None,
         on_stream_recover: Callable[[], Awaitable[None]] | None = None,
     ) -> LLMResponse:
@@ -1044,6 +1049,22 @@ class LLMProvider(ABC):
                     return result
                 return response
 
+            retry_after = self._extract_retry_after_from_response(response)
+            if on_retry_event is not None:
+                try:
+                    on_retry_event({
+                        "attempt": attempt,
+                        "retry_mode": retry_mode,
+                        "error_kind": response.error_kind,
+                        "error_status_code": response.error_status_code,
+                        "error_type": response.error_type,
+                        "error_code": response.error_code,
+                        "retry_after_s": retry_after,
+                        "error_summary": (response.content or "")[:500],
+                    })
+                except Exception:
+                    pass
+
             if persistent and identical_error_count >= self._PERSISTENT_IDENTICAL_ERROR_LIMIT:
                 logger.warning(
                     "Stopping persistent retry after {} identical transient errors: {}",
@@ -1069,7 +1090,7 @@ class LLMProvider(ABC):
                 break
 
             base_delay = delays[min(attempt - 1, len(delays) - 1)]
-            delay = self._extract_retry_after_from_response(response) or base_delay
+            delay = retry_after or base_delay
             if persistent:
                 delay = min(delay, self._PERSISTENT_MAX_DELAY)
 
