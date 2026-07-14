@@ -411,10 +411,11 @@ def test_serve_uses_cache_data_dir_for_custom_workspace(tmp_path: Path, monkeypa
     fake_loop.close_mcp = AsyncMock()
     fake_app = MagicMock()
 
-    with patch("nanobot.cli.commands.sync_workspace_templates") as sync_templates, \
-         patch("nanobot.cli.commands.AgentLoop.from_config", return_value=fake_loop) as from_config, \
-         patch("nanobot.api.server.create_app", return_value=fake_app), \
-         patch("aiohttp.web.run_app"):
+    with (
+        patch("nanobot.cli.commands.AgentLoop.from_config", return_value=fake_loop) as from_config,
+        patch("nanobot.api.server.create_app", return_value=fake_app),
+        patch("aiohttp.web.run_app"),
+    ):
         result = runner.invoke(
             app,
             [
@@ -427,11 +428,15 @@ def test_serve_uses_cache_data_dir_for_custom_workspace(tmp_path: Path, monkeypa
         )
 
     assert result.exit_code == 0
-    sync_templates.assert_called_once_with(data_dir)
     assert from_config.call_args.kwargs["data_dir"] == data_dir
     session_manager = from_config.call_args.kwargs["session_manager"]
     assert data_dir in session_manager.sessions_dir.parents
     assert workspace not in session_manager.sessions_dir.parents
+    assert session_manager.sessions_dir.is_dir()
+    for filename in ("AGENTS.md", "SOUL.md", "USER.md", "HEARTBEAT.md", "LEARNING_RULES.md"):
+        assert not (data_dir / filename).exists()
+    assert not (data_dir / "memory" / "MEMORY.md").exists()
+    assert not (data_dir / "prompts" / "README.md").exists()
 
 
 def test_status_uses_explicit_config_and_workspace(tmp_path: Path):

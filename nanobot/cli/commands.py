@@ -1424,8 +1424,10 @@ def serve(
             "Set api.api_key in config to prevent unauthenticated access.[/red]"
         )
         raise typer.Exit(1)
+    # API sessions are often short-lived. Keep their cache directory persistent,
+    # but do not pre-populate it with bootstrap templates or initialize GitStore.
+    # SessionManager and agent subsystems create runtime directories lazily.
     data_dir = _runtime_data_dir_for_workspace(runtime_config.workspace_path)
-    sync_workspace_templates(data_dir)
     bus = MessageBus()
     session_manager = SessionManager(data_dir)
     try:
