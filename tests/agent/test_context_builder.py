@@ -387,6 +387,19 @@ class TestBuildSystemPrompt:
         result = builder.build_system_prompt()
         assert "workspace" in result.lower() or "python" in result.lower()
 
+    def test_workspace_section_does_not_guess_memory_or_skill_paths(self, tmp_path):
+        builder = _builder(tmp_path)
+        result = builder.build_system_prompt(session_key="cli:topic")
+        workspace_section = result.split("## Platform Policy", maxsplit=1)[0]
+
+        assert "Your workspace is at:" in workspace_section
+        assert "Long-term memory:" not in workspace_section
+        assert "History log:" not in workspace_section
+        assert "Custom skills:" not in workspace_section
+        assert "## Memory Paths" in result
+        assert "Global memory:" in result
+        assert "Topic memory:" in result
+
     def test_includes_bootstrap_files(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Be helpful and concise.", encoding="utf-8")
         builder = _builder(tmp_path)

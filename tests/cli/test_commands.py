@@ -291,6 +291,27 @@ def test_status_help_shows_workspace_and_config_options():
     assert "-c" in stripped_output
 
 
+def test_system_prompt_is_only_an_interactive_local_command() -> None:
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "system-prompt" not in _strip_ansi(result.stdout)
+
+
+def test_format_prompt_inspection_separates_system_history_and_current_context() -> None:
+    rendered = cli_commands._format_prompt_inspection(
+        [
+            {"role": "system", "content": "system rules"},
+            {"role": "assistant", "content": "prior response"},
+            {"role": "user", "content": "current runtime context"},
+        ]
+    )
+
+    assert "## System Prompt\n\nsystem rules" in rendered
+    assert "## 历史消息 1（assistant）\n\nprior response" in rendered
+    assert "## 当前请求上下文（检查占位消息）\n\ncurrent runtime context" in rendered
+
+
 def test_mark_cli_session_unnamed_clears_existing_title() -> None:
     session = type("Session", (), {"metadata": {"cli_title": "旧名称"}})()
 
@@ -330,6 +351,7 @@ def test_resolve_cli_session_key_uses_display_name_or_legacy_key() -> None:
     [
         "/exit",
         "/skills",
+        "/system-prompt",
         "/clear",
         "/rename 批量修改github仓库",
         "/commit_memory show",
@@ -355,6 +377,10 @@ def test_tui_command_palette_uses_claude_style_session_commands() -> None:
     )
     assert "/new" not in commands
     assert commands["/rename"] == ("Rename the current CLI session.", "edit")
+    assert commands["/system-prompt"] == (
+        "Show the current topic's rendered system rules.",
+        "submit",
+    )
     assert commands["/clear"] == ("Clear context and start an unnamed empty session.", "submit")
     assert commands["/resume"] == ("Switch to a saved CLI session.", "edit")
 
@@ -3246,7 +3272,9 @@ def test_fork_tui_command_palette_includes_cli_local_commands() -> None:
 
     commands = {item[0] for item in _tui_command_palette()}
 
-    assert {"/rename", "/clear", "/resume", "/todos", "/continue", "/commit_memory", "/exit"} <= commands
+    assert {
+        "/rename", "/system-prompt", "/clear", "/resume", "/todos", "/continue", "/commit_memory", "/exit"
+    } <= commands
 
 
 def test_fork_tui_command_palette_marks_argument_commands_for_edit() -> None:

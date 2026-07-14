@@ -1,6 +1,7 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
 import os
 import select
 import signal
@@ -235,6 +236,26 @@ def _tool_result_summary_from_events(tool_events: object) -> str | None:
 
 def _format_skills_command(skills_loader: Any) -> str:
     return skills_loader.format_listing()
+
+
+def _format_prompt_inspection(messages: list[dict[str, Any]]) -> str:
+    """Render the exact message list built for a local prompt inspection."""
+    parts = ["# 当前请求上下文（只读检查）"]
+    for index, message in enumerate(messages, start=1):
+        role = str(message.get("role", "unknown"))
+        if index == 1 and role == "system":
+            heading = "## System Prompt"
+        elif role == "user" and index == len(messages):
+            heading = "## 当前请求上下文（检查占位消息）"
+        else:
+            heading = f"## 历史消息 {index - 1}（{role}）"
+        content = message.get("content", "")
+        if isinstance(content, str):
+            rendered = content
+        else:
+            rendered = json.dumps(content, ensure_ascii=False, indent=2)
+        parts.append(f"{heading}\n\n{rendered}")
+    return "\n\n---\n\n".join(parts)
 
 
 def _format_topic_cache_size(size_bytes: int | None) -> str:
@@ -656,6 +677,7 @@ def _is_cli_local_command(text: str) -> bool:
     return (
         _is_exit_command(command)
         or command == "/skills"
+        or command == "/system-prompt"
         or command == "/clear"
         or command == "/rename"
         or command.startswith("/rename ")
@@ -970,6 +992,7 @@ def _tui_command_palette() -> list[tuple[str, str, str]]:
     ]
     items.extend([
         ("/rename", "Rename the current CLI session.", "edit"),
+        ("/system-prompt", "Show the current topic's rendered system rules.", "submit"),
         ("/clear", "Clear context and start an unnamed empty session.", "submit"),
         ("/resume", "Switch to a saved CLI session.", "edit"),
         ("/todos", "Show or clear the current topic todo list.", "submit"),
@@ -2509,6 +2532,53 @@ def agent(
                 # ── 话题管理命令 ──────────────────────────────────────────────
                 if text == "/skills":
                     tui.add_system(_format_skills_command(agent_loop.context.skills))
+                    return
+
+                if text == "/system-prompt":
+                    session = agent_loop.sessions.get_or_create(
+                        f"{cli_channel}:{topic_state['chat_id']}"
+                    )
+                    inspection_msg = InboundMessage(
+                        channel=cli_channel,
+                        sender_id="user",
+                        chat_id=topic_state["chat_id"],
+                        content="",
+                        metadata={"_prompt_inspection": True},
+                    )
+                    scope = agent_loop.workspace_scopes.for_message(
+                        inspection_msg, session.metadata
+                    )
+                    history = session.get_history(
+                        max_messages=agent_loop._max_messages,
+                        max_tokens=agent_loop._replay_token_budget(),
+                        extend_to_user=False,
+                    )
+                    pending_summary = None
+                    summary_meta = session.metadata.get("_last_summary")
+                    if isinstance(summary_meta, dict):
+                        from nanobot.agent.autocompact import AutoCompact
+
+                        pending_summary = AutoCompact._format_summary(
+                            str(summary_meta["text"]),
+                            datetime.fromisoformat(str(summary_meta["last_active"])),
+                        )
+                    messages = agent_loop.context.build_messages(
+                        history=history,
+                        current_message="",
+                        channel=cli_channel,
+                        chat_id=topic_state["chat_id"],
+                        sender_id="user",
+                        session_summary=pending_summary,
+                        session_metadata=session.metadata,
+                        learning_ctx=agent_loop._build_learning_ctx(session.key),
+                        todos=session.todos,
+                        workspace=scope.project_path,
+                        runtime_state=agent_loop,
+                        inbound_message=inspection_msg,
+                        session_key=session.key,
+                        unified_session=agent_loop._unified_session,
+                    )
+                    tui.add_system(_format_prompt_inspection(messages))
                     return
 
                 if text == "/clear":
