@@ -307,6 +307,9 @@ def test_cli_session_display_name_prefers_rename_and_marks_unnamed() -> None:
         {"key": "cli:session-a", "metadata": {"cli_unnamed": True}}, "cli"
     ) == "未命名会话"
     assert cli_commands._cli_session_display_name(
+        {"key": "cli:session-a", "title": "旧列表名称"}, "cli"
+    ) == "旧列表名称"
+    assert cli_commands._cli_session_display_name(
         {"key": "telegram:session-a", "metadata": {}}, "cli"
     ) is None
 

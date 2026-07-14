@@ -985,6 +985,10 @@ class SessionManager:
                                     "created_at": data.get("created_at") or fallback_time,
                                     "updated_at": data.get("updated_at") or fallback_time,
                                     "title": title,
+                                    # Consumers that need channel-specific display rules
+                                    # (such as CLI named/unnamed sessions) must receive the
+                                    # original metadata, not only the generic web title.
+                                    "metadata": metadata if isinstance(metadata, dict) else {},
                                     "preview": preview,
                                     "path": str(path),
                                     "transcript_path": str(self.transcripts.path_for(key)),
@@ -999,6 +1003,7 @@ class SessionManager:
                             "created_at": repaired.created_at.isoformat(),
                             "updated_at": repaired.updated_at.isoformat(),
                             "title": _metadata_title(repaired.metadata),
+                            "metadata": repaired.metadata,
                             "preview": next(
                                 (
                                     text

@@ -38,3 +38,20 @@ def test_list_sessions_repairs_corrupt_legacy_stem(tmp_path: Path, monkeypatch) 
     # actual legacy filename. The session is silently dropped.
     assert len(sessions) == 1, f"Expected 1 session, got {len(sessions)}"
     assert sessions[0]["key"] == "telegram:12345"
+    assert sessions[0]["metadata"] == {}
+
+
+def test_list_sessions_exposes_metadata_for_channel_specific_names(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "nanobot.session.manager.get_legacy_sessions_dir",
+        lambda: tmp_path / "legacy_sessions",
+    )
+    manager = SessionManager(tmp_path / "workspace")
+    session = manager.get_or_create("cli:session-a")
+    session.metadata["cli_title"] = "重构话题"
+    manager.save(session)
+
+    sessions = manager.list_sessions()
+
+    assert len(sessions) == 1
+    assert sessions[0]["metadata"] == {"cli_title": "重构话题"}

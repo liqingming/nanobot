@@ -936,6 +936,11 @@ def _cli_session_display_name(session_info: dict[str, Any], cli_channel: str) ->
             return title.strip()
         if metadata.get("cli_unnamed") is True:
             return _CLI_UNNAMED_SESSION_LABEL
+    # SessionManager also exposes its generic title as a flat list field. It is
+    # the fallback for older list entries that predate CLI-specific metadata.
+    title = session_info.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
     return key[len(prefix):]
 
 
