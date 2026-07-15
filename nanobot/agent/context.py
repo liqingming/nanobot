@@ -372,13 +372,14 @@ class ContextBuilder:
         user_content = self._build_user_content(current_message, media)
 
         reminder = ""
-        effective_pending = pending_summary or session_summary
-        if effective_pending and effective_pending.strip():
+        # ``session_summary`` is persistently included in the system prompt.
+        # Only a newly produced pending summary needs this one-shot reminder.
+        if pending_summary and pending_summary.strip():
             reminder = (
                 "<system-reminder>\n"
                 "Updated long-term memory (consolidated from earlier in this "
                 "conversation; not yet promoted to MEMORY.md):\n\n"
-                f"{effective_pending.strip()}\n"
+                f"{pending_summary.strip()}\n"
                 "</system-reminder>"
             )
         skill_hint = self._build_skill_match_reminder(current_message)

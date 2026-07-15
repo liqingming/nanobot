@@ -186,6 +186,35 @@ class TestConsolidatorTokenBudget:
         await consolidator.maybe_consolidate_by_tokens(session)
         consolidator.archive.assert_not_called()
 
+    async def test_completed_goal_archives_one_segment_below_high_water_mark(self, consolidator):
+        consolidator._SAFETY_BUFFER = 0
+        session = Session(key="test:completed-goal")
+        for index in range(3):
+            session.add_message("user", f"u{index}")
+            session.add_message("assistant", f"a{index}")
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(600, "test"))
+        consolidator.archive = AsyncMock(return_value="completed task summary")
+
+        await consolidator.maybe_consolidate_by_tokens(session, completed_goal=True)
+
+        assert consolidator.archive.await_count == 1
+        assert session.metadata.get("_completed_goal_needs_compaction") is None
+
+    async def test_completed_goal_below_target_keeps_history(self, consolidator):
+        consolidator._SAFETY_BUFFER = 0
+        session = Session(key="test:completed-goal-small")
+        session.add_message("user", "u")
+        session.add_message("assistant", "a")
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(400, "test"))
+        consolidator.archive = AsyncMock(return_value="summary")
+
+        await consolidator.maybe_consolidate_by_tokens(session, completed_goal=True)
+
+        consolidator.archive.assert_not_awaited()
+        assert session.metadata.get("_completed_goal_needs_compaction") is None
+
     async def test_background_probe_reuses_safe_exact_estimate(self, consolidator):
         consolidator.context_window_tokens = 10_000
         consolidator.max_completion_tokens = 1

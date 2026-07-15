@@ -793,6 +793,7 @@ class Consolidator:
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
         consolidation_ratio: float = 0.5,
+        consolidation_trigger_ratio: float = 0.7,
         unified_session: bool = False,
     ):
         self.store = store
@@ -802,6 +803,7 @@ class Consolidator:
         self.context_window_tokens = context_window_tokens
         self.max_completion_tokens = max_completion_tokens
         self.consolidation_ratio = consolidation_ratio
+        self.consolidation_trigger_ratio = max(consolidation_ratio, consolidation_trigger_ratio)
         self.unified_session = unified_session
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
@@ -1053,6 +1055,7 @@ class Consolidator:
         *,
         replay_max_messages: int | None = None,
         background: bool = False,
+        completed_goal: bool = False,
     ) -> None:
         """Loop: archive old messages until prompt fits within safe budget.
 
@@ -1073,6 +1076,7 @@ class Consolidator:
 
             budget = self._input_token_budget
             target = int(budget * self.consolidation_ratio)
+            trigger = int(budget * self.consolidation_trigger_ratio)
             last_summary = await self._consolidate_replay_overflow(
                 session,
                 replay_max_messages,
@@ -1109,13 +1113,14 @@ class Consolidator:
             if estimated <= 0:
                 self._persist_last_summary(session, last_summary)
                 return
-            if estimated < budget:
+            if estimated < trigger and not completed_goal:
                 unconsolidated_count = len(session.messages) - session.last_consolidated
                 logger.debug(
-                    "Token consolidation idle {}: {}/{} via {}, msgs={}",
+                    "Token consolidation idle {}: {}/{} trigger={} via {}, msgs={}",
                     session.key,
                     estimated,
                     self.context_window_tokens,
+                    trigger,
                     source,
                     unconsolidated_count,
                 )
@@ -1123,7 +1128,10 @@ class Consolidator:
                 return
 
             for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
-                if estimated <= target:
+                # A completed goal may archive one finished task segment even
+                # below the normal high-water mark, but never cascades through
+                # multiple older tasks in the same pass.
+                if estimated <= target or (completed_goal and round_num > 0):
                     break
 
                 boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
@@ -1188,6 +1196,9 @@ class Consolidator:
             # into the runtime context on the next prepare_session() call, aligning
             # the summary injection strategy with AutoCompact._archive().
             self._persist_last_summary(session, last_summary)
+            if completed_goal:
+                session.metadata.pop("_completed_goal_needs_compaction", None)
+                self.sessions.save(session)
 
     async def compact_idle_session(
         self,

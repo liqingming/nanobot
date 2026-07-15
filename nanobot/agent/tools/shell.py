@@ -323,6 +323,13 @@ class ExecTool(Tool):
         if isinstance(policy, dict) and policy.get("disable_exec") is True:
             return ToolResult.error("Error: exec is blocked by the request tool_policy.")
         command = command or cmd
+        if isinstance(policy, dict) and command:
+            for pattern in policy.get("blocked_exec_patterns") or []:
+                try:
+                    if re.search(str(pattern), command, re.IGNORECASE):
+                        return ToolResult.error("Error: command is blocked by the request tool_policy.")
+                except re.error:
+                    return ToolResult.error("Error: request tool_policy contains an invalid blocked_exec_patterns regex.")
         working_dir = working_dir or workdir
         if not command:
             return ToolResult.error("Error: Missing command. Provide command or cmd.")

@@ -75,6 +75,7 @@ async def test_complete_goal_closes_active_goal(tmp_path):
     blob = sess.metadata.get(GOAL_STATE_KEY)
     assert blob["status"] == "completed"
     assert blob["recap"] == "Done."
+    assert sess.metadata["_completed_goal_needs_compaction"] is True
 
 
 @pytest.mark.asyncio

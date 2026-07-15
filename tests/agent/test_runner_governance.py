@@ -60,6 +60,34 @@ def _make_loop(tmp_path):
     return loop
 
 
+async def test_runner_logs_context_governance_metrics():
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="done", tool_calls=[]))
+    tools = MagicMock()
+    tools.get_definitions.return_value = [{"type": "function", "name": "read_file"}]
+    events: list[tuple[str, dict]] = []
+
+    await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "request"},
+        ],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        event_logger=lambda event, fields: events.append((event, fields)),
+    ))
+
+    fields = [fields for event, fields in events if event == "runner.context.governance"][-1]
+    assert fields["before"]["total"] >= fields["after"]["total"]
+    assert fields["before"]["system"] > 0
+    assert fields["before"]["tool_definitions"] > 0
+    assert fields["compacted_tool_results"] == 0
+
+
 async def test_runner_uses_raw_messages_when_context_governance_fails():
     from nanobot.agent.runner import AgentRunner
 

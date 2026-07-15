@@ -183,6 +183,20 @@ async def test_exec_rejects_request_with_disable_exec_policy(tmp_path: Path) -> 
     assert "exec is blocked by the request tool_policy" in str(result)
 
 
+@pytest.mark.asyncio
+async def test_exec_rejects_request_blocked_command_pattern(tmp_path: Path) -> None:
+    tool = ExecTool(working_dir=str(tmp_path))
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="default", session_key="api:repair",
+        metadata={"tool_policy": {"blocked_exec_patterns": [r"\bgit\s+commit\b"]}},
+    ))
+    try:
+        result = await tool.execute(command="git commit -m test", shell="cmd")
+    finally:
+        reset_request_context(token)
+    assert "command is blocked by the request tool_policy" in str(result)
+
+
 async def test_grep_allows_explicit_leaf_module_despite_blocked_parent(tmp_path: Path) -> None:
     module = tmp_path / "Assets" / "Script" / "Game" / "moduls" / "DragonInvadeActivity"
     module.mkdir(parents=True)

@@ -243,6 +243,9 @@ class CompleteGoalTool(Tool, _GoalToolsMixin):
             "recap": (recap or "").strip(),
         }
         discard_legacy_goal_state_key(sess.metadata)
+        # Defer one conservative archive to the next real user turn so this
+        # turn's final answer remains in the retained recent context.
+        sess.metadata["_completed_goal_needs_compaction"] = True
         self._sessions.save(sess)
         await self._publish_goal_state_changed(sess.metadata)
         tail = (recap or "").strip()

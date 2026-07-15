@@ -290,6 +290,11 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             if not isinstance(requested_tool_policy["disable_exec"], bool):
                 return _error_json(400, "tool_policy.disable_exec must be a boolean")
             normalized_policy["disable_exec"] = requested_tool_policy["disable_exec"]
+        blocked_exec_patterns = requested_tool_policy.get("blocked_exec_patterns")
+        if blocked_exec_patterns is not None:
+            if not isinstance(blocked_exec_patterns, list) or not all(isinstance(pattern, str) for pattern in blocked_exec_patterns):
+                return _error_json(400, "tool_policy.blocked_exec_patterns must be an array of strings")
+            normalized_policy["blocked_exec_patterns"] = list(blocked_exec_patterns)
         metadata["tool_policy"] = normalized_policy
     if session_id and str(session_id).startswith("review_"):
         metadata["review_session"] = True

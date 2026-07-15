@@ -401,10 +401,23 @@ class AgentRunner:
                     if adaptive_context_block_limit is not None
                     else governance_config
                 )
+                tools_for_model = active_governance_config.tools.get_definitions()
+                before_context = self.context_governor.context_metrics(messages, tools_for_model)
                 messages_for_model = self.context_governor.prepare_for_model(
                     active_governance_config,
                     messages,
                     compacted_tool_call_ids,
+                )
+                after_context = self.context_governor.context_metrics(
+                    messages_for_model, tools_for_model
+                )
+                self._log_event(
+                    spec,
+                    "runner.context.governance",
+                    iteration=iteration,
+                    before=before_context,
+                    after=after_context,
+                    compacted_tool_results=len(compacted_tool_call_ids),
                 )
             except Exception:
                 logger.exception(

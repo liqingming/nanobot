@@ -80,6 +80,22 @@ class ContextGovernanceConfig:
 class ContextGovernor:
     """Prepare model-copy messages while preserving persisted history."""
 
+    @staticmethod
+    def context_metrics(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, int]:
+        """Return cheap, comparable token estimates grouped by prompt component."""
+        groups = {"system": 0, "history": 0, "tool_results": 0}
+        for message in messages:
+            tokens = estimate_message_tokens(message)
+            if message.get("role") == "system":
+                groups["system"] += tokens
+            elif message.get("role") == "tool":
+                groups["tool_results"] += tokens
+            else:
+                groups["history"] += tokens
+        groups["tool_definitions"] = estimate_message_tokens({"content": str(tools)})
+        groups["total"] = sum(groups.values())
+        return groups
+
     def prepare_for_model(
         self,
         config: ContextGovernanceConfig,

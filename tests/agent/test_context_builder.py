@@ -464,6 +464,20 @@ class TestBuildSystemPrompt:
 
 
 class TestBuildMessages:
+    def test_session_summary_is_not_repeated_as_user_reminder(self, tmp_path):
+        builder = _builder(tmp_path)
+        messages = builder.build_messages([], "hello", session_summary="Archived summary")
+
+        assert messages[0]["content"].count("Archived summary") == 1
+        assert "Archived summary" not in messages[-1]["content"]
+
+    def test_pending_summary_is_injected_as_user_reminder(self, tmp_path):
+        builder = _builder(tmp_path)
+        messages = builder.build_messages([], "hello", pending_summary="Fresh summary")
+
+        assert "Fresh summary" in messages[-1]["content"]
+        assert "Fresh summary" not in messages[0]["content"]
+
     def test_basic_empty_history(self, tmp_path):
         builder = _builder(tmp_path)
         messages = builder.build_messages([], "hello")

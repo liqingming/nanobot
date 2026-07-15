@@ -236,6 +236,7 @@ class AgentLoop:
         timezone: str | None = None,
         session_ttl_minutes: int = 0,
         consolidation_ratio: float = 0.5,
+        consolidation_trigger_ratio: float = 0.7,
         hooks: list[AgentHook] | None = None,
         enable_learning: bool = True,
         nudge_after_empty_tools_message: str | None = None,
@@ -408,6 +409,7 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
+            consolidation_trigger_ratio=consolidation_trigger_ratio,
             unified_session=unified_session,
         )
         self.auto_compact = AutoCompact(
@@ -482,6 +484,7 @@ class AgentLoop:
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
+            consolidation_trigger_ratio=defaults.consolidation_trigger_ratio,
             tools_config=config.tools,
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
@@ -1959,6 +1962,7 @@ class AgentLoop:
             await self.consolidator.maybe_consolidate_by_tokens(
                 ctx.session,
                 replay_max_messages=self._max_messages,
+                completed_goal=bool(ctx.session.metadata.get("_completed_goal_needs_compaction")),
             )
         self._set_tool_context(
             ctx.msg.channel,

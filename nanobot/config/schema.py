@@ -170,6 +170,13 @@ class AgentDefaults(Base):
         validation_alias=AliasChoices("consolidationRatio"),
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
+    consolidation_trigger_ratio: float = Field(
+        default=0.7,
+        ge=0.2,
+        le=0.95,
+        validation_alias=AliasChoices("consolidationTriggerRatio"),
+        serialization_alias="consolidationTriggerRatio",
+    )  # Start preventive consolidation before the hard input budget is exhausted.
     dream: DreamConfig = Field(default_factory=DreamConfig)
     # ── fork additions ────────────────────────────────────────────────
     enable_learning: bool = True  # self-learning: TurnSummary injection, memory consolidation, search_history tool

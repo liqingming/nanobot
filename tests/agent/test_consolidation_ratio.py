@@ -18,6 +18,7 @@ def _make_loop(
     estimated_tokens: int = 0,
     context_window_tokens: int = 200,
     consolidation_ratio: float = 0.5,
+    consolidation_trigger_ratio: float = 0.7,
 ) -> AgentLoop:
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
@@ -34,6 +35,7 @@ def _make_loop(
         model="test-model",
         context_window_tokens=context_window_tokens,
         consolidation_ratio=consolidation_ratio,
+        consolidation_trigger_ratio=consolidation_trigger_ratio,
     )
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop.consolidator._SAFETY_BUFFER = 0
@@ -89,15 +91,41 @@ async def test_consolidation_ratio_controls_target(
     assert loop.consolidator.archive.await_count == expected_archives
 
 
+@pytest.mark.asyncio
+async def test_consolidation_starts_at_preventive_high_water_mark(tmp_path, monkeypatch) -> None:
+    loop = _make_loop(
+        tmp_path,
+        context_window_tokens=1_000,
+        consolidation_ratio=0.5,
+        consolidation_trigger_ratio=0.7,
+    )
+    loop.consolidator._SAFETY_BUFFER = 0
+    loop.consolidator.archive = AsyncMock(return_value="summary")  # type: ignore[method-assign]
+    session = _session_with_turns(loop, turns=4)
+    estimates = iter([(750, "test"), (450, "test")])
+    loop.consolidator.estimate_session_prompt_tokens = lambda _session: next(estimates)  # type: ignore[method-assign]
+    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 100)
+
+    await loop.consolidator.maybe_consolidate_by_tokens(session)
+
+    assert loop.consolidator.archive.await_count == 1
+
+
 def test_ratio_propagated_from_config_schema() -> None:
     defaults = AgentDefaults()
     assert defaults.consolidation_ratio == 0.5
+    assert defaults.consolidation_trigger_ratio == 0.7
 
-    defaults = AgentDefaults.model_validate({"consolidationRatio": 0.3})
+    defaults = AgentDefaults.model_validate({
+        "consolidationRatio": 0.3,
+        "consolidationTriggerRatio": 0.6,
+    })
     assert defaults.consolidation_ratio == 0.3
+    assert defaults.consolidation_trigger_ratio == 0.6
 
     dumped = defaults.model_dump(by_alias=True)
     assert dumped["consolidationRatio"] == 0.3
+    assert dumped["consolidationTriggerRatio"] == 0.6
 
 
 def test_ratio_validation_rejects_out_of_range() -> None:
