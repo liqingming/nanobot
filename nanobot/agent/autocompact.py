@@ -87,7 +87,7 @@ class AutoCompact:
             )
             if summary and summary != "(nothing)":
                 session = self.sessions.get_or_create(key)
-                meta = session.metadata.get("_last_summary")
+                meta = session.metadata.get("_continuation_summary") or session.metadata.get("_last_summary")
                 if isinstance(meta, dict):
                     self._summaries[key] = (
                         meta["text"],
@@ -111,7 +111,7 @@ class AutoCompact:
         if entry:
             return session, self._format_summary(entry[0], entry[1])
         # Cold path: summary persisted in session metadata (process restarted).
-        meta = session.metadata.get("_last_summary")
+        meta = session.metadata.get("_continuation_summary") or session.metadata.get("_last_summary")
         if isinstance(meta, dict):
             return session, self._format_summary(meta["text"], datetime.fromisoformat(meta["last_active"]))
         return session, None

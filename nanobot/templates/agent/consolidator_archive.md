@@ -1,24 +1,25 @@
-Extract key facts from this conversation. For each fact, annotate its memory attributes.
+Summarize an archived conversation segment into two separate products.
 
-Only SNIP facts deserve a non-[skip] mark:
-- Signal: would the user need to repeat this if forgotten?
-- Novel: not just a restatement of another fact in this same conversation chunk
-- Important: prevents rework or captures preferences / rules
-- Persistent: still relevant after 2 weeks
+Output exactly these two XML-like sections, with concise bullets only and no preamble:
 
-Output one fact per line in this format:
-- [mark] fact content
+<continuation>
+- Current objective, completed work, verified facts, relevant changed files, unresolved work or blockers, user constraints, and the next safe action.
+</continuation>
+<memory-candidates>
+- [permanent|durable|ephemeral|correction] only facts useful to long-term memory or later Dream consolidation.
+</memory-candidates>
 
-Marks (choose the best match):
-- [permanent] Core preferences, personal traits, habits — never becomes stale
-- [durable] Technical discoveries, project knowledge, config details — valid for months
-- [ephemeral] Active task state, temporary decisions — may change in weeks
-- [correction] Correction to a previous memory — state what changed
-- [skip] Does not meet SNIP criteria, is conversational filler, is code/source facts derivable from the repo, or is only useful as an audit breadcrumb
+Continuation rules:
+- It is for the next 1–10 turns of this same session, not a permanent memory.
+- If an existing continuation summary is supplied, replace stale state and merge still-active facts; never merely append it.
+- Preserve decisions and negative constraints that prevent repeated investigation or unauthorized changes.
+- Keep only conclusions with necessary paths, commands, or evidence; do not copy raw logs or verbose tool output.
+- If there is no active work state, output `(nothing)` inside this section.
 
-Priority: user corrections and preferences > solutions > decisions > events > environment facts. The most valuable memory prevents the user from having to repeat themselves.
+Memory-candidate rules:
+- Include only SNIP facts: Signal (the user would repeat it if forgotten), Novel, Important, and Persistent (relevant after two weeks).
+- Prefer user corrections and preferences over solutions, decisions, events, and environment facts.
+- Do not include repository-derived code facts, conversational filler, audit breadcrumbs, or skip-tagged entries.
+- If there are no candidates, output `(nothing)` inside this section.
 
-Do not mark something [skip] merely because it might already exist in long-term memory; Dream handles cross-file deduplication later.
-
-Output concise bullet points only. No preamble, no commentary.
-If nothing noteworthy happened, output: (nothing)
+Tool records identify their tool name and arguments. Treat successful tests and reads as evidence, but report only their useful conclusion.

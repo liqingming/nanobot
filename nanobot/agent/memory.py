@@ -15,12 +15,9 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from loguru import logger
 
-from nanobot.utils.atomic_write import replace_file_with_retry
-
-from nanobot.agent.runner import AgentRunner, AgentRunSpec
-from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import provider_input_token_budget
 from nanobot.session.manager import Session
+from nanobot.utils.atomic_write import replace_file_with_retry
 from nanobot.utils.gitstore import GitStore
 from nanobot.utils.helpers import (
     ensure_dir,
@@ -684,14 +681,26 @@ class MemoryStore:
 
     @staticmethod
     def _format_messages(messages: list[dict]) -> str:
+        """Render archived messages with enough tool provenance for reliable summaries."""
         lines = []
         for message in messages:
-            if not message.get("content"):
-                continue
-            tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
-            lines.append(
-                f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
-            )
+            timestamp = message.get("timestamp", "?")[:16]
+            role = str(message.get("role") or "unknown").upper()
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                calls = []
+                for call in tool_calls:
+                    function = call.get("function", {}) if isinstance(call, dict) else {}
+                    calls.append(f"{function.get('name', 'tool')}({function.get('arguments', '')})")
+                lines.append(f"[{timestamp}] {role} TOOL_CALLS: {'; '.join(calls)}")
+            content = message.get("content")
+            if content:
+                if message.get("role") == "tool":
+                    name = message.get("name") or "tool"
+                    lines.append(f"[{timestamp}] TOOL {name}: {content}")
+                else:
+                    tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+                    lines.append(f"[{timestamp}] {role}{tools}: {content}")
         return "\n".join(lines)
 
     def raw_archive(
@@ -770,7 +779,12 @@ class MemoryStore:
 # _HISTORY_ENTRY_HARD_CAP at append_history() is a belt-and-suspenders default
 # that catches any new caller that forgot to set its own cap.
 _RAW_ARCHIVE_MAX_CHARS = 16_000       # fallback dump (LLM failed)
-_ARCHIVE_SUMMARY_MAX_CHARS = 8_000    # LLM-produced consolidation summary
+_ARCHIVE_SUMMARY_MAX_CHARS = 8_000    # LLM-produced long-term candidates
+_CONTINUATION_SUMMARY_MAX_CHARS = 8_000
+_CONTINUATION_OPEN = "<continuation>"
+_CONTINUATION_CLOSE = "</continuation>"
+_CANDIDATES_OPEN = "<memory-candidates>"
+_CANDIDATES_CLOSE = "</memory-candidates>"
 _DREAM_PROMPT_MAX_CHARS = 32_000      # workspace-local Dream prompt override
 _HISTORY_ENTRY_HARD_CAP = 64_000      # emergency cap in append_history
 
@@ -917,17 +931,35 @@ class Consolidator:
             len(chunk),
             replay_max_messages,
         )
-        summary = await self.archive(chunk, session_key=session.key)
+        summary = await self.archive(
+            chunk,
+            session_key=session.key,
+            prior_continuation=self._summary_text(session.metadata),
+        )
         session.last_consolidated = end_idx
         self.sessions.save(session)
         return summary
 
+    @staticmethod
+    def _summary_text(metadata: dict[str, Any]) -> str | None:
+        """Read the new continuation summary, with a one-release legacy fallback."""
+        for key in ("_continuation_summary", "_last_summary"):
+            value = metadata.get(key)
+            text = value.get("text") if isinstance(value, dict) else value
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+        return None
+
     def _persist_last_summary(self, session: Session, summary: str | None) -> None:
-        if summary and summary != "(nothing)":
-            session.metadata["_last_summary"] = {
-                "text": summary,
+        if isinstance(summary, str) and summary and summary != "(nothing)":
+            entry = {
+                "text": truncate_text(summary, _CONTINUATION_SUMMARY_MAX_CHARS),
                 "last_active": session.updated_at.isoformat(),
             }
+            session.metadata["_continuation_summary"] = entry
+            # Compatibility mirror for existing sessions and third-party
+            # consumers; prompt construction always prefers the new key.
+            session.metadata["_last_summary"] = entry
             self.sessions.save(session)
 
     def estimate_session_prompt_tokens(
@@ -938,8 +970,7 @@ class Consolidator:
         history = self._full_unconsolidated_history(session)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
         # Include archived summary in estimation so the budget accounts for it.
-        meta = session.metadata.get("_last_summary")
-        summary = meta.get("text") if isinstance(meta, dict) else (meta if isinstance(meta, str) else None)
+        summary = self._summary_text(session.metadata)
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
@@ -975,12 +1006,23 @@ class Consolidator:
             return truncate_text(text, _RAW_ARCHIVE_MAX_CHARS)
         return truncate_text_to_tokens(text, budget)
 
+    @staticmethod
+    def _extract_section(text: str, opening: str, closing: str) -> str:
+        start = text.find(opening)
+        if start < 0:
+            return ""
+        end = text.find(closing, start + len(opening))
+        if end < 0:
+            return ""
+        return text[start + len(opening):end].strip()
+
     async def archive(
         self,
         messages: list[dict],
         *,
         session_key: str | None = None,
         summary_messages: list[dict] | None = None,
+        prior_continuation: str | None = None,
     ) -> str | None:
         """Summarize messages via LLM and append to history.jsonl.
 
@@ -996,6 +1038,15 @@ class Consolidator:
         messages_to_summarize = summary_messages if summary_messages is not None else messages
         try:
             formatted = MemoryStore._format_messages(messages_to_summarize)
+            if prior_continuation:
+                formatted = (
+                    "<existing-continuation>\n"
+                    f"{truncate_text(prior_continuation, _CONTINUATION_SUMMARY_MAX_CHARS)}\n"
+                    "</existing-continuation>\n\n"
+                    "<archived-messages>\n"
+                    f"{formatted}\n"
+                    "</archived-messages>"
+                )
             formatted = self._truncate_to_token_budget(formatted)
             response = await self.provider.chat_with_retry(
                 model=self.model,
@@ -1014,13 +1065,34 @@ class Consolidator:
             )
             if response.finish_reason == "error":
                 raise RuntimeError(f"LLM returned error: {response.content}")
-            summary = response.content or "[no summary]"
-            self.store.append_history(
-                summary,
-                max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
-                session_key=session_key,
+            response_text = response.content or ""
+            continuation = self._extract_section(
+                response_text, _CONTINUATION_OPEN, _CONTINUATION_CLOSE
             )
-            return summary
+            candidates = self._extract_section(
+                response_text, _CANDIDATES_OPEN, _CANDIDATES_CLOSE
+            )
+            # Accept old summarizers during a rolling upgrade, but never inject
+            # their unstructured output into the long-term history candidate stream.
+            if not continuation and response_text.strip():
+                continuation = response_text.strip()
+            if candidates and candidates != "(nothing)":
+                self.store.append_history(
+                    candidates,
+                    max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
+                    session_key=session_key,
+                )
+            elif response_text.strip():
+                # Rolling-upgrade fallback: an older prompt/model may return a
+                # legacy unstructured summary. Archive it rather than silently
+                # dropping durable evidence; new structured output never takes
+                # this branch.
+                self.store.append_history(
+                    response_text,
+                    max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
+                    session_key=session_key,
+                )
+            return continuation or "(nothing)"
         except Exception:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
             self.store.raw_archive(messages, session_key=session_key)
@@ -1080,7 +1152,7 @@ class Consolidator:
             last_summary = await self._consolidate_replay_overflow(
                 session,
                 replay_max_messages,
-            )
+            ) or self._summary_text(session.metadata)
             estimated: int | None = (
                 self._background_probe_upper_bound(session, budget) if background else None
             )
@@ -1158,7 +1230,11 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                summary = await self.archive(chunk, session_key=session.key)
+                summary = await self.archive(
+                    chunk,
+                    session_key=session.key,
+                    prior_continuation=last_summary,
+                )
                 # Advance the cursor either way: on success the chunk was
                 # summarized; on failure archive() already raw-archived it as
                 # a breadcrumb. Re-archiving the same chunk on the next call
@@ -1247,13 +1323,16 @@ class Consolidator:
                     messages_to_remove,
                     session_key=session_key,
                     summary_messages=messages_to_summarize,
+                    prior_continuation=self._summary_text(session.metadata),
                 )
 
-            if summary and summary != "(nothing)":
-                session.metadata["_last_summary"] = {
-                    "text": summary,
+            if isinstance(summary, str) and summary and summary != "(nothing)":
+                entry = {
+                    "text": truncate_text(summary, _CONTINUATION_SUMMARY_MAX_CHARS),
                     "last_active": last_active.isoformat(),
                 }
+                session.metadata["_continuation_summary"] = entry
+                session.metadata["_last_summary"] = entry
 
             session.messages = messages_to_keep
             session.last_consolidated = 0

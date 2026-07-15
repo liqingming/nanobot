@@ -65,16 +65,20 @@ class TestConsolidatorSummarize:
     async def test_summarize_appends_to_history(self, consolidator, mock_provider, store):
         """Consolidator should call LLM to summarize, then append to HISTORY.md."""
         mock_provider.chat_with_retry.return_value = MagicMock(
-            content="User fixed a bug in the auth module."
+            content=(
+                "<continuation>\n- Auth bug fixed.\n</continuation>\n"
+                "<memory-candidates>\n- [durable] Auth race condition fixed.\n</memory-candidates>"
+            )
         )
         messages = [
             {"role": "user", "content": "fix the auth bug"},
             {"role": "assistant", "content": "Done, fixed the race condition."},
         ]
         result = await consolidator.archive(messages)
-        assert result == "User fixed a bug in the auth module."
+        assert result == "- Auth bug fixed."
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
+        assert entries[0]["content"] == "- [durable] Auth race condition fixed."
 
     async def test_summarize_appends_session_key_to_history(
         self,
@@ -123,14 +127,13 @@ class TestConsolidatorSummarize:
 
 
 class TestConsolidatorPromptContract:
-    def test_archive_prompt_outputs_attribute_tags_without_missing_context_claims(self):
+    def test_archive_prompt_separates_continuation_from_memory_candidates(self):
         prompt = render_template("agent/consolidator_archive.md", strip=True)
 
-        assert "SNIP" in prompt
-        for mark in ("[permanent]", "[durable]", "[ephemeral]", "[correction]", "[skip]"):
-            assert mark in prompt
-        assert "check context below" not in prompt.lower()
-        assert "Do not mark something [skip] merely because it might already exist" in prompt
+        assert "<continuation>" in prompt
+        assert "<memory-candidates>" in prompt
+        assert "existing continuation" in prompt.lower()
+        assert "[skip]" not in prompt
 
 
 class TestConsolidatorArchiveErrorHandling:
@@ -159,7 +162,10 @@ class TestConsolidatorArchiveErrorHandling:
     async def test_archive_preserves_summary_on_success(self, consolidator, mock_provider, store):
         """Normal LLM response should still produce a proper summary entry."""
         mock_provider.chat_with_retry.return_value = MagicMock(
-            content="User fixed a bug in the auth module.",
+            content=(
+                "<continuation>\n- Auth bug fixed.\n</continuation>\n"
+                "<memory-candidates>\n- [durable] Auth race condition fixed.\n</memory-candidates>"
+            ),
             finish_reason="stop",
         )
         messages = [
@@ -167,10 +173,32 @@ class TestConsolidatorArchiveErrorHandling:
             {"role": "assistant", "content": "Done."},
         ]
         result = await consolidator.archive(messages)
-        assert result == "User fixed a bug in the auth module."
+        assert result == "- Auth bug fixed."
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
         assert "[RAW]" not in entries[0]["content"]
+
+    async def test_archive_merges_prior_continuation_and_separates_history(self, consolidator, mock_provider, store):
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content=(
+                "<continuation>\n- Current task: verify migration.\n</continuation>\n"
+                "<memory-candidates>\n- [durable] Migration uses schema v2.\n</memory-candidates>"
+            ),
+            finish_reason="stop",
+        )
+
+        result = await consolidator.archive(
+            [{"role": "tool", "name": "pytest", "content": "1 passed"}],
+            prior_continuation="- Old task: migration started.",
+        )
+
+        request = mock_provider.chat_with_retry.await_args.kwargs["messages"][-1]["content"]
+        assert "<existing-continuation>" in request
+        assert "TOOL pytest: 1 passed" in request
+        assert result == "- Current task: verify migration."
+        assert store.read_unprocessed_history(since_cursor=0)[0]["content"] == (
+            "- [durable] Migration uses schema v2."
+        )
 
 
 class TestConsolidatorTokenBudget:
