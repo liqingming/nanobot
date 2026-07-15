@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator
@@ -81,8 +82,18 @@ def _tool_arguments_source(*values: Any) -> Any:
     return "{}"
 
 
-async def iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], None]:
-    """Yield parsed JSON events from a Responses API SSE stream."""
+async def iter_sse(
+    response: httpx.Response,
+    *,
+    first_line_timeout_s: float | None = None,
+    idle_timeout_s: float | None = None,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Yield parsed JSON events from a Responses API SSE stream.
+
+    Optional timeouts distinguish the initial response wait from gaps after the
+    stream has begun. Callers that omit both preserve the response client's
+    native timeout behavior.
+    """
     buffer: list[str] = []
 
     def _flush() -> dict[str, Any] | None:
@@ -99,11 +110,20 @@ async def iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], N
             logger.warning("Failed to parse SSE event JSON: {}", data[:200])
             return None
 
-    async for line in response.aiter_lines():
+    lines = response.aiter_lines().__aiter__()
+    first_event = True
+    while True:
+        timeout_s = first_line_timeout_s if first_event else idle_timeout_s
+        try:
+            next_line = anext(lines)
+            line = await asyncio.wait_for(next_line, timeout_s) if timeout_s is not None else await next_line
+        except StopAsyncIteration:
+            break
         if line == "":
             if buffer:
                 event = _flush()
                 if event is not None:
+                    first_event = False
                     yield event
             continue
         buffer.append(line)
@@ -134,6 +154,9 @@ async def consume_sse_with_reasoning(
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+    *,
+    first_line_timeout_s: float | None = None,
+    idle_timeout_s: float | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
     """Consume a Responses API SSE stream, including visible reasoning summaries."""
     content = ""
@@ -145,7 +168,11 @@ async def consume_sse_with_reasoning(
     reasoning_content: str | None = None
     streamed_reasoning = False
 
-    async for event in iter_sse(response):
+    async for event in iter_sse(
+        response,
+        first_line_timeout_s=first_line_timeout_s,
+        idle_timeout_s=idle_timeout_s,
+    ):
         event_type = event.get("type")
         if event_type == "response.output_item.added":
             item = event.get("item") or {}

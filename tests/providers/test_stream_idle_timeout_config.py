@@ -124,12 +124,12 @@ async def test_bedrock_stream_ignores_invalid_idle_timeout_env(monkeypatch) -> N
 async def test_codex_stream_ignores_invalid_idle_timeout_env(monkeypatch) -> None:
     monkeypatch.setenv("NANOBOT_STREAM_IDLE_TIMEOUT_S", "abc")
     original_client = httpx.AsyncClient
-    seen: dict[str, float] = {}
+    seen: dict[str, httpx.Timeout] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, request=request)
 
-    def fake_client(*, timeout: float, verify: bool) -> httpx.AsyncClient:
+    def fake_client(*, timeout: httpx.Timeout, verify: bool) -> httpx.AsyncClient:
         seen["timeout"] = timeout
         return original_client(transport=httpx.MockTransport(handler), timeout=timeout)
 
@@ -142,4 +142,7 @@ async def test_codex_stream_ignores_invalid_idle_timeout_env(monkeypatch) -> Non
         verify=True,
     )
 
-    assert seen["timeout"] == DEFAULT_STREAM_IDLE_TIMEOUT_S
+    assert seen["timeout"].connect == DEFAULT_STREAM_IDLE_TIMEOUT_S
+    assert seen["timeout"].read == 180
+    assert seen["timeout"].write == DEFAULT_STREAM_IDLE_TIMEOUT_S
+    assert seen["timeout"].pool == DEFAULT_STREAM_IDLE_TIMEOUT_S

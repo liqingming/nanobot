@@ -11,6 +11,7 @@ from loguru import logger
 
 import nanobot.providers.base as provider_base
 from nanobot.providers.openai_codex_provider import (
+    DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_S,
     OpenAICodexProvider,
     _build_reasoning_options,
     _codex_error_response,
@@ -18,6 +19,7 @@ from nanobot.providers.openai_codex_provider import (
     _friendly_error,
     _request_codex,
     _should_retry_status,
+    resolve_codex_first_event_timeout_s,
 )
 from nanobot.providers.openai_responses.parsing import ResponsesAPIError
 
@@ -47,6 +49,14 @@ def _capture_codex_warnings(monkeypatch: pytest.MonkeyPatch) -> _WarningCaptureL
     capture = _WarningCaptureLogger()
     monkeypatch.setattr("nanobot.providers.openai_codex_provider.logger", capture)
     return capture
+
+
+def test_codex_first_event_timeout_parser_defaults_and_bounds() -> None:
+    assert resolve_codex_first_event_timeout_s(env_value=None) == DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_S
+    assert resolve_codex_first_event_timeout_s(env_value="240") == 240
+    assert resolve_codex_first_event_timeout_s(env_value="0") == DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_S
+    assert resolve_codex_first_event_timeout_s(env_value="bad") == DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_S
+    assert resolve_codex_first_event_timeout_s(env_value="7200") == 3600
 
 
 def test_codex_blank_timeout_root_cause_reproduction() -> None:
@@ -84,11 +94,14 @@ async def test_codex_request_non_200_populates_http_metadata(monkeypatch) -> Non
 
     def fake_client(
         *,
-        timeout: int,
+        timeout: httpx.Timeout,
         verify: bool,
         **_kwargs: object,
     ) -> httpx.AsyncClient:
-        assert timeout == 90
+        assert timeout.connect == 90
+        assert timeout.read == 180
+        assert timeout.write == 90
+        assert timeout.pool == 90
         assert verify is True
         return original_client(transport=httpx.MockTransport(handler), timeout=timeout)
 
@@ -111,14 +124,14 @@ async def test_codex_request_honors_stream_idle_timeout_env(monkeypatch) -> None
     """NANOBOT_STREAM_IDLE_TIMEOUT_S overrides the default Codex stream timeout."""
     monkeypatch.setenv("NANOBOT_STREAM_IDLE_TIMEOUT_S", "5")
     original_client = httpx.AsyncClient
-    seen: dict[str, int] = {}
+    seen: dict[str, httpx.Timeout] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, request=request)
 
     def fake_client(
         *,
-        timeout: int,
+        timeout: httpx.Timeout,
         verify: bool,
         **_kwargs: object,
     ) -> httpx.AsyncClient:
@@ -129,7 +142,10 @@ async def test_codex_request_honors_stream_idle_timeout_env(monkeypatch) -> None
 
     await _request_codex("https://codex.example/responses", {}, {"input": []}, verify=True)
 
-    assert seen["timeout"] == 5
+    assert seen["timeout"].connect == 5
+    assert seen["timeout"].read == 180
+    assert seen["timeout"].write == 5
+    assert seen["timeout"].pool == 5
 
 
 @pytest.mark.asyncio

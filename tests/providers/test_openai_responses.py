@@ -1,5 +1,6 @@
 """Tests for the shared openai_responses converters and parsers."""
 
+import asyncio
 import json
 from unittest.mock import MagicMock, patch
 
@@ -484,6 +485,34 @@ class _SseResponse:
 
 
 class TestConsumeSse:
+    @pytest.mark.asyncio
+    async def test_first_line_and_subsequent_idle_timeouts_are_distinct(self, monkeypatch):
+        response = _SseResponse([
+            {"type": "response.output_text.delta", "delta": "hi"},
+            {"type": "response.completed", "response": {"status": "completed"}},
+        ])
+        seen: list[float] = []
+        original_wait_for = asyncio.wait_for
+
+        async def _record_wait_for(awaitable, timeout):
+            seen.append(timeout)
+            return await original_wait_for(awaitable, timeout)
+
+        monkeypatch.setattr(
+            "nanobot.providers.openai_responses.parsing.asyncio.wait_for",
+            _record_wait_for,
+        )
+
+        content, _, finish_reason, _, _ = await consume_sse_with_reasoning(
+            response,
+            first_line_timeout_s=180,
+            idle_timeout_s=90,
+        )
+
+        assert content == "hi"
+        assert finish_reason == "stop"
+        assert seen == [180, 180, 90, 90, 90]
+
     @pytest.mark.asyncio
     async def test_legacy_consume_sse_returns_three_tuple(self):
         response = _SseResponse([

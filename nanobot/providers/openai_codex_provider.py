@@ -29,6 +29,8 @@ from nanobot.utils.oauth_compat import call_with_optional_proxy
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
+CODEX_FIRST_EVENT_TIMEOUT_ENV = "NANOBOT_CODEX_FIRST_EVENT_TIMEOUT_S"
+DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_S = 180.0
 
 
 class OpenAICodexProvider(LLMProvider):
@@ -181,6 +183,36 @@ class OpenAICodexProvider(LLMProvider):
         return self.default_model
 
 
+def resolve_codex_first_event_timeout_s(
+    *,
+    env_value: str | None = None,
+    default: float = DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_S,
+) -> float:
+    """Return a bounded Codex wait for the first SSE line."""
+    raw = os.environ.get(CODEX_FIRST_EVENT_TIMEOUT_ENV) if env_value is None else env_value
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid {}={!r}; using {}",
+            CODEX_FIRST_EVENT_TIMEOUT_ENV,
+            raw,
+            default,
+        )
+        return default
+    if value <= 0:
+        logger.warning(
+            "Ignoring non-positive {}={!r}; using {}",
+            CODEX_FIRST_EVENT_TIMEOUT_ENV,
+            raw,
+            default,
+        )
+        return default
+    return min(value, 3600.0)
+
+
 def _strip_model_prefix(model: str) -> str:
     if model.startswith("openai-codex/") or model.startswith("openai_codex/"):
         return model.split("/", 1)[1]
@@ -267,7 +299,16 @@ async def _request_codex(
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
     idle_timeout_s = resolve_stream_idle_timeout_s()
-    client_kwargs: dict[str, Any] = {"timeout": idle_timeout_s, "verify": verify}
+    first_event_timeout_s = resolve_codex_first_event_timeout_s()
+    client_kwargs: dict[str, Any] = {
+        "timeout": httpx.Timeout(
+            connect=idle_timeout_s,
+            read=first_event_timeout_s,
+            write=idle_timeout_s,
+            pool=idle_timeout_s,
+        ),
+        "verify": verify,
+    }
     if proxy:
         client_kwargs["proxy"] = proxy
         client_kwargs["trust_env"] = False
@@ -291,6 +332,8 @@ async def _request_codex(
                 on_content_delta=on_content_delta,
                 on_tool_call_delta=on_tool_call_delta,
                 on_reasoning_delta=on_thinking_delta,
+                first_line_timeout_s=first_event_timeout_s,
+                idle_timeout_s=idle_timeout_s,
             )
 
 
