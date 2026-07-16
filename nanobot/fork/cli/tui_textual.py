@@ -43,6 +43,7 @@ Safe to call directly (already inside Textual's event handlers):
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from io import StringIO
@@ -2015,7 +2016,10 @@ class TextualTUI(TUIBase):
         # a "thinking..." spinner in #live so the user knows we're waiting.
         self._schedule_idle_thinking()
 
-    _FILE_DIFF_VISIBLE_LINES = 40
+    _FILE_DIFF_VISIBLE_LINES = 120
+    _FILE_DIFF_HUNK_RE = re.compile(
+        r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@"
+    )
 
     def add_file_edit_events(self, events: list[dict[str, Any]]) -> None:
         if not events:
@@ -2079,19 +2083,17 @@ class TextualTUI(TUIBase):
         path = block["path"]
         header = _RText()
         header.append(self._TOOL_INDENT, style="")
-        marker = "✗" if status == "error" else "Δ"
-        header.append(
-            f"{marker} ",
-            style=self.THEME_ERROR if status == "error" else self.THEME_MARKER,
-        )
+        if status == "error":
+            header.append("✗ ", style=self.THEME_ERROR)
         header.append(path, style=self.THEME_HINT)
         if block["binary"]:
             header.append("  binary", style=self.THEME_MUTED)
-        elif added or deleted:
-            header.append("  ", style="")
+        else:
+            header.append(" (", style=self.THEME_MUTED)
             header.append(f"+{added}", style="green")
-            header.append(" / ", style=self.THEME_MUTED)
+            header.append(" ", style="")
             header.append(f"-{deleted}", style="red")
+            header.append(")", style=self.THEME_MUTED)
         if block["error"]:
             header.append(f"  {block['error']}", style=self.THEME_ERROR)
         self._log_write(header)
@@ -2099,21 +2101,21 @@ class TextualTUI(TUIBase):
         diff = block["diff"]
         if not diff:
             return
-        lines = diff.splitlines()
+        lines = self._number_file_diff_lines(diff)
         visible = lines[: self._FILE_DIFF_VISIBLE_LINES]
-        for line in visible:
+        width = max((len(str(number)) for number, _line in visible), default=1)
+        for number, line in visible:
             text = _RText()
             text.append(self._TOOL_INDENT + "  ", style="")
-            if line.startswith("+") and not line.startswith("+++"):
+            text.append(f"{number:>{width}} ", style=self.THEME_MUTED)
+            if line.startswith("+"):
                 text.append(line, style="green")
-            elif line.startswith("-") and not line.startswith("---"):
+            elif line.startswith("-"):
                 text.append(line, style="red")
-            elif line.startswith("@@"):
-                text.append(line, style="cyan")
             else:
                 text.append(line, style=self.THEME_MUTED)
             self._log_write(text)
-        hidden = max(0, block["diff_total_lines"] - len(visible))
+        hidden = max(0, len(lines) - len(visible))
         if hidden or block["diff_truncated"]:
             suffix = "，diff 已截断" if block["diff_truncated"] else ""
             self._log_write(
@@ -2122,6 +2124,34 @@ class TextualTUI(TUIBase):
                     style=self.THEME_MUTED,
                 )
             )
+
+    @classmethod
+    def _number_file_diff_lines(cls, diff: str) -> list[tuple[int, str]]:
+        """Convert unified diff hunks to one readable file-line-number column."""
+        numbered: list[tuple[int, str]] = []
+        old_line = 0
+        new_line = 0
+        in_hunk = False
+        for line in diff.splitlines():
+            match = cls._FILE_DIFF_HUNK_RE.match(line)
+            if match is not None:
+                old_line = int(match.group(1))
+                new_line = int(match.group(2))
+                in_hunk = True
+                continue
+            if not in_hunk or line.startswith("\\ No newline at end of file"):
+                continue
+            if line.startswith("-"):
+                numbered.append((old_line, line))
+                old_line += 1
+            elif line.startswith("+"):
+                numbered.append((new_line, line))
+                new_line += 1
+            else:
+                numbered.append((new_line, line))
+                old_line += 1
+                new_line += 1
+        return numbered
 
     def add_system(self, text: str) -> None:
         self._log_write(Text(text, style="dim"))

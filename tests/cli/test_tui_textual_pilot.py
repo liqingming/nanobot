@@ -447,7 +447,7 @@ async def test_app_level_large_paste_routes_to_input() -> None:
 
         assert submitted == [payload]
 
-def test_file_edit_diff_block_folds_long_diff(monkeypatch) -> None:
+def test_file_edit_diff_block_numbers_lines_and_folds_long_diff(monkeypatch) -> None:
     tui = TextualTUI()
     written: list[str] = []
 
@@ -456,16 +456,16 @@ def test_file_edit_diff_block_folds_long_diff(monkeypatch) -> None:
             written.append(getattr(item, "plain", str(item)))
 
     monkeypatch.setattr(tui, "_log_write", capture)
-    diff_lines = ["--- a/app.py", "+++ b/app.py", "@@ -1,45 +1,45 @@"]
-    diff_lines.extend(f"-old {idx}" for idx in range(21))
-    diff_lines.extend(f"+new {idx}" for idx in range(21))
+    diff_lines = ["--- a/app.py", "+++ b/app.py", "@@ -10,65 +10,65 @@"]
+    diff_lines.extend(f"-old {idx}" for idx in range(65))
+    diff_lines.extend(f"+new {idx}" for idx in range(65))
 
     block = tui._format_file_edit_event({
         "phase": "end",
         "status": "done",
         "path": "app.py",
-        "added": 21,
-        "deleted": 21,
+        "added": 65,
+        "deleted": 65,
         "diff": "\n".join(diff_lines),
         "diff_total_lines": len(diff_lines),
     })
@@ -474,10 +474,35 @@ def test_file_edit_diff_block_folds_long_diff(monkeypatch) -> None:
     tui._write_file_edit_block(block)
 
     text = "\n".join(written)
-    assert "Δ app.py  +21 / -21" in text
-    assert "--- a/app.py" in text
-    assert "+++ b/app.py" in text
-    assert "已折叠 5 行" in text
+    assert "app.py (+65 -65)" in text
+    assert "10 -old 0" in text
+    assert "10 +new 0" in text
+    assert "--- a/app.py" not in text
+    assert "+++ b/app.py" not in text
+    assert "@@ -10,65 +10,65 @@" not in text
+    assert "已折叠 10 行" in text
+
+
+def test_file_edit_diff_single_line_number_uses_old_for_delete_new_for_add() -> None:
+    lines = TextualTUI._number_file_diff_lines(
+        "@@ -8,3 +8,4 @@\n context\n-old\n+new\n+extra\n tail"
+    )
+
+    assert lines == [
+        (8, " context"),
+        (9, "-old"),
+        (9, "+new"),
+        (10, "+extra"),
+        (11, " tail"),
+    ]
+
+
+def test_file_edit_diff_new_file_has_sequential_new_line_numbers() -> None:
+    lines = TextualTUI._number_file_diff_lines(
+        "--- /dev/null\n+++ b/plan.md\n@@ -0,0 +1,3 @@\n+# title\n+\n+body"
+    )
+
+    assert lines == [(1, "+# title"), (2, "+"), (3, "+body")]
 
 
 @pytest.mark.asyncio
