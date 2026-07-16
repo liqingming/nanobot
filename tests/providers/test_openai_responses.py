@@ -486,6 +486,32 @@ class _SseResponse:
 
 class TestConsumeSse:
     @pytest.mark.asyncio
+    async def test_reasoning_consumer_observer_receives_events_without_changing_content(self):
+        events = [
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "secret answer",
+            },
+            {
+                "type": "response.completed",
+                "sequence_number": 2,
+                "response": {"status": "completed"},
+            },
+        ]
+        observed: list[dict] = []
+
+        result = await consume_sse_with_reasoning(
+            _SseResponse(events),
+            on_event=lambda event: observed.append(event),
+        )
+
+        assert result[0] == "secret answer"
+        assert observed == events
+
+    @pytest.mark.asyncio
     async def test_first_line_and_subsequent_idle_timeouts_are_distinct(self, monkeypatch):
         response = _SseResponse([
             {"type": "response.output_text.delta", "delta": "hi"},

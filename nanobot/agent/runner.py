@@ -560,6 +560,8 @@ class AgentRunner:
             if response.finish_reason == "error":
                 response_log_fields["error_content"] = response.content or ""
                 response_log_fields["error_kind"] = response.error_kind
+            if response.provider_diagnostics:
+                response_log_fields["provider_diagnostics"] = response.provider_diagnostics
             self._log_event(spec, "runner.model.response", **response_log_fields)
             if reasoning_text and not context.streamed_reasoning:
                 await hook.emit_reasoning(reasoning_text)

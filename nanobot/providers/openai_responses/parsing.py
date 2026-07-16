@@ -154,6 +154,7 @@ async def consume_sse_with_reasoning(
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
     *,
     first_line_timeout_s: float | None = None,
     idle_timeout_s: float | None = None,
@@ -173,6 +174,8 @@ async def consume_sse_with_reasoning(
         first_line_timeout_s=first_line_timeout_s,
         idle_timeout_s=idle_timeout_s,
     ):
+        if on_event:
+            on_event(event)
         event_type = event.get("type")
         if event_type == "response.output_item.added":
             item = event.get("item") or {}

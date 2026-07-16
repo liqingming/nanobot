@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
+import secrets
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,7 @@ DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
 CODEX_FIRST_EVENT_TIMEOUT_ENV = "NANOBOT_CODEX_FIRST_EVENT_TIMEOUT_S"
 DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_S = 180.0
+_DIAGNOSTIC_HMAC_KEY = secrets.token_bytes(32)
 
 
 class OpenAICodexProvider(LLMProvider):
@@ -109,30 +112,47 @@ class OpenAICodexProvider(LLMProvider):
             headers = _build_headers(token.account_id, token.access)
 
             try:
-                content, tool_calls, finish_reason, usage, reasoning_content = await _request_codex(
+                request_result = await _request_codex(
                     DEFAULT_CODEX_URL, headers, body, verify=True,
                     proxy=self.proxy,
                     on_content_delta=on_content_delta,
                     on_thinking_delta=on_thinking_delta,
                     on_tool_call_delta=on_tool_call_delta,
                 )
+                (
+                    content,
+                    tool_calls,
+                    finish_reason,
+                    usage,
+                    reasoning_content,
+                    diagnostics,
+                ) = _unpack_codex_result(request_result)
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason, usage, reasoning_content = await _request_codex(
+                request_result = await _request_codex(
                     DEFAULT_CODEX_URL, headers, body, verify=False,
                     proxy=self.proxy,
                     on_content_delta=on_content_delta,
                     on_thinking_delta=on_thinking_delta,
                     on_tool_call_delta=on_tool_call_delta,
                 )
+                (
+                    content,
+                    tool_calls,
+                    finish_reason,
+                    usage,
+                    reasoning_content,
+                    diagnostics,
+                ) = _unpack_codex_result(request_result)
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
                 usage=usage,
                 reasoning_content=reasoning_content,
+                provider_diagnostics=diagnostics,
             )
         except Exception as e:
             response = _codex_error_response(e)
@@ -297,7 +317,14 @@ async def _request_codex(
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
+) -> tuple[
+    str,
+    list[ToolCallRequest],
+    str,
+    dict[str, int],
+    str | None,
+    dict[str, Any],
+]:
     idle_timeout_s = resolve_stream_idle_timeout_s()
     first_event_timeout_s = resolve_codex_first_event_timeout_s()
     client_kwargs: dict[str, Any] = {
@@ -327,14 +354,141 @@ async def _request_codex(
                     error_code=error_code,
                     should_retry=_should_retry_status(response.status_code, error_type, error_code, raw),
                 )
-            return await consume_sse_with_reasoning(
+            diagnostics = _CodexSSEDiagnostics()
+            result = await consume_sse_with_reasoning(
                 response,
                 on_content_delta=on_content_delta,
                 on_tool_call_delta=on_tool_call_delta,
                 on_reasoning_delta=on_thinking_delta,
+                on_event=diagnostics.observe,
                 first_line_timeout_s=first_event_timeout_s,
                 idle_timeout_s=idle_timeout_s,
             )
+            content, tool_calls, finish_reason, usage, reasoning_content = result
+            return (
+                content,
+                tool_calls,
+                finish_reason,
+                usage,
+                reasoning_content,
+                diagnostics.finish(content),
+            )
+
+
+def _unpack_codex_result(
+    result: tuple[Any, ...],
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None, dict[str, Any] | None]:
+    """Accept legacy five-item test/provider adapters while adding diagnostics."""
+    if len(result) == 5:
+        content, tool_calls, finish_reason, usage, reasoning_content = result
+        return content, tool_calls, finish_reason, usage, reasoning_content, None
+    content, tool_calls, finish_reason, usage, reasoning_content, diagnostics = result
+    return content, tool_calls, finish_reason, usage, reasoning_content, diagnostics
+
+
+def _diagnostic_fingerprint(value: str) -> str:
+    return hmac.new(
+        _DIAGNOSTIC_HMAC_KEY,
+        value.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:16]
+
+
+class _CodexSSEDiagnostics:
+    """Collect metadata sufficient to diagnose replay without retaining response text."""
+
+    def __init__(self) -> None:
+        self.event_count = 0
+        self.delta_count = 0
+        self.delta_chars = 0
+        self.repeated_event_count = 0
+        self.repeated_delta_count = 0
+        self.first_sequence_number: int | None = None
+        self.last_sequence_number: int | None = None
+        self.repeated_sequence_count = 0
+        self.response_created_count = 0
+        self.response_completed_count = 0
+        self._seen_events: set[tuple[Any, ...]] = set()
+        self._seen_deltas: set[tuple[Any, ...]] = set()
+        self._seen_sequence_numbers: set[int] = set()
+        self._response_fingerprints: set[str] = set()
+
+    @staticmethod
+    def _event_position(event: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            event.get("sequence_number"),
+            event.get("output_index"),
+            event.get("content_index"),
+            event.get("item_id"),
+        )
+
+    def observe(self, event: dict[str, Any]) -> None:
+        self.event_count += 1
+        event_type = str(event.get("type") or "")
+        sequence_number = event.get("sequence_number")
+        if isinstance(sequence_number, int):
+            if self.first_sequence_number is None:
+                self.first_sequence_number = sequence_number
+            self.last_sequence_number = sequence_number
+            if sequence_number in self._seen_sequence_numbers:
+                self.repeated_sequence_count += 1
+            else:
+                self._seen_sequence_numbers.add(sequence_number)
+
+        if event_type == "response.created":
+            self.response_created_count += 1
+        elif event_type == "response.completed":
+            self.response_completed_count += 1
+        response_obj = event.get("response")
+        if isinstance(response_obj, dict) and response_obj.get("id"):
+            self._response_fingerprints.add(
+                _diagnostic_fingerprint(str(response_obj["id"]))
+            )
+
+        position = self._event_position(event)
+        event_id = event.get("event_id") or event.get("id")
+        event_key = (event_type, event_id, *position)
+        if event_id is not None or any(value is not None for value in position):
+            if event_key in self._seen_events:
+                self.repeated_event_count += 1
+            else:
+                self._seen_events.add(event_key)
+
+        if event_type != "response.output_text.delta":
+            return
+        delta = event.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return
+        self.delta_count += 1
+        self.delta_chars += len(delta)
+        delta_key = (*position, len(delta), _diagnostic_fingerprint(delta))
+        if delta_key in self._seen_deltas:
+            self.repeated_delta_count += 1
+        else:
+            self._seen_deltas.add(delta_key)
+
+    def finish(self, content: str) -> dict[str, Any]:
+        exact_half_repeat = bool(content) and len(content) % 2 == 0
+        if exact_half_repeat:
+            midpoint = len(content) // 2
+            exact_half_repeat = hmac.compare_digest(content[:midpoint], content[midpoint:])
+        return {
+            "kind": "codex_sse",
+            "event_count": self.event_count,
+            "delta_count": self.delta_count,
+            "delta_chars": self.delta_chars,
+            "repeated_event_count": self.repeated_event_count,
+            "repeated_delta_count": self.repeated_delta_count,
+            "first_sequence_number": self.first_sequence_number,
+            "last_sequence_number": self.last_sequence_number,
+            "repeated_sequence_count": self.repeated_sequence_count,
+            "response_created_count": self.response_created_count,
+            "response_completed_count": self.response_completed_count,
+            "unique_response_id_count": len(self._response_fingerprints),
+            "content_chars": len(content),
+            "content_fingerprint": _diagnostic_fingerprint(content),
+            "exact_half_repeat": exact_half_repeat,
+        }
 
 
 def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:

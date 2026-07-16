@@ -16,6 +16,7 @@ from nanobot.providers.openai_codex_provider import (
     _build_reasoning_options,
     _codex_error_response,
     _CodexHTTPError,
+    _CodexSSEDiagnostics,
     _friendly_error,
     _request_codex,
     _should_retry_status,
@@ -556,6 +557,92 @@ async def test_codex_stream_surfaces_reasoning_summary(monkeypatch) -> None:
 
 async def _append(target: list[str], value: str) -> None:
     target.append(value)
+
+
+def test_codex_sse_diagnostics_normal_stream_is_low_sensitivity() -> None:
+    secret = "private answer that must never appear in runtime diagnostics"
+    diagnostics = _CodexSSEDiagnostics()
+    diagnostics.observe({
+        "type": "response.output_text.delta",
+        "sequence_number": 1,
+        "output_index": 0,
+        "content_index": 0,
+        "delta": secret,
+    })
+    diagnostics.observe({
+        "type": "response.completed",
+        "sequence_number": 2,
+        "response": {"status": "completed", "output": [{"text": secret}]},
+    })
+
+    result = diagnostics.finish(secret)
+    serialized = json.dumps(result, ensure_ascii=False)
+
+    assert result == {
+        "kind": "codex_sse",
+        "event_count": 2,
+        "delta_count": 1,
+        "delta_chars": len(secret),
+        "repeated_event_count": 0,
+        "repeated_delta_count": 0,
+        "first_sequence_number": 1,
+        "last_sequence_number": 2,
+        "repeated_sequence_count": 0,
+        "response_created_count": 0,
+        "response_completed_count": 1,
+        "unique_response_id_count": 0,
+        "content_chars": len(secret),
+        "content_fingerprint": result["content_fingerprint"],
+        "exact_half_repeat": False,
+    }
+    assert len(result["content_fingerprint"]) == 16
+    assert secret not in serialized
+    assert "private answer" not in serialized
+
+
+def test_codex_sse_diagnostics_detects_event_and_exact_half_replay() -> None:
+    diagnostics = _CodexSSEDiagnostics()
+    event = {
+        "type": "response.output_text.delta",
+        "sequence_number": 7,
+        "output_index": 0,
+        "content_index": 0,
+        "item_id": "msg_1",
+        "delta": "same answer",
+    }
+
+    diagnostics.observe(event)
+    diagnostics.observe(dict(event))
+    result = diagnostics.finish("same answersame answer")
+
+    assert result["event_count"] == 2
+    assert result["delta_count"] == 2
+    assert result["repeated_event_count"] == 1
+    assert result["repeated_delta_count"] == 1
+    assert result["repeated_sequence_count"] == 1
+    assert result["first_sequence_number"] == 7
+    assert result["last_sequence_number"] == 7
+    assert result["exact_half_repeat"] is True
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_attaches_diagnostics_without_changing_content(monkeypatch) -> None:
+    _mock_codex_token(monkeypatch)
+    diagnostics = {
+        "kind": "codex_sse",
+        "event_count": 4,
+        "exact_half_repeat": True,
+    }
+
+    async def fake_request(*args: Any, **kwargs: Any):
+        return "answeranswer", [], "stop", {}, None, diagnostics
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
+
+    response = await OpenAICodexProvider().chat([{"role": "user", "content": "hello"}])
+
+    assert response.content == "answeranswer"
+    assert response.provider_diagnostics == diagnostics
 
 
 @pytest.mark.asyncio

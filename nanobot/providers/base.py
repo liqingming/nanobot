@@ -171,6 +171,9 @@ class LLMResponse:
     error_code: str | None = None  # Provider/code semantic, e.g. rate_limit_exceeded.
     error_retry_after_s: float | None = None
     error_should_retry: bool | None = None
+    # Low-sensitivity provider diagnostics for runtime.log only. This field must
+    # never contain prompts, response text, credentials, or raw provider payloads.
+    provider_diagnostics: dict[str, Any] | None = None
 
     @property
     def has_tool_calls(self) -> bool:
