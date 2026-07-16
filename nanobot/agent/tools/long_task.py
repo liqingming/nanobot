@@ -20,6 +20,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from nanobot.agent.context_artifacts import add_completion_stub
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
@@ -236,12 +237,21 @@ class CompleteGoalTool(Tool, _GoalToolsMixin):
             return "No active goal to complete."
 
         ended = _iso_now()
+        recap_text = (recap or "").strip()
         sess.metadata[GOAL_STATE_KEY] = {
             **prior,
             "status": "completed",
             "completed_at": ended,
-            "recap": (recap or "").strip(),
+            "recap": recap_text,
         }
+        task_seed = str(prior.get("started_at") or prior.get("objective") or ended)
+        add_completion_stub(
+            sess.metadata,
+            task_id=f"goal:{task_seed}",
+            title=str(prior.get("ui_summary") or prior.get("objective") or "Completed goal"),
+            result=recap_text,
+            completed_at=ended,
+        )
         discard_legacy_goal_state_key(sess.metadata)
         # Defer one conservative archive to the next real user turn so this
         # turn's final answer remains in the retained recent context.

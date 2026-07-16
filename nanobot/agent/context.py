@@ -4,9 +4,11 @@ import base64
 import hashlib
 import mimetypes
 import platform
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from nanobot.agent.context_artifacts import render_active_context, select_memory_view
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader, project_skill_roots
 from nanobot.agent.tools import mcp as mcp_tools
@@ -18,6 +20,7 @@ from nanobot.utils.helpers import (
     build_assistant_message,
     current_time_str,
     detect_image_mime,
+    estimate_message_tokens,
     load_bundled_template,
     safe_filename,
     truncate_text_to_tokens,
@@ -28,6 +31,14 @@ from nanobot.utils.prompt_templates import render_template
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return persisted kwargs for turn-attached capabilities."""
     return cli_app_utils.session_extra(metadata) | mcp_tools.session_extra(metadata)
+
+
+@dataclass(frozen=True, slots=True)
+class SystemPromptBuild:
+    """Rendered system prompt plus stable per-section token estimates."""
+
+    prompt: str
+    section_tokens: dict[str, int]
 
 
 def runtime_lines(state: Any, msg: Any, workspace: Path, *, skip: bool = False) -> list[str]:
@@ -57,8 +68,8 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
-    _MAX_RECENT_HISTORY = 50
-    _MAX_HISTORY_TOKENS = 8_000
+    _MAX_RECENT_HISTORY = 12
+    _MAX_HISTORY_TOKENS = 1_500
     # Default bootstrap contents observed in this user's existing local data
     # directories before the bundled templates changed.  Keep these fingerprints
     # narrow: any other content remains user-authored and is injected normally.
@@ -88,7 +99,7 @@ class ContextBuilder:
         self._topic_memory_factory = topic_memory_factory
 
     def _get_topic_store(self, session_key: str | None) -> MemoryStore | None:
-        if self._topic_memory_factory is None or not session_key:
+        if self._topic_memory_factory is None or not isinstance(session_key, str) or not session_key:
             return None
         return self._topic_memory_factory.get(session_key)
 
@@ -114,40 +125,72 @@ class ContextBuilder:
         unified_session: bool = False,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        return self.build_system_prompt_with_metrics(
+            skill_names=skill_names,
+            include_learning_rules=include_learning_rules,
+            session_key=session_key,
+            todos=todos,
+            channel=channel,
+            session_summary=session_summary,
+            workspace=workspace,
+            include_memory_recent_history=include_memory_recent_history,
+            unified_session=unified_session,
+        ).prompt
+
+    def build_system_prompt_with_metrics(
+        self,
+        skill_names: list[str] | None = None,
+        include_learning_rules: bool = False,
+        session_key: str | None = None,
+        todos: list[dict[str, Any]] | None = None,
+        channel: str | None = None,
+        session_summary: str | None = None,
+        workspace: Path | None = None,
+        include_memory_recent_history: bool = True,
+        unified_session: bool = False,
+    ) -> SystemPromptBuild:
+        """Build the system prompt and expose comparable per-section estimates."""
+        del skill_names  # Reserved for API compatibility; skills are loaded progressively.
         root = workspace or self.workspace
-        parts = [self._get_identity(session_key=session_key, channel=channel, workspace=root)]
+        sections: list[tuple[str, str]] = []
 
-        bootstrap = self._load_bootstrap_files(root)
-        if bootstrap:
-            parts.append(bootstrap)
+        def add(name: str, content: str | None) -> None:
+            if content and content.strip():
+                sections.append((name, content))
 
-        parts.append(render_template("agent/tool_contract.md"))
+        add("identity", self._get_identity(session_key=session_key, channel=channel, workspace=root))
+        add("bootstrap", self._load_bootstrap_files(root))
+        add("tool_contract", render_template("agent/tool_contract.md"))
 
         mem_parts: list[str] = []
-        global_memory = self.memory.get_memory_context()
-        if global_memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
-            mem_parts.append(global_memory)
+        raw_global_memory = self.memory.read_memory()
+        if raw_global_memory and not self._is_template_content(
+            raw_global_memory, "memory/MEMORY.md"
+        ):
+            global_memory = self.memory.format_memory_context(raw_global_memory)
+            global_memory = select_memory_view(global_memory)
+            if global_memory:
+                mem_parts.append(global_memory)
         topic_store = self._get_topic_store(session_key)
         topic_mem = topic_store.read_memory() if topic_store is not None else ""
         if topic_mem:
-            mem_parts.append(f"### Topic Memory\n{topic_mem}")
-        if mem_parts:
-            parts.append("\n\n".join(mem_parts))
+            topic_view = select_memory_view(topic_mem)
+            if topic_view:
+                mem_parts.append(f"### Topic Memory\n{topic_view}")
+        add("memory", "\n\n".join(mem_parts))
 
         if todos:
             from nanobot.fork.agent.tools.todo import format_todos
-            parts.append("# Active Todos\n\n" + format_todos(todos))
+            add("todos", "# Active Todos\n\n" + format_todos(todos))
 
         skills = self._skills_for_workspace(root)
         always_skills = skills.get_always_skills()
-        if always_skills:
-            always_content = skills.load_skills_for_context(always_skills)
-            if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+        always_content = skills.load_skills_for_context(always_skills) if always_skills else ""
+        add("always_skills", f"# Active Skills\n\n{always_content}" if always_content else "")
 
         skills_summary = skills.build_skills_summary(exclude=set(always_skills))
         if skills_summary:
-            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+            add("skills_index", render_template("agent/skills_section.md", skills_summary=skills_summary))
 
         if include_memory_recent_history:
             entries = self.memory.read_recent_history_for_prompt(
@@ -161,17 +204,25 @@ class ContextBuilder:
                     f"- [{entry['timestamp']}] {entry['content']}" for entry in capped
                 )
                 history_text = truncate_text_to_tokens(history_text, self._MAX_HISTORY_TOKENS)
-                parts.append("# Recent History\n\n" + history_text)
+                add("recent_history", "# Recent History\n\n" + history_text)
 
-        if session_summary:
-            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+        # Active/legacy continuation state is injected with the current user
+        # metadata so the stable system prefix remains cache-friendly.
 
         if include_learning_rules:
             lr_path = self.data_dir / "LEARNING_RULES.md"
             if lr_path.exists():
-                parts.append(lr_path.read_text(encoding="utf-8"))
+                add("learning_rules", lr_path.read_text(encoding="utf-8"))
 
-        return "\n\n---\n\n".join(parts)
+        prompt = "\n\n---\n\n".join(content for _name, content in sections)
+        section_tokens = {
+            name: estimate_message_tokens({"role": "system", "content": content})
+            for name, content in sections
+        }
+        section_tokens["total"] = estimate_message_tokens(
+            {"role": "system", "content": prompt}
+        )
+        return SystemPromptBuild(prompt=prompt, section_tokens=section_tokens)
 
     def _get_identity(
         self,
@@ -192,17 +243,18 @@ class ContextBuilder:
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
         )
-        if session_key is not None:
+        if isinstance(session_key, str) and session_key:
             safe_key = safe_filename(session_key.replace(":", "_"))
             memory_lines = (
                 f"- Global memory: {data_path}/memory/MEMORY.md (cross-topic facts, auto-injected)\n"
-                f"- Topic memory: {data_path}/memory/topics/{safe_key}/MEMORY.md (current topic facts, auto-injected; prefer writing here)\n"
-                f"- Topic history: {data_path}/memory/topics/{safe_key}/HISTORY.md (event log, handled by consolidation)"
+                f"- Global history: {data_path}/memory/history.jsonl (event log, search on demand)\n"
+                f"- Topic memory: {data_path}/memory/topics/{safe_key}/MEMORY.md (current topic facts, auto-injected)\n"
+                f"- Topic history: {data_path}/memory/topics/{safe_key}/history.jsonl (event log, search on demand)"
             )
         else:
             memory_lines = (
-                f"- Long-term memory: {data_path}/memory/MEMORY.md (write important facts here)\n"
-                f"- History log: {data_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM]."
+                f"- Long-term memory: {data_path}/memory/MEMORY.md (auto-injected facts)\n"
+                f"- History log: {data_path}/memory/history.jsonl (search on demand)"
             )
         return f"{identity}\n\n## Memory Paths\n{memory_lines}\n- Custom skills: {data_path}/skills/{{skill-name}}/SKILL.md"
 
@@ -291,20 +343,25 @@ class ContextBuilder:
     _SKILL_MATCH_MIN_TOKEN_LEN = 4
     _SKILL_MATCH_MAX_SUGGESTIONS = 3
 
-    def _build_skill_match_reminder(self, user_message: str) -> str:
+    def _build_skill_match_reminder(
+        self,
+        user_message: str,
+        skills: SkillsLoader | None = None,
+    ) -> str:
         if not user_message or not user_message.strip():
             return ""
+        loader = skills or self.skills
         try:
-            skills = self.skills.list_skills(filter_unavailable=True)
+            entries = loader.list_skills(filter_unavailable=True)
         except Exception:
             return ""
-        if not skills:
+        if not entries:
             return ""
         msg_lower = user_message.lower()
         suggestions: list[tuple[str, str, int]] = []
-        for skill in skills:
+        for skill in entries:
             name = skill.get("name", "")
-            desc = self.skills._get_skill_description(name) or ""
+            desc = loader._get_skill_description(name) or ""
             if not name or not desc:
                 continue
             tokens = {
@@ -354,10 +411,16 @@ class ContextBuilder:
         skip_runtime_lines: bool = False,
         include_memory_recent_history: bool = True,
         unified_session: bool = False,
+        system_prompt_metrics: dict[str, int] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         root = workspace or self.workspace
-        extra = [*goal_state_runtime_lines(session_metadata)]
+        active_context = render_active_context(
+            session_metadata,
+            workspace=root,
+            legacy_summary=session_summary,
+        )
+        extra = [] if active_context else [*goal_state_runtime_lines(session_metadata)]
         if runtime_state is not None and inbound_message is not None:
             extra.extend(runtime_lines(runtime_state, inbound_message, root, skip=skip_runtime_lines))
         if current_runtime_lines:
@@ -382,8 +445,13 @@ class ContextBuilder:
                 f"{pending_summary.strip()}\n"
                 "</system-reminder>"
             )
-        skill_hint = self._build_skill_match_reminder(current_message)
-        prefix_parts = [part for part in (learning_ctx, reminder, skill_hint) if part]
+        skill_hint = self._build_skill_match_reminder(
+            current_message,
+            self._skills_for_workspace(root),
+        )
+        prefix_parts = [
+            part for part in (active_context, learning_ctx, reminder, skill_hint) if part
+        ]
         prefix = "\n\n".join(prefix_parts) if prefix_parts else ""
 
         if isinstance(user_content, str):
@@ -393,21 +461,22 @@ class ContextBuilder:
             merged = ([{"type": "text", "text": prefix}] if prefix else []) + user_content
             merged.append({"type": "text", "text": runtime_ctx})
 
+        system_build = self.build_system_prompt_with_metrics(
+            skill_names,
+            include_learning_rules=(learning_ctx is not None),
+            session_key=session_key,
+            todos=todos,
+            channel=channel,
+            session_summary=session_summary,
+            workspace=root,
+            include_memory_recent_history=include_memory_recent_history,
+            unified_session=unified_session,
+        )
+        if system_prompt_metrics is not None:
+            system_prompt_metrics.clear()
+            system_prompt_metrics.update(system_build.section_tokens)
         messages = [
-            {
-                "role": "system",
-                "content": self.build_system_prompt(
-                    skill_names,
-                    include_learning_rules=(learning_ctx is not None),
-                    session_key=session_key,
-                    todos=todos,
-                    channel=channel,
-                    session_summary=session_summary,
-                    workspace=root,
-                    include_memory_recent_history=include_memory_recent_history,
-                    unified_session=unified_session,
-                ),
-            },
+            {"role": "system", "content": system_build.prompt},
             *history,
         ]
         if messages[-1].get("role") == current_role and len(messages) > 1:

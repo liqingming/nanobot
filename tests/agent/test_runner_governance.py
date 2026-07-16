@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nanobot.agent.context_artifacts import ToolDigestBuilder
 from nanobot.agent.context_governance import (
     BACKFILL_CONTENT,
     HISTORICAL_TOOL_CALL_KEEP_RECENT,
@@ -86,6 +87,15 @@ async def test_runner_logs_context_governance_metrics():
     assert fields["before"]["system"] > 0
     assert fields["before"]["tool_definitions"] > 0
     assert fields["compacted_tool_results"] == 0
+    assert fields["saved_total"] == fields["before"]["total"] - fields["after"]["total"]
+    assert fields["saved"]["tool_results"] >= 0
+    assert fields["digested_tool_results"] == 0
+    turn_summary = [
+        fields for event, fields in events if event == "runner.context.turn_summary"
+    ][-1]
+    assert turn_summary["model_requests"] == 1
+    assert turn_summary["prompt_peak_tokens"] >= 0
+    assert turn_summary["governance_saved_total"] >= fields["saved_total"]
 
 
 async def test_runner_uses_raw_messages_when_context_governance_fails():
@@ -549,6 +559,56 @@ def test_prepare_for_model_reuses_overflow_probe_when_prompt_fits(monkeypatch) -
     assert probe.call_count == 1
 
 
+def test_microcompact_uses_structured_digest_when_available() -> None:
+    provider = MagicMock()
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    messages = [{"role": "user", "content": "request"}]
+    for idx in range(MICROCOMPACT_KEEP_RECENT + 1):
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": f"call_{idx}",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": f"call_{idx}",
+                "name": "read_file",
+                "content": "x" * 5000,
+            },
+        ])
+    spec = AgentRunSpec(
+        initial_messages=messages,
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    digest, _ = ToolDigestBuilder.build(
+        tool_call_id="call_0",
+        tool_name="read_file",
+        arguments={"path": "a.py"},
+        result="x" * 5000,
+    )
+
+    compacted = ContextGovernor().compact_inflight_soft_budget(
+        _governance_config(provider, tools, spec),
+        messages,
+        set(),
+        tool_digests={"call_0": digest},
+    )
+
+    tool_result = next(msg for msg in compacted if msg.get("tool_call_id") == "call_0")
+    assert "ToolDigest" in tool_result["content"]
+    assert "a.py" in tool_result["content"]
+    assert "evidence:" in tool_result["content"]
+
+
 def test_microcompact_soft_budget_compacts_only_stale_read_results() -> None:
     provider = MagicMock()
     tools = MagicMock()
@@ -677,9 +737,12 @@ def test_microcompact_overflow_compacts_to_low_watermark(monkeypatch):
     compacted = [m for m in tool_msgs if "compacted to fit context" in str(m.get("content", ""))]
     preserved = [m for m in tool_msgs if m.get("content") == long_content]
 
-    assert len(compacted) == 8
-    assert len(preserved) == total - 8
-    assert [m["tool_call_id"] for m in compacted] == [f"c{i}" for i in range(8)]
+    # Stop as soon as the estimate reaches the configured low watermark;
+    # the keep-recent setting caps candidates but does not force all stale
+    # candidates to be compacted.
+    assert len(compacted) == 6
+    assert len(preserved) == total - 6
+    assert [m["tool_call_id"] for m in compacted] == [f"c{i}" for i in range(6)]
 
 
 def test_microcompact_compacts_newest_when_it_alone_overflows(monkeypatch):

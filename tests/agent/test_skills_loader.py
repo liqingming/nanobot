@@ -117,6 +117,22 @@ def test_list_skills_extra_root_shadows_workspace_and_builtin(tmp_path: Path) ->
     assert ws_path.read_text(encoding="utf-8") != loader.load_skill("dup")
 
 
+def test_list_skills_are_sorted_within_each_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    skills_root = workspace / "skills"
+    _write_skill(skills_root, "zeta", body="# Z")
+    _write_skill(skills_root, "alpha", body="# A")
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+
+    assert [entry["name"] for entry in loader.list_skills(filter_unavailable=False)] == [
+        "alpha",
+        "zeta",
+    ]
+
+
 def test_list_skills_merges_workspace_and_builtin(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     ws_skills = workspace / "skills"
@@ -301,6 +317,18 @@ def test_disabled_skills_empty_set_no_effect(tmp_path: Path) -> None:
     loader = SkillsLoader(workspace, builtin_skills_dir=builtin, disabled_skills=set())
     entries = loader.list_skills(filter_unavailable=False)
     assert len(entries) == 2
+
+
+def test_build_skills_summary_empty_when_all_skills_excluded(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    skills_root = workspace / "skills"
+    _write_skill(skills_root, "alpha", body="# Alpha")
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+
+    assert loader.build_skills_summary(exclude={"alpha"}) == ""
 
 
 def test_disabled_skills_excluded_from_build_skills_summary(tmp_path: Path) -> None:

@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
+from nanobot.agent.context_artifacts import ToolDigest, ToolDigestBuilder
 from nanobot.agent.context_governance import (
     ContextGovernanceConfig,
     ContextGovernor,
@@ -100,6 +101,7 @@ class AgentRunSpec:
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
     finalize_on_max_iterations: bool = True
+    context_delta_callback: Callable[[dict[str, Any]], Any] | None = None
 
 @dataclass(slots=True)
 class AgentRunResult:
@@ -365,8 +367,12 @@ class AgentRunner:
         had_injections = False
         injection_cycles = 0
         compacted_tool_call_ids: set[str] = set()
+        tool_digests: dict[str, ToolDigest] = {}
         adaptive_context_block_limit: int | None = None
         false_tool_budget_retries = 0
+        model_request_count = 0
+        prompt_peak_tokens = 0
+        governance_saved_total = 0
         governance_config = ContextGovernanceConfig(
             provider=self.provider,
             model=spec.model,
@@ -407,17 +413,29 @@ class AgentRunner:
                     active_governance_config,
                     messages,
                     compacted_tool_call_ids,
+                    tool_digests=tool_digests,
                 )
                 after_context = self.context_governor.context_metrics(
                     messages_for_model, tools_for_model
                 )
+                saved_by_group = {
+                    key: max(0, before_context.get(key, 0) - after_context.get(key, 0))
+                    for key in before_context
+                }
+                saved_total = max(0, before_context["total"] - after_context["total"])
+                governance_saved_total += saved_total
                 self._log_event(
                     spec,
                     "runner.context.governance",
                     iteration=iteration,
                     before=before_context,
                     after=after_context,
+                    saved=saved_by_group,
+                    saved_total=saved_total,
                     compacted_tool_results=len(compacted_tool_call_ids),
+                    digested_tool_results=sum(
+                        1 for call_id in compacted_tool_call_ids if call_id in tool_digests
+                    ),
                 )
             except Exception:
                 logger.exception(
@@ -550,6 +568,8 @@ class AgentRunner:
             raw_usage = self._usage_or_estimate(spec, messages_for_model, response)
             context.usage = dict(raw_usage)
             self._accumulate_usage(usage, raw_usage)
+            model_request_count += 1
+            prompt_peak_tokens = max(prompt_peak_tokens, raw_usage.get("prompt_tokens", 0))
             response_log_fields: dict[str, Any] = {
                 "iteration": iteration,
                 "finish_reason": response.finish_reason,
@@ -688,17 +708,36 @@ class AgentRunner:
                 context.tool_events = list(new_events)
                 await hook.after_execute_tools(context)
                 completed_tool_results: list[dict[str, Any]] = []
-                for tool_call, result in zip(response.tool_calls, results):
+                for tool_call, result, event in zip(response.tool_calls, results, new_events):
+                    normalized = self.context_governor.normalize_tool_result(
+                        governance_config,
+                        tool_call.id,
+                        tool_call.name,
+                        result,
+                    )
+                    artifact_locator = self.context_governor.persisted_result_locator(normalized)
+                    digest, evidence = ToolDigestBuilder.build(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        arguments=tool_call.arguments,
+                        result=result,
+                        status=str(event.get("status") or "ok"),
+                        artifact_locator=artifact_locator,
+                    )
+                    tool_digests[tool_call.id] = digest
+                    if spec.context_delta_callback is not None:
+                        try:
+                            spec.context_delta_callback({
+                                "tool_digest": digest,
+                                "evidence": evidence,
+                            })
+                        except Exception:
+                            logger.exception("Context delta callback failed for {}", tool_call.id)
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_call.name,
-                        "content": self.context_governor.normalize_tool_result(
-                            governance_config,
-                            tool_call.id,
-                            tool_call.name,
-                            result,
-                        ),
+                        "content": normalized,
                     }
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
@@ -915,6 +954,19 @@ class AgentRunner:
                 final_content = self._max_iterations_fallback(spec)
             self._append_final_message(messages, final_content)
 
+        self._log_event(
+            spec,
+            "runner.context.turn_summary",
+            model_requests=model_request_count,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            prompt_peak_tokens=prompt_peak_tokens,
+            governance_saved_total=governance_saved_total,
+            compacted_tool_results=len(compacted_tool_call_ids),
+            digested_tool_results=sum(
+                1 for call_id in compacted_tool_call_ids if call_id in tool_digests
+            ),
+        )
         return AgentRunResult(
             final_content=final_content,
             messages=messages,

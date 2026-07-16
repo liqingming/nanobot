@@ -15,19 +15,7 @@ always: true
 
 ## Search Past Events
 
-`memory/history.jsonl` is JSONL format — each line is a JSON object with `cursor`, `timestamp`, `content`.
-
-- For broad searches, start with `grep(..., path="memory", glob="*.jsonl", output_mode="count")` or the default `files_with_matches` mode before expanding to full content
-- Use `output_mode="content"` plus `context_before` / `context_after` when you need the exact matching lines
-- Use `fixed_strings=true` for literal timestamps or JSON fragments
-- Use `head_limit` / `offset` to page through long histories
-- Use `exec` only as a last-resort fallback when the built-in search cannot express what you need
-
-Examples (replace `keyword`):
-- `grep(pattern="keyword", path="memory/history.jsonl", case_insensitive=true)`
-- `grep(pattern="2026-04-02 10:00", path="memory/history.jsonl", fixed_strings=true)`
-- `grep(pattern="keyword", path="memory", glob="*.jsonl", output_mode="count", case_insensitive=true)`
-- `grep(pattern="oauth|token", path="memory", glob="*.jsonl", output_mode="content", case_insensitive=true)`
+`memory/history.jsonl` is append-only JSONL with `cursor`, `timestamp`, and `content`. Search it with `grep`: scope broad queries with `output_mode="count"`, use `content` plus context for exact evidence, `fixed_strings` for literal JSON/timestamps, and paginate with `head_limit`/`offset`. Use `exec` only when structured search cannot express the query.
 
 ## Important
 

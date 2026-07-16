@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nanobot.agent.context_artifacts import CONTEXT_STATE_KEY, ContextState
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.long_task import (
@@ -76,6 +77,10 @@ async def test_complete_goal_closes_active_goal(tmp_path):
     assert blob["status"] == "completed"
     assert blob["recap"] == "Done."
     assert sess.metadata["_completed_goal_needs_compaction"] is True
+    context_state = ContextState.from_metadata(sess.metadata)
+    assert len(context_state.completion_stubs) == 1
+    assert context_state.completion_stubs[0].result == "Done."
+    assert CONTEXT_STATE_KEY in sess.metadata
 
 
 @pytest.mark.asyncio

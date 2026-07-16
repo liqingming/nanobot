@@ -216,8 +216,9 @@ def test_recent_history_capped_at_max(tmp_path) -> None:
         builder.memory.append_history(f"entry-{i}")
 
     prompt = builder.build_system_prompt()
+    first_kept = 20
     assert "entry-0" not in prompt
-    assert "entry-19" not in prompt
+    assert f"entry-{first_kept - 1}" not in prompt
     assert f"entry-{builder._MAX_RECENT_HISTORY + 19}" in prompt
 
 
@@ -368,10 +369,10 @@ def test_system_prompt_keeps_message_tool_out_of_current_chat_replies(tmp_path) 
 
     prompt = builder.build_system_prompt(channel="slack")
 
-    assert "Do not use the 'message' tool for normal replies in the current chat" in prompt
-    assert "When 'generate_image' creates images" in prompt
-    assert "call 'message' with the artifact paths in the 'media' parameter" in prompt
-    assert "Wait for the tool results, then answer once" in prompt
+    assert "Reply directly in the current conversation" in prompt
+    assert "use `message` only for proactive/cross-channel delivery" in prompt
+    assert "requested file attachments" in prompt
+    assert "wait for their results before giving the final answer" in prompt
 
 
 def test_subagent_result_does_not_create_consecutive_assistant_messages(tmp_path) -> None:
@@ -405,7 +406,7 @@ def test_always_skills_excluded_from_skills_index(tmp_path) -> None:
     skills_section = prompt.split("# Skills\n", 1)
     if len(skills_section) > 1:
         index_text = skills_section[1].split("\n\n---")[0]
-        assert "**memory**" not in index_text
+        assert "<name>memory</name>" not in index_text
 
 
 def test_template_memory_md_is_skipped(tmp_path) -> None:
@@ -436,7 +437,7 @@ def test_customized_memory_md_is_injected(tmp_path) -> None:
     builder = ContextBuilder(workspace)
     prompt = builder.build_system_prompt()
 
-    assert "# Long-term Memory\n\nUser prefers dark mode" in prompt
+    assert "# Long-term Memory\nUser prefers dark mode" in prompt
     assert "# Memory\n\n## Long-term Memory" not in prompt
     assert "User prefers dark mode" in prompt
 

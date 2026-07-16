@@ -267,9 +267,9 @@ class MemoryStore:
 
     # -- context injection (used by context.py) ------------------------------
 
-    def get_memory_context(self) -> str:
-        """Return meaningful long-term memory without its untouched template scaffolding."""
-        long_term = self.read_memory()
+    @staticmethod
+    def format_memory_context(long_term: str) -> str:
+        """Remove untouched template scaffolding from long-term memory text."""
         if not long_term:
             return ""
         for section in (
@@ -281,6 +281,10 @@ class MemoryStore:
             long_term = long_term.replace(section, "")
         footer = "\n---\n\n*This file is automatically updated by nanobot when important information should be remembered.*"
         return long_term.replace(footer, "").strip()
+
+    def get_memory_context(self) -> str:
+        """Return meaningful long-term memory without its untouched template scaffolding."""
+        return self.format_memory_context(self.read_memory())
 
     # -- history.jsonl — append-only, JSONL format ---------------------------
 

@@ -24,16 +24,17 @@ from nanobot.utils.helpers import (
 from nanobot.utils.runtime import ensure_nonempty_tool_result
 
 if TYPE_CHECKING:
+    from nanobot.agent.context_artifacts import ToolDigest
     from nanobot.providers.base import LLMProvider
 
 SNIP_SAFETY_BUFFER = 1024
-MICROCOMPACT_KEEP_RECENT = 10
+MICROCOMPACT_KEEP_RECENT = 8
 MICROCOMPACT_MIN_CHARS = 500
 # Keep enough recent evidence for the next model decision, but do not let a
 # long read/search-heavy tool chain accumulate every earlier raw result until
 # it nearly exhausts the provider context window.
-MICROCOMPACT_SOFT_CHAR_BUDGET = 48_000
-MICROCOMPACT_SOFT_TARGET_CHARS = 32_000
+MICROCOMPACT_SOFT_CHAR_BUDGET = 36_000
+MICROCOMPACT_SOFT_TARGET_CHARS = 24_000
 HISTORICAL_TOOL_CALL_KEEP_RECENT = 64
 INFLIGHT_COMPACT_TARGET_RATIO = 0.85
 COMPACTABLE_TOOLS = frozenset({
@@ -101,6 +102,8 @@ class ContextGovernor:
         config: ContextGovernanceConfig,
         messages: list[dict[str, Any]],
         compacted_tool_call_ids: set[str],
+        *,
+        tool_digests: dict[str, ToolDigest] | None = None,
     ) -> list[dict[str, Any]]:
         updated = self.strip_placeholder_assistant_messages(messages)
         updated = self.strip_malformed_tool_calls(updated)
@@ -109,10 +112,16 @@ class ContextGovernor:
         updated = self.trim_historical_tool_exchanges(config, updated)
         updated = self.apply_tool_result_budget(config, updated)
         updated = self.compact_inflight_soft_budget(
-            config, updated, compacted_tool_call_ids
+            config,
+            updated,
+            compacted_tool_call_ids,
+            tool_digests=tool_digests,
         )
         updated, exact_estimate = self._compact_inflight_overflow_with_estimate(
-            config, updated, compacted_tool_call_ids
+            config,
+            updated,
+            compacted_tool_call_ids,
+            tool_digests=tool_digests,
         )
         updated = self.snip_history(config, updated, exact_estimate=exact_estimate)
         updated = self.drop_orphan_tool_results(updated)
@@ -138,6 +147,17 @@ class ContextGovernor:
             SNIP_SAFETY_BUFFER,
         )
         return budget if budget > 0 else 0
+
+    @staticmethod
+    def persisted_result_locator(result: Any) -> str | None:
+        """Extract the persisted artifact path from a normalized tool result."""
+        if not isinstance(result, str):
+            return None
+        marker = "Full output saved to: "
+        for line in result.splitlines():
+            if line.startswith(marker):
+                return line[len(marker):].strip()
+        return None
 
     @staticmethod
     def normalize_tool_result(
@@ -423,6 +443,8 @@ class ContextGovernor:
         config: ContextGovernanceConfig,
         messages: list[dict[str, Any]],
         compacted_tool_call_ids: set[str],
+        *,
+        tool_digests: dict[str, ToolDigest] | None = None,
     ) -> list[dict[str, Any]]:
         """Compact stale in-flight read/search results before they dominate a prompt.
 
@@ -454,7 +476,7 @@ class ContextGovernor:
             if isinstance(content, str):
                 total_chars -= len(content)
             compacted_tool_call_ids.add(tool_call_id)
-            self._compact_tool_result_at(updated, idx)
+            self._compact_tool_result_at(updated, idx, tool_digests=tool_digests)
             total_chars += len(updated[idx].get("content", ""))
         return updated
 
@@ -475,6 +497,8 @@ class ContextGovernor:
         config: ContextGovernanceConfig,
         messages: list[dict[str, Any]],
         compacted_tool_call_ids: set[str],
+        *,
+        tool_digests: dict[str, ToolDigest] | None = None,
     ) -> tuple[list[dict[str, Any]], int | None]:
         """Overflow guard that returns its exact estimate for downstream reuse."""
         budget = self.input_budget(config)
@@ -510,7 +534,7 @@ class ContextGovernor:
             if updated is messages:
                 updated = [dict(m) for m in messages]
             compacted_tool_call_ids.add(tool_call_id)
-            self._compact_tool_result_at(updated, idx)
+            self._compact_tool_result_at(updated, idx, tool_digests=tool_digests)
             estimate, source = estimate_prompt_tokens_chain(
                 config.provider,
                 config.model,
@@ -661,5 +685,15 @@ class ContextGovernor:
         fallback = compactable[primary_count:]
         return primary + fallback
 
-    def _compact_tool_result_at(self, messages: list[dict[str, Any]], idx: int) -> None:
-        messages[idx]["content"] = self._summary_for(messages[idx])
+    def _compact_tool_result_at(
+        self,
+        messages: list[dict[str, Any]],
+        idx: int,
+        *,
+        tool_digests: dict[str, ToolDigest] | None = None,
+    ) -> None:
+        tool_call_id = str(messages[idx].get("tool_call_id") or "")
+        digest = tool_digests.get(tool_call_id) if tool_digests else None
+        messages[idx]["content"] = (
+            digest.prompt_text() if digest is not None else self._summary_for(messages[idx])
+        )

@@ -21,6 +21,7 @@ from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.automation_turns import publish_next_deferred_turn
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.context_artifacts import CONTEXT_STATE_KEY, ContextState
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
@@ -137,6 +138,7 @@ class TurnContext:
 
     history: list[dict[str, Any]] = field(default_factory=list)
     initial_messages: list[dict[str, Any]] = field(default_factory=list)
+    system_prompt_metrics: dict[str, int] = field(default_factory=dict)
 
     final_content: str | None = None
     tools_used: list[str] = field(default_factory=list)
@@ -744,7 +746,9 @@ class AgentLoop:
         pending_summary: str | None,
         *,
         learning_ctx: str | None = None,
-        include_memory_recent_history: bool = True,    ) -> list[dict[str, Any]]:
+        include_memory_recent_history: bool = True,
+        system_prompt_metrics: dict[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
         scope = self.workspace_scopes.for_message(msg, session.metadata)
         return self.context.build_messages(
@@ -762,7 +766,9 @@ class AgentLoop:
             inbound_message=msg,
             include_memory_recent_history=include_memory_recent_history,
             session_key=session.key,
-            unified_session=self._unified_session,        )
+            unified_session=self._unified_session,
+            system_prompt_metrics=system_prompt_metrics,
+        )
 
     async def _dispatch_command_inline(
         self,
@@ -1111,6 +1117,20 @@ class AgentLoop:
             )
 
         session_metadata = session.metadata if session is not None else None
+
+        def _context_delta(delta: dict[str, Any]) -> None:
+            if session is None:
+                return
+            state = ContextState.from_metadata(session.metadata)
+            digest = delta.get("tool_digest")
+            evidence = delta.get("evidence")
+            if digest is not None:
+                state.tool_digests[digest.tool_call_id] = digest
+            if evidence is not None:
+                state.evidence[evidence.evidence_id] = evidence
+            state.revision += 1
+            session.metadata[CONTEXT_STATE_KEY] = state.to_metadata()
+
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
@@ -1162,6 +1182,7 @@ class AgentLoop:
                     message_metadata=metadata,
                 ),
                 event_logger=_event_logger,
+                context_delta_callback=_context_delta,
             ))
         finally:
             reset_workspace_scope(workspace_token)
@@ -1994,12 +2015,20 @@ class AgentLoop:
                 ctx.pending_summary,
                 learning_ctx=learning_ctx,
                 include_memory_recent_history=not ctx.ephemeral,
+                system_prompt_metrics=ctx.system_prompt_metrics,
             )
             user_persisted_early = self._persist_user_message_early(ctx.msg, ctx.session)
             return history, initial_messages, user_persisted_early
 
         ctx.history, ctx.initial_messages, ctx.user_persisted_early = (
             await asyncio.to_thread(_build_sync)
+        )
+        append_session_runtime_log(
+            ctx.runtime_log_path,
+            "turn.context.system_sections",
+            turn_id=ctx.turn_id,
+            session_key=ctx.session_key,
+            sections=ctx.system_prompt_metrics,
         )
         if ctx.on_progress is None:
             ctx.on_progress = await self._build_bus_progress_callback(ctx.msg)

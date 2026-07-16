@@ -65,7 +65,7 @@ class SkillsLoader:
         if not base.exists():
             return []
         entries: list[dict[str, str]] = []
-        for skill_dir in base.iterdir():
+        for skill_dir in sorted(base.iterdir(), key=lambda path: path.name):
             if not skill_dir.is_dir():
                 continue
             skill_file = skill_dir / "SKILL.md"
@@ -178,8 +178,8 @@ class SkillsLoader:
         """
         Build a summary of all skills (name, description, path, availability).
 
-        This is used for progressive loading - the agent can read the full
-        skill content using read_file when needed.
+        This is used for progressive loading - the agent can load the full
+        skill content by name when needed.
 
         Args:
             exclude: Set of skill names to omit from the summary.
@@ -194,11 +194,13 @@ class SkillsLoader:
         def escape_xml(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+        emitted = [skill for skill in all_skills if not exclude or skill["name"] not in exclude]
+        if not emitted:
+            return ""
+
         lines = ["<skills>"]
-        for s in all_skills:
+        for s in emitted:
             skill_name = s["name"]
-            if exclude and skill_name in exclude:
-                continue
             name = escape_xml(skill_name)
             desc = escape_xml(self._get_skill_description(skill_name))
             skill_meta = self._get_skill_meta(skill_name)
