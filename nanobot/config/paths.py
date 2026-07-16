@@ -83,7 +83,7 @@ def is_default_workspace(workspace: str | Path | None) -> bool:
 
 
 def get_cli_history_path() -> Path:
-    """Return the shared CLI history file path."""
+    """Return the CLI history base path (TUI topics derive isolated files from it)."""
     return Path.home() / ".nanobot" / "history" / "cli_history"
 
 

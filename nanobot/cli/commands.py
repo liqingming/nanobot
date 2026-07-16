@@ -2285,6 +2285,7 @@ def agent(
             fresh_session = agent_loop.sessions.get_or_create(f"{cli_channel}:{fresh_chat_id}")
             _mark_cli_session_unnamed(fresh_session)
             topic_state: dict[str, str] = {"chat_id": fresh_chat_id}
+            tui.set_input_history_topic(fresh_session.key)
 
             def _load_topic(name: str) -> None:
                 """Load session history and context estimate for the given topic."""
@@ -2308,6 +2309,7 @@ def agent(
                 display_name = _cli_session_display_name(
                     {"key": s.key, "metadata": s.metadata}, cli_channel
                 )
+                tui.set_input_history_topic(s.key)
                 tui.set_topic("" if display_name == _CLI_UNNAMED_SESSION_LABEL else display_name or name)
                 tui.load_session_history(
                     agent_loop.sessions.display_history(s.key, s.messages),

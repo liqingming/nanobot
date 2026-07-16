@@ -53,10 +53,9 @@ from loguru import logger
 from rich.console import Console
 from rich.text import Text
 
-from nanobot.cli.markdown import terminal_markdown
-
 from nanobot import __logo__, __version__
-from nanobot.fork.cli.tui_base import TUIBase
+from nanobot.cli.markdown import terminal_markdown
+from nanobot.fork.cli.tui_base import TUIBase, input_history_path
 from nanobot.fork.cli.tui_keys import (
     EnterAction,
     PopupAction,
@@ -1326,13 +1325,15 @@ class TextualTUI(TUIBase):
                 "Install it with:  pip install 'nanobot-ai[textual]'"
             )
         self._render_md = render_markdown
-        self._history_file = Path(history_file) if history_file else None
+        self._history_base_file = Path(history_file) if history_file else None
+        self._history_file: Path | None = None
         self._model = model
         self._reasoning_effort = reasoning_effort
         self._workspace_label = _compact_path_label(str(workspace or Path.cwd()))
 
-        # Input history
-        self._history: list[str] = self._load_history()
+        # Input history is bound to an internal session key by
+        # set_input_history_topic(); no topic means no browsable history.
+        self._history: list[str] = []
         self._history_pos: int = -1  # -1 = not navigating
 
         # Streaming state
@@ -2484,6 +2485,17 @@ class TextualTUI(TUIBase):
         # compatibility fallback.
         try:
             self._app._driver.write(f"\033]0;{title}\007")
+        except Exception:
+            pass
+
+    def set_input_history_topic(self, topic_key: str) -> None:
+        self._history_file = input_history_path(self._history_base_file, topic_key)
+        self._history = self._load_history()
+        self._history_pos = -1
+        try:
+            input_widget = self._app.query_one("#input", _ComposerInput)
+            input_widget._clear_multiline_paste_tokens()
+            input_widget.value = ""
         except Exception:
             pass
 

@@ -35,6 +35,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, HTML, AnyFormattedText
 from prompt_toolkit.history import FileHistory as _FileHistory
+from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, VSplit, Window
@@ -44,12 +45,11 @@ from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
 from rich.text import Text
-
-from nanobot.cli.markdown import terminal_markdown
 from wcwidth import wcswidth as _wcswidth
 
 from nanobot import __logo__, __version__
-from nanobot.fork.cli.tui_base import TUIBase
+from nanobot.cli.markdown import terminal_markdown
+from nanobot.fork.cli.tui_base import TUIBase, input_history_path
 from nanobot.fork.cli.tui_keys import (
     EnterAction,
     PopupAction,
@@ -311,6 +311,7 @@ class PromptTUI(TUIBase):
         reasoning_effort: str | None = None,
     ) -> None:
         self._render_md = render_markdown
+        self._history_base_file = history_file
         self._model = model
         self._reasoning_effort = reasoning_effort
         self._output_lines: list[str] = []   # completed ANSI blocks
@@ -357,7 +358,7 @@ class PromptTUI(TUIBase):
         self._popup_on_select: Callable[[str], Awaitable[None]] | None = None
         self._popup_all_topics: list[str] = []
         self._popup_all_items: list[tuple[str, str]] = []
-        self._setup(history_file)
+        self._setup()
 
     # ── Session history restore ────────────────────────────────────────────
 
@@ -656,7 +657,7 @@ class PromptTUI(TUIBase):
 
     # ── Layout setup ───────────────────────────────────────────────────────
 
-    def _setup(self, history_file: str | None) -> None:
+    def _setup(self) -> None:
         output_ctrl = _OutputControl(self, text=self._get_output_text, focusable=False)
         scrollbar_ctrl = _ScrollbarControl(self)
         output_window = VSplit([
@@ -682,10 +683,7 @@ class PromptTUI(TUIBase):
         )
         separator = Window(height=1, char="─", style="class:separator")
 
-        buf_kwargs: dict[str, Any] = {"name": "nanobot_input", "multiline": False}
-        if history_file:
-            buf_kwargs["history"] = _FilteredFileHistory(history_file)
-        self._input_buffer = Buffer(**buf_kwargs)
+        self._input_buffer = Buffer(name="nanobot_input", multiline=False)
         self._input_buffer.on_text_changed += lambda _: self._update_popup()
 
         input_window = Window(
@@ -1021,6 +1019,16 @@ class PromptTUI(TUIBase):
         self._topic = name
         self._invalidate()
         print(f"\033]0;nanobot — {name}\007", end="", flush=True)
+
+    def set_input_history_topic(self, topic_key: str) -> None:
+        path = input_history_path(self._history_base_file, topic_key)
+        if path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            history = _FilteredFileHistory(str(path))
+        else:
+            history = InMemoryHistory()
+        self._input_buffer.history = history
+        self._input_buffer.reset()
 
     def reset_history(self) -> None:
         """Clear all output history (used when switching topics)."""

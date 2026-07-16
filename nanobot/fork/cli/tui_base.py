@@ -6,9 +6,20 @@ implementation (prompt_toolkit or Textual) is selected at runtime by
 """
 from __future__ import annotations
 
+import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
+
+
+def input_history_path(history_file: str | Path | None, topic_key: str) -> Path | None:
+    """Return a stable per-session history path without exposing the session key."""
+    if not history_file or not topic_key:
+        return None
+    base = Path(history_file)
+    digest = hashlib.sha256(topic_key.encode("utf-8")).hexdigest()[:16]
+    return base.parent / "topics" / f"{digest}.history"
 
 
 class TUIBase(ABC):
@@ -117,6 +128,9 @@ class TUIBase(ABC):
 
     @abstractmethod
     def set_topic(self, name: str) -> None: ...
+
+    @abstractmethod
+    def set_input_history_topic(self, topic_key: str) -> None: ...
 
     @abstractmethod
     def set_is_processing(self, value: bool) -> None: ...
