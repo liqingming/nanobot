@@ -471,7 +471,7 @@ class _CodexSSEDiagnostics:
         exact_half_repeat = bool(content) and len(content) % 2 == 0
         if exact_half_repeat:
             midpoint = len(content) // 2
-            exact_half_repeat = hmac.compare_digest(content[:midpoint], content[midpoint:])
+            exact_half_repeat = content[:midpoint] == content[midpoint:]
         return {
             "kind": "codex_sse",
             "event_count": self.event_count,

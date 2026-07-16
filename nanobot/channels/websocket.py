@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import re
 import ssl
@@ -33,6 +32,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
+from nanobot.security.constant_time import constant_time_text_equal
 from nanobot.security.workspace_access import (
     WORKSPACE_SCOPE_METADATA_KEY,
     WorkspaceScopeError,
@@ -415,7 +415,7 @@ class WebSocketChannel(BaseChannel):
         static_token = self.config.token.strip()
 
         if static_token:
-            if supplied and hmac.compare_digest(supplied, static_token):
+            if supplied and constant_time_text_equal(supplied, static_token):
                 return None
             if supplied and self._tokens.take_issued_token_if_valid(supplied):
                 return None

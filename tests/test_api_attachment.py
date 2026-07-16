@@ -188,6 +188,25 @@ def test_parse_json_content_rejects_oversized_base64_file(tmp_path) -> None:
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
+async def test_multipart_tool_policy_is_parsed(aiohttp_client, mock_agent) -> None:
+    import aiohttp
+
+    data = aiohttp.FormData()
+    data.add_field("message", "hello")
+    data.add_field("tool_policy", '{"disable_exec": true}', content_type="application/json")
+
+    app = create_app(mock_agent, model_name="m", api_key=API_KEY)
+    client = await aiohttp_client(app)
+    response = await client.post("/v1/chat/completions", headers=AUTH_HEADERS, data=data)
+
+    assert response.status == 200
+    assert mock_agent.process_direct.call_args.kwargs["metadata"]["tool_policy"] == {
+        "disable_exec": True
+    }
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
 async def test_multipart_upload_saves_file(aiohttp_client, mock_agent, tmp_path) -> None:
     """Multipart upload saves file to media dir and passes path to process_direct."""
     import os

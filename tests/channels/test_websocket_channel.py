@@ -335,6 +335,11 @@ def test_issue_route_secret_matches_bearer_and_header() -> None:
     assert _issue_route_secret_matches(x_headers, secret) is True
     wrong = Headers([("Authorization", "Bearer other")])
     assert _issue_route_secret_matches(wrong, secret) is False
+    unicode_secret = "\u4e2d\u6587\u5bc6\u94a5"
+    unicode_bearer = Headers([("Authorization", f"Bearer {unicode_secret}")])
+    assert _issue_route_secret_matches(unicode_bearer, unicode_secret) is True
+    unicode_header = Headers([("X-Nanobot-Auth", unicode_secret)])
+    assert _issue_route_secret_matches(unicode_header, unicode_secret) is True
 
 
 def test_issue_route_secret_matches_empty_secret() -> None:
@@ -343,6 +348,22 @@ def test_issue_route_secret_matches_empty_secret() -> None:
     # Empty secret always returns True regardless of headers
     assert _issue_route_secret_matches(Headers([]), "") is True
     assert _issue_route_secret_matches(Headers([("Authorization", "Bearer anything")]), "") is True
+
+
+def test_static_token_handshake_supports_non_ascii_token(bus: MagicMock) -> None:
+    token = "\u4e2d\u6587\u5bc6\u94a5"
+    channel = _ch(bus, token=token)
+    connection = MagicMock()
+
+    assert channel._authorize_websocket_handshake(connection, {"token": [token]}) is None
+
+    denied = object()
+    connection.respond.return_value = denied
+    result = channel._authorize_websocket_handshake(
+        connection, {"token": ["\u9519\u8bef\u5bc6\u94a5"]}
+    )
+    assert result is denied
+    connection.respond.assert_called_once_with(401, "Unauthorized")
 
 
 @pytest.mark.asyncio

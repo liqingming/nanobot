@@ -625,6 +625,13 @@ def test_codex_sse_diagnostics_detects_event_and_exact_half_replay() -> None:
     assert result["exact_half_repeat"] is True
 
 
+def test_codex_sse_diagnostics_handles_non_ascii_content() -> None:
+    diagnostics = _CodexSSEDiagnostics()
+
+    assert diagnostics.finish("\u4e2d\u6587\u4e2d\u6587")["exact_half_repeat"] is True
+    assert diagnostics.finish("\u4e2d\u6587\u56de\u7b54")["exact_half_repeat"] is False
+
+
 @pytest.mark.asyncio
 async def test_codex_provider_attaches_diagnostics_without_changing_content(monkeypatch) -> None:
     _mock_codex_token(monkeypatch)

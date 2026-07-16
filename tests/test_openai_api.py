@@ -134,6 +134,19 @@ async def test_api_key_protects_api_routes_but_not_health(aiohttp_client, mock_a
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
+async def test_non_ascii_api_key_rejects_wrong_token_without_server_error(
+    aiohttp_client, mock_agent
+) -> None:
+    app = create_app(mock_agent, model_name="test-model", api_key="\u4e2d\u6587\u5bc6\u94a5")
+    client = await aiohttp_client(app)
+
+    response = await client.get("/v1/models", headers={"Authorization": "Bearer wrong"})
+
+    assert response.status == 401
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
 async def test_api_routes_allow_requests_without_configured_api_key(aiohttp_client, mock_agent) -> None:
     app = create_app(mock_agent, model_name="test-model")
     client = await aiohttp_client(app)

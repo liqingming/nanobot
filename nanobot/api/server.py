@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import json as _json
 import time
 import uuid
@@ -18,6 +17,12 @@ from aiohttp import web
 from loguru import logger
 
 from nanobot.config.paths import get_media_dir
+from nanobot.security.constant_time import constant_time_text_equal
+from nanobot.security.workspace_access import (
+    WORKSPACE_SCOPE_METADATA_KEY,
+    WorkspaceScopeError,
+    validate_workspace_scope_payload,
+)
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
     MAX_FILE_SIZE,
@@ -27,11 +32,6 @@ from nanobot.utils.media_decode import (
 )
 from nanobot.utils.media_decode import (
     save_base64_data_url as _save_base64_data_url,
-)
-from nanobot.security.workspace_access import (
-    WORKSPACE_SCOPE_METADATA_KEY,
-    WorkspaceScopeError,
-    validate_workspace_scope_payload,
 )
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
@@ -195,7 +195,7 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
             timeout = float(raw_timeout) if raw_timeout else None
         elif part.name == "tool_policy":
             raw_policy = (await part.read()).decode("utf-8").strip()
-            tool_policy = json.loads(raw_policy) if raw_policy else None
+            tool_policy = _json.loads(raw_policy) if raw_policy else None
         elif part.name == "files":
             raw = await part.read()
             if len(raw) > MAX_FILE_SIZE:
@@ -506,7 +506,7 @@ def create_app(
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return _error_json(401, "Missing Authorization header. Use: Bearer <api_key>")
-        if not hmac.compare_digest(auth[len("Bearer "):], api_key):
+        if not constant_time_text_equal(auth[len("Bearer "):], api_key):
             return _error_json(401, "Invalid API key")
         return await handler(request)
 

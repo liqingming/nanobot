@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import email.utils
-import hmac
 import http
 import ipaddress
 import json
@@ -13,6 +12,8 @@ from urllib.parse import parse_qs, urlparse
 
 from websockets.datastructures import Headers
 from websockets.http11 import Response
+
+from nanobot.security.constant_time import constant_time_text_equal
 
 QueryParams = dict[str, list[str]]
 
@@ -205,8 +206,8 @@ def issue_route_secret_matches(headers: Any, configured_secret: str) -> bool:
     authorization = headers.get("Authorization") or headers.get("authorization")
     if authorization and authorization.lower().startswith("bearer "):
         supplied = authorization[7:].strip()
-        return hmac.compare_digest(supplied, configured_secret)
+        return constant_time_text_equal(supplied, configured_secret)
     header_token = headers.get("X-Nanobot-Auth") or headers.get("x-nanobot-auth")
     if not header_token:
         return False
-    return hmac.compare_digest(header_token.strip(), configured_secret)
+    return constant_time_text_equal(header_token.strip(), configured_secret)
