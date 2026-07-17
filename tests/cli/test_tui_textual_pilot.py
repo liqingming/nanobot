@@ -44,17 +44,32 @@ async def test_skin_is_disabled_by_default_and_keeps_opaque_background() -> None
 
 
 @pytest.mark.asyncio
-async def test_enabled_skin_uses_transparent_canvas_but_opaque_popup() -> None:
+async def test_enabled_skin_uses_terminal_default_canvas_but_opaque_popup() -> None:
     tui = TextualTUI(skin_enabled=True)
 
     async with tui._app.run_test() as pilot:
         await pilot.pause()
         assert "glass-skin" in tui._app.screen.classes
-        assert tui._app.query_one("#output").styles.background.a == 0
-        assert tui._app.query_one("#input").styles.background.a == 0
-        assert tui._app.query_one("#status").styles.background.a == 0
-        assert tui._app.query_one("#output").styles.scrollbar_background.a == 0
+        for selector in ("#output", "#input", "#status"):
+            background = tui._app.query_one(selector).styles.background
+            assert background.ansi == -1
+            assert background.rich_color.is_default
+        scrollbar_background = tui._app.query_one("#output").styles.scrollbar_background
+        assert scrollbar_background.ansi == -1
+        assert scrollbar_background.rich_color.is_default
         assert tui._app.query_one("#popup").styles.background.hex == "#0C0C0C"
+
+        # Verify the final compositor output, after Textual line filters. The
+        # terminal-default background must survive rather than becoming #0c0c0c.
+        strips = tui._app.screen._compositor.render_strips()
+        ordinary_backgrounds = {
+            style.bgcolor
+            for strip in strips
+            for _text, style, _control in strip._segments
+            if style is not None and style.bgcolor is not None
+        }
+        assert any(background.is_default for background in ordinary_backgrounds)
+        assert not any(str(background) == "Color('#0c0c0c', ColorType.TRUECOLOR, triplet=ColorTriplet(red=12, green=12, blue=12))" for background in ordinary_backgrounds)
 
 
 @pytest.mark.asyncio

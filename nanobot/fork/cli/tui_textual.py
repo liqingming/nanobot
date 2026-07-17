@@ -830,8 +830,9 @@ if _TEXTUAL_AVAILABLE:
             display: block;
         }
 
-        /* Optional glass skin. The terminal owns the image, opacity, and blur;
-           Textual only stops painting opaque cells over that terminal canvas. */
+        /* Optional glass skin. Use the terminal's default background rather than
+           Textual's transparent color: a transparent root defers to App.render(),
+           which paints the Textual theme background and hides terminal acrylic. */
         Screen.glass-skin,
         Screen.glass-skin #output,
         Screen.glass-skin #sep-row,
@@ -842,10 +843,10 @@ if _TEXTUAL_AVAILABLE:
         Screen.glass-skin TextArea,
         Screen.glass-skin #status,
         Screen.glass-skin #todo-bar {
-            background: transparent;
+            background: ansi_default;
         }
         Screen.glass-skin #output {
-            scrollbar-background: transparent;
+            scrollbar-background: ansi_default;
         }
         /* Keep transient overlays opaque so commands remain readable over
            arbitrary user-selected terminal background images. */
@@ -863,7 +864,10 @@ if _TEXTUAL_AVAILABLE:
         ]
 
         def __init__(self, tui: "TextualTUI") -> None:
-            super().__init__()
+            # Preserve ``ansi_default`` in glass mode. Textual normally converts
+            # ANSI colors to truecolor, which turns the terminal-default canvas
+            # back into the opaque theme background before terminal output.
+            super().__init__(ansi_color=True if tui._skin_enabled else None)
             self._tui = tui
             self._spinner_timer: Any = None
             self._spinner_frame = 0
