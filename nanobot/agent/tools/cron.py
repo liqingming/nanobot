@@ -124,6 +124,13 @@ class CronTool(Tool, ContextAware):
             f"If tz is omitted, cron expressions and naive ISO times default to {self._default_timezone}."
         )
 
+    @property
+    def supports_read_only_calls(self) -> bool:
+        return True
+
+    def is_read_only_call(self, params: Any) -> bool:
+        return isinstance(params, dict) and params.get("action") == "list"
+
     def validate_params(self, params: dict[str, Any]) -> list[str]:
         errors = super().validate_params(params)
         action = params.get("action")

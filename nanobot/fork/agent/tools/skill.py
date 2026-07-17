@@ -65,6 +65,10 @@ class LoadSkillTool(Tool):
         )
 
     @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",

@@ -588,6 +588,13 @@ class ProcessControlTool(Tool):
             "or restart a managed process."
         )
 
+    @property
+    def supports_read_only_calls(self) -> bool:
+        return True
+
+    def is_read_only_call(self, params: Any) -> bool:
+        return isinstance(params, dict) and params.get("action") in {"list", "logs"}
+
     async def execute(
         self,
         action: str,

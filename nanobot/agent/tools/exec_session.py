@@ -486,6 +486,18 @@ class WriteStdinTool(Tool):
             "Do not use this to start new commands; start them with exec."
         )
 
+    @property
+    def supports_read_only_calls(self) -> bool:
+        return True
+
+    def is_read_only_call(self, params: Any) -> bool:
+        return (
+            isinstance(params, dict)
+            and not str(params.get("chars") or "")
+            and not bool(params.get("close_stdin"))
+            and not bool(params.get("terminate"))
+        )
+
     async def execute(
         self,
         session_id: str,

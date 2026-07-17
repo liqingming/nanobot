@@ -179,6 +179,15 @@ class Tool(ABC):
         return False
 
     @property
+    def supports_read_only_calls(self) -> bool:
+        """Whether this tool has at least one request shape safe in read-only mode."""
+        return self.read_only
+
+    def is_read_only_call(self, params: Any) -> bool:
+        """Return whether this concrete invocation is side-effect free."""
+        return self.read_only
+
+    @property
     def concurrency_safe(self) -> bool:
         """Whether this tool can run alongside other concurrency-safe tools."""
         return self.read_only and not self.exclusive

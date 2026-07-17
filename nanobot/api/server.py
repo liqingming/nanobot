@@ -279,17 +279,18 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         if not isinstance(requested_tool_policy, dict):
             return _error_json(400, "tool_policy must be an object")
         normalized_policy: dict[str, list[str]] = {}
-        for key in ("blocked_find_files_paths", "blocked_grep_paths", "blocked_read_file_paths", "allowed_grep_paths"):
+        for key in ("blocked_find_files_paths", "blocked_grep_paths", "blocked_read_file_paths", "allowed_grep_paths", "blocked_tool_names"):
             paths = requested_tool_policy.get(key)
             if paths is None:
                 continue
             if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
                 return _error_json(400, f"tool_policy.{key} must be an array of strings")
             normalized_policy[key] = list(paths)
-        if "disable_exec" in requested_tool_policy:
-            if not isinstance(requested_tool_policy["disable_exec"], bool):
-                return _error_json(400, "tool_policy.disable_exec must be a boolean")
-            normalized_policy["disable_exec"] = requested_tool_policy["disable_exec"]
+        for boolean_key in ("disable_all_tools", "disable_exec", "read_only_mode"):
+            if boolean_key in requested_tool_policy:
+                if not isinstance(requested_tool_policy[boolean_key], bool):
+                    return _error_json(400, f"tool_policy.{boolean_key} must be a boolean")
+                normalized_policy[boolean_key] = requested_tool_policy[boolean_key]
         blocked_exec_patterns = requested_tool_policy.get("blocked_exec_patterns")
         if blocked_exec_patterns is not None:
             if not isinstance(blocked_exec_patterns, list) or not all(isinstance(pattern, str) for pattern in blocked_exec_patterns):

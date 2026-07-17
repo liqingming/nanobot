@@ -599,14 +599,14 @@ async def test_json_request_passes_workspace_and_timeout_to_agent(aiohttp_client
             "messages": [{"role": "user", "content": "hello"}],
             "workspace": str(tmp_path),
             "timeout": 30,
-            "tool_policy": {"blocked_grep_paths": ["Assets"], "blocked_read_file_paths": ["Assets/ResourcesAssets"], "allowed_grep_paths": ["Assets/Script/Game/moduls/DragonInvadeActivity"], "disable_exec": True, "blocked_exec_patterns": ["\\bgit\\s+commit\\b"]},
+            "tool_policy": {"blocked_grep_paths": ["Assets"], "blocked_read_file_paths": ["Assets/ResourcesAssets"], "allowed_grep_paths": ["Assets/Script/Game/moduls/DragonInvadeActivity"], "blocked_tool_names": ["long_task", "todo_write"], "disable_all_tools": True, "disable_exec": True, "read_only_mode": True, "blocked_exec_patterns": ["\\bgit\\s+commit\\b"]},
         },
     )
 
     assert resp.status == 200
     kwargs = agent.process_direct.call_args.kwargs
     assert kwargs["metadata"]["workspace_scope"]["project_path"] == str(tmp_path.resolve())
-    assert kwargs["metadata"]["tool_policy"] == {"blocked_grep_paths": ["Assets"], "blocked_read_file_paths": ["Assets/ResourcesAssets"], "allowed_grep_paths": ["Assets/Script/Game/moduls/DragonInvadeActivity"], "disable_exec": True, "blocked_exec_patterns": ["\\bgit\\s+commit\\b"]}
+    assert kwargs["metadata"]["tool_policy"] == {"blocked_grep_paths": ["Assets"], "blocked_read_file_paths": ["Assets/ResourcesAssets"], "allowed_grep_paths": ["Assets/Script/Game/moduls/DragonInvadeActivity"], "blocked_tool_names": ["long_task", "todo_write"], "disable_all_tools": True, "disable_exec": True, "read_only_mode": True, "blocked_exec_patterns": ["\\bgit\\s+commit\\b"]}
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
@@ -625,3 +625,41 @@ async def test_invalid_workspace_returns_400(aiohttp_client, tmp_path) -> None:
     )
 
     assert resp.status == 400
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_disable_all_tools_policy_requires_boolean(aiohttp_client) -> None:
+    agent = _make_mock_agent()
+    app = create_app(agent, model_name="test-model")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "tool_policy": {"disable_all_tools": "yes"},
+        },
+    )
+
+    assert resp.status == 400
+    assert "tool_policy.disable_all_tools must be a boolean" in (await resp.text())
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_read_only_mode_policy_requires_boolean(aiohttp_client) -> None:
+    agent = _make_mock_agent()
+    app = create_app(agent, model_name="test-model")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "tool_policy": {"read_only_mode": "yes"},
+        },
+    )
+
+    assert resp.status == 400
+    assert "tool_policy.read_only_mode must be a boolean" in (await resp.text())

@@ -269,6 +269,62 @@ class ExecTool(Tool):
     _MAX_TIMEOUT = 600
     _MAX_OUTPUT = 10_000
 
+    @property
+    def supports_read_only_calls(self) -> bool:
+        return True
+
+    def is_read_only_call(self, params: Any) -> bool:
+        if not isinstance(params, dict):
+            return False
+        command = str(params.get("command") or params.get("cmd") or "").strip()
+        return self._is_read_only_command(command)
+
+    @staticmethod
+    def _is_read_only_command(command: str) -> bool:
+        """Conservative allowlist for diagnostics that cannot mutate local state."""
+        if not command or re.search(r"[><|;&`\r\n]", command):
+            return False
+        if re.search(r"\$\(|%[^%]+%|\$env:|\$[a-z_]", command, re.IGNORECASE):
+            return False
+        tokens = re.findall(r'"[^"]*"|\S+', command)
+        if not tokens:
+            return False
+        executable = Path(tokens[0].strip('"')).name.lower()
+        if executable.removesuffix(".exe") in {"python", "py", "node", "ruby", "perl", "php", "powershell", "pwsh", "cmd", "bash", "sh", "wsl", "cscript", "wscript"}:
+            return False
+        if executable in {"git", "git.exe"}:
+            if len(tokens) < 2:
+                return False
+            args = [token.strip('"').lower() for token in tokens[2:]]
+            if any(
+                arg.startswith(("--output", "--open-files-in-pager"))
+                or arg in {"-o", "--exec-path", "--ext-diff", "--textconv", "--paginate", "-p"}
+                for arg in args
+            ):
+                return False
+            subcommand = tokens[1].lower()
+            if subcommand == "branch":
+                return not args or all(arg in {"-a", "--all", "-r", "--remotes", "-l", "--list", "-v", "-vv", "--verbose", "--show-current", "--contains", "--no-contains", "--merged", "--no-merged", "--format"} or arg.startswith("--format=") for arg in args)
+            if subcommand == "tag":
+                return not args or all(arg in {"-l", "--list", "--contains", "--no-contains", "--merged", "--no-merged", "-n", "--sort", "--format"} or arg.startswith(("--sort=", "--format=")) for arg in args)
+            if subcommand == "remote":
+                return not args or args[0] in {"-v", "--verbose", "show", "get-url"}
+            return subcommand in {
+                "status", "diff", "show", "log", "rev-parse", "describe", "blame", "grep",
+                "ls-files", "ls-tree", "cat-file", "merge-base", "name-rev", "shortlog",
+                "for-each-ref", "count-objects",
+            }
+        if executable in {"dotnet", "dotnet.exe"}:
+            return len(tokens) == 2 and tokens[1].lower() in {"--info", "--version", "--list-sdks", "--list-runtimes"}
+        if executable in {"java", "java.exe", "javac", "javac.exe"}:
+            return len(tokens) == 2 and tokens[1].lower() in {"-version", "--version"}
+        return executable in {
+            "where", "where.exe", "whoami", "whoami.exe", "hostname", "hostname.exe",
+            "ver", "systeminfo", "systeminfo.exe", "tasklist", "tasklist.exe", "netstat", "netstat.exe",
+            "ipconfig", "ipconfig.exe", "ping", "ping.exe", "tracert", "tracert.exe", "nslookup", "nslookup.exe",
+            "type", "dir", "tree", "tree.com", "fc", "fc.exe", "findstr", "findstr.exe",
+        }
+
     # Kernel device files safe as stdio redirect targets (#3599).
     _BENIGN_DEVICE_PATHS: frozenset[str] = frozenset({
         "/dev/null",
@@ -323,6 +379,9 @@ class ExecTool(Tool):
         if isinstance(policy, dict) and policy.get("disable_exec") is True:
             return ToolResult.error("Error: exec is blocked by the request tool_policy.")
         command = command or cmd
+        if isinstance(policy, dict) and policy.get("read_only_mode") is True:
+            if not self._is_read_only_command(str(command or "")):
+                return ToolResult.error("Error: command is not allowed in request read-only mode.")
         if isinstance(policy, dict) and command:
             for pattern in policy.get("blocked_exec_patterns") or []:
                 try:

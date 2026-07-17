@@ -512,3 +512,52 @@ def test_subagent_prompt_respects_disabled_skills(tmp_path: Path) -> None:
 
     assert "alpha" not in prompt
     assert "beta" in prompt
+
+
+@pytest.mark.parametrize(
+    ("command", "allowed"),
+    [
+        ("git status --short", True),
+        ("git diff --check", True),
+        ("git log -5 --oneline", True),
+        ("git branch --show-current", True),
+        ("git remote -v", True),
+        ("where python", True),
+        ("where powershell", True),
+        ("tasklist", True),
+        ("dotnet --info", True),
+        ("git checkout main", False),
+        ("git branch new-name", False),
+        ("git tag v1", False),
+        ("git remote add origin x", False),
+        ("git diff --output=patch.txt", False),
+        ("git diff --ext-diff", False),
+        ("git show --textconv HEAD:file", False),
+        ("git grep --open-files-in-pager=writer needle", False),
+        ("git --paginate status", False),
+        ("python -c \"open('x','w').write('y')\"", False),
+        ("type source.txt > copy.txt", False),
+        ("git status & echo x", False),
+        ("git status | findstr M", False),
+        ("powershell Get-Content x", False),
+        ("dotnet build", False),
+    ],
+)
+def test_exec_read_only_command_classifier(command: str, allowed: bool) -> None:
+    assert ExecTool._is_read_only_command(command) is allowed
+
+
+@pytest.mark.asyncio
+async def test_exec_read_only_mode_allows_diagnostics_and_blocks_mutation(tmp_path: Path) -> None:
+    tool = ExecTool(working_dir=str(tmp_path))
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="default", session_key="api:repair",
+        metadata={"tool_policy": {"read_only_mode": True}},
+    ))
+    try:
+        allowed = await tool.execute(command="git status --short", shell="cmd")
+        blocked = await tool.execute(command="git checkout main", shell="cmd")
+    finally:
+        reset_request_context(token)
+    assert "not allowed" not in str(allowed)
+    assert "not allowed in request read-only mode" in str(blocked)

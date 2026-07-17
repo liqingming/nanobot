@@ -4,6 +4,7 @@ import json
 from typing import Any, Callable
 
 from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.context import current_request_context
 
 
 def is_tool_error_result(name: str, result: Any) -> bool:
@@ -102,23 +103,36 @@ class ToolRegistry:
         sorted and appended.  The result is cached until the next
         register/unregister call.
         """
-        if self._cached_definitions is not None:
-            return self._cached_definitions
+        if self._cached_definitions is None:
+            definitions = [tool.to_schema() for tool in self._tools.values()]
+            builtins: list[dict[str, Any]] = []
+            mcp_tools: list[dict[str, Any]] = []
+            for schema in definitions:
+                name = self._schema_name(schema)
+                if name.startswith("mcp_"):
+                    mcp_tools.append(schema)
+                else:
+                    builtins.append(schema)
 
-        definitions = [tool.to_schema() for tool in self._tools.values()]
-        builtins: list[dict[str, Any]] = []
-        mcp_tools: list[dict[str, Any]] = []
-        for schema in definitions:
-            name = self._schema_name(schema)
-            if name.startswith("mcp_"):
-                mcp_tools.append(schema)
-            else:
-                builtins.append(schema)
+            builtins.sort(key=self._schema_name)
+            mcp_tools.sort(key=self._schema_name)
+            self._cached_definitions = builtins + mcp_tools
 
-        builtins.sort(key=self._schema_name)
-        mcp_tools.sort(key=self._schema_name)
-        self._cached_definitions = builtins + mcp_tools
-        return self._cached_definitions
+        request_ctx = current_request_context()
+        policy = request_ctx.metadata.get("tool_policy") if request_ctx else None
+        if isinstance(policy, dict) and policy.get("disable_all_tools") is True:
+            return []
+        definitions = self._cached_definitions
+        if isinstance(policy, dict) and policy.get("read_only_mode") is True:
+            definitions = [
+                schema for schema in definitions
+                if (tool := self._tools.get(self._schema_name(schema))) is not None and tool.supports_read_only_calls
+            ]
+        blocked_tool_names = policy.get("blocked_tool_names") if isinstance(policy, dict) else None
+        if isinstance(blocked_tool_names, list):
+            blocked = set(blocked_tool_names)
+            return [schema for schema in definitions if self._schema_name(schema) not in blocked]
+        return definitions
 
     def prepare_call(
         self,
@@ -191,8 +205,18 @@ class ToolRegistry:
 
     async def execute(self, name: str, params: Any) -> Any:
         """Execute a tool by name with given parameters."""
+        request_ctx = current_request_context()
+        policy = request_ctx.metadata.get("tool_policy") if request_ctx else None
+        if isinstance(policy, dict) and policy.get("disable_all_tools") is True:
+            return ToolResult.error("Error: all tools are blocked by the request tool_policy.")
+        blocked_tool_names = policy.get("blocked_tool_names") if isinstance(policy, dict) else None
+        if isinstance(blocked_tool_names, list) and name in blocked_tool_names:
+            return ToolResult.error(f"Error: tool '{name}' is blocked by the request tool_policy.")
         hint = "\n\n[Analyze the error above and try a different approach.]"
         tool, params, error = self.prepare_call(name, params)
+        if tool is not None and isinstance(policy, dict) and policy.get("read_only_mode") is True:
+            if not tool.is_read_only_call(params):
+                return ToolResult.error(f"Error: tool '{name}' call is not allowed in request read-only mode.")
         if error:
             return ToolResult.error(str(error) + hint)
 

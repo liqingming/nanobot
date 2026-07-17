@@ -4,18 +4,24 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.filesystem import ReadFileTool
 from nanobot.agent.tools.registry import ToolRegistry
 
 
 class _FakeTool(Tool):
-    def __init__(self, name: str, schema: dict[str, Any] | None = None):
+    def __init__(self, name: str, schema: dict[str, Any] | None = None, *, read_only: bool = False):
         self._name = name
         self._schema = schema
+        self._read_only = read_only
 
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
 
     @property
     def description(self) -> str:
@@ -321,3 +327,127 @@ def test_unregister_invalidates_cache() -> None:
     second = registry.get_definitions()
     assert first is not second
     assert len(second) == 1
+
+
+async def test_registry_blocks_every_tool_for_disable_all_tools_policy() -> None:
+    registry = ToolRegistry()
+    tool = _FakeTool("write_file")
+    tool.execute = AsyncMock(return_value="written")
+    registry.register(tool)
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="repair", metadata={"tool_policy": {"disable_all_tools": True}},
+    ))
+    try:
+        result = await registry.execute("write_file", {"path": "x", "content": "y"})
+    finally:
+        reset_request_context(token)
+
+    assert isinstance(result, ToolResult)
+    assert result.is_error
+    assert "all tools are blocked" in str(result)
+    tool.execute.assert_not_awaited()
+
+
+async def test_registry_blocks_named_tool_but_keeps_other_tools_available() -> None:
+    registry = ToolRegistry()
+    blocked = _FakeTool("long_task")
+    allowed = _FakeTool("read_file")
+    blocked.execute = AsyncMock(return_value="started")
+    allowed.execute = AsyncMock(return_value="read")
+    registry.register(blocked)
+    registry.register(allowed)
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="repair", metadata={"tool_policy": {"blocked_tool_names": ["long_task"]}},
+    ))
+    try:
+        blocked_result = await registry.execute("long_task", {"goal": "x"})
+        allowed_result = await registry.execute("read_file", {"path": "x"})
+    finally:
+        reset_request_context(token)
+
+    assert isinstance(blocked_result, ToolResult)
+    assert blocked_result.is_error
+    assert "tool 'long_task' is blocked" in str(blocked_result)
+    blocked.execute.assert_not_awaited()
+    allowed.execute.assert_awaited_once_with(path="x")
+    assert allowed_result == "read"
+
+
+async def test_get_definitions_hides_tools_blocked_for_current_request() -> None:
+    registry = _registry_with_names(["read_file", "long_task", "todo_write"])
+    unfiltered = registry.get_definitions()
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="repair", metadata={"tool_policy": {"blocked_tool_names": ["long_task", "todo_write"]}},
+    ))
+    try:
+        filtered = registry.get_definitions()
+    finally:
+        reset_request_context(token)
+
+    assert _tool_names(unfiltered) == ["long_task", "read_file", "todo_write"]
+    assert _tool_names(filtered) == ["read_file"]
+    assert _tool_names(registry.get_definitions()) == ["long_task", "read_file", "todo_write"]
+
+
+async def test_get_definitions_is_empty_when_all_tools_are_disabled() -> None:
+    registry = _registry_with_names(["read_file", "write_file"])
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="repair", metadata={"tool_policy": {"disable_all_tools": True}},
+    ))
+    try:
+        assert registry.get_definitions() == []
+    finally:
+        reset_request_context(token)
+
+
+async def test_read_only_mode_hides_and_blocks_mutating_tools_but_allows_read_tools() -> None:
+    registry = ToolRegistry()
+    read_tool = _FakeTool("read_file", read_only=True)
+    write_tool = _FakeTool("write_file")
+    read_tool.execute = AsyncMock(return_value="read")
+    write_tool.execute = AsyncMock(return_value="written")
+    registry.register(read_tool)
+    registry.register(write_tool)
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="repair", metadata={"tool_policy": {"read_only_mode": True}},
+    ))
+    try:
+        assert _tool_names(registry.get_definitions()) == ["read_file"]
+        read_result = await registry.execute("read_file", {"path": "x"})
+        write_result = await registry.execute("write_file", {"path": "x", "content": "y"})
+    finally:
+        reset_request_context(token)
+
+    assert read_result == "read"
+    read_tool.execute.assert_awaited_once_with(path="x")
+    assert isinstance(write_result, ToolResult) and write_result.is_error
+    assert "not allowed in request read-only mode" in str(write_result)
+    write_tool.execute.assert_not_awaited()
+
+
+async def test_read_only_mode_allows_only_safe_shape_of_mixed_tool() -> None:
+    class _MixedTool(_FakeTool):
+        @property
+        def supports_read_only_calls(self) -> bool:
+            return True
+
+        def is_read_only_call(self, params: Any) -> bool:
+            return isinstance(params, dict) and params.get("action") == "check"
+
+    registry = ToolRegistry()
+    tool = _MixedTool("my")
+    tool.execute = AsyncMock(return_value="ok")
+    registry.register(tool)
+    token = bind_request_context(RequestContext(
+        channel="api", chat_id="repair", metadata={"tool_policy": {"read_only_mode": True}},
+    ))
+    try:
+        assert _tool_names(registry.get_definitions()) == ["my"]
+        check_result = await registry.execute("my", {"action": "check"})
+        set_result = await registry.execute("my", {"action": "set", "key": "model", "value": "x"})
+    finally:
+        reset_request_context(token)
+
+    assert check_result == "ok"
+    assert isinstance(set_result, ToolResult) and set_result.is_error
+    tool.execute.assert_awaited_once_with(action="check")

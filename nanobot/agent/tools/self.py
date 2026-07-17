@@ -164,6 +164,13 @@ class MyTool(Tool, ContextAware):
         return base
 
     @property
+    def supports_read_only_calls(self) -> bool:
+        return True
+
+    def is_read_only_call(self, params: Any) -> bool:
+        return isinstance(params, dict) and params.get("action") in ("inspect", "check")
+
+    @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
