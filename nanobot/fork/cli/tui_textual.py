@@ -147,8 +147,9 @@ if _TEXTUAL_AVAILABLE:
         """
         can_focus = False
 
-        def __init__(self, **kwargs: Any) -> None:
+        def __init__(self, *, user_background: str = "#2d2d2d", **kwargs: Any) -> None:
             super().__init__(**kwargs)
+            self._user_background = user_background
             if hasattr(self, "auto_scroll"):
                 self.auto_scroll = False
             self._sel_start: tuple[int, int] | None = None  # content-space row, cell column
@@ -391,7 +392,7 @@ if _TEXTUAL_AVAILABLE:
             else:
                 strip = super().render_line(y)
             if self._user_ranges and any(s <= content_row <= e for s, e in self._user_ranges):
-                strip = self._force_bgcolor(strip, "#2d2d2d")
+                strip = self._force_bgcolor(strip, self._user_background)
             points = self._selection_points()
             if points is not None:
                 cols = self._selection_cols_for_row(
@@ -848,6 +849,14 @@ if _TEXTUAL_AVAILABLE:
         Screen.glass-skin #output {
             scrollbar-background: ansi_default;
         }
+        Screen.glass-skin TextArea .text-area--cursor-line {
+            background: ansi_default;
+        }
+        Screen.glass-skin TextArea .text-area--cursor {
+            color: black;
+            background: white;
+            text-style: none;
+        }
         /* Keep transient overlays opaque so commands remain readable over
            arbitrary user-selected terminal background images. */
         Screen.glass-skin #popup {
@@ -918,7 +927,14 @@ if _TEXTUAL_AVAILABLE:
             return f" ({minutes}m{seconds}s)"
 
         def compose(self) -> ComposeResult:
-            yield _OutputLog(id="output", markup=True, highlight=False, wrap=True)
+            user_background = "default" if self._tui._skin_enabled else "#2d2d2d"
+            yield _OutputLog(
+                id="output",
+                markup=True,
+                highlight=False,
+                wrap=True,
+                user_background=user_background,
+            )
             yield Static("", id="live")
             yield Static("", id="popup")
             yield Static("", id="todo-bar")

@@ -39,7 +39,9 @@ async def test_skin_is_disabled_by_default_and_keeps_opaque_background() -> None
     async with tui._app.run_test() as pilot:
         await pilot.pause()
         assert "glass-skin" not in tui._app.screen.classes
-        assert tui._app.query_one("#output").styles.background.hex == "#0C0C0C"
+        output = tui._app.query_one("#output")
+        assert output.styles.background.hex == "#0C0C0C"
+        assert output._user_background == "#2d2d2d"
         assert tui._app.query_one("#popup").styles.background.hex == "#0C0C0C"
 
 
@@ -50,6 +52,7 @@ async def test_enabled_skin_uses_terminal_default_canvas_but_opaque_popup() -> N
     async with tui._app.run_test() as pilot:
         await pilot.pause()
         assert "glass-skin" in tui._app.screen.classes
+        assert tui._app.query_one("#output")._user_background == "default"
         for selector in ("#output", "#input", "#status"):
             background = tui._app.query_one(selector).styles.background
             assert background.ansi == -1
@@ -58,6 +61,12 @@ async def test_enabled_skin_uses_terminal_default_canvas_but_opaque_popup() -> N
         assert scrollbar_background.ansi == -1
         assert scrollbar_background.rich_color.is_default
         assert tui._app.query_one("#popup").styles.background.hex == "#0C0C0C"
+        input_widget = tui._app.query_one("#input")
+        cursor_line = input_widget.get_component_rich_style("text-area--cursor-line")
+        assert cursor_line.bgcolor.is_default
+        cursor = input_widget.get_component_rich_style("text-area--cursor")
+        assert cursor.bgcolor.name == "#ffffff"
+        assert cursor.color.name == "#000000"
 
         # Verify the final compositor output, after Textual line filters. The
         # terminal-default background must survive rather than becoming #0c0c0c.
