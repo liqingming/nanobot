@@ -1004,7 +1004,7 @@ def _tui_command_palette() -> list[tuple[str, str, str]]:
         ("/system-prompt", "Show the current topic's rendered system rules.", "submit"),
         ("/skin", "Switch the Windows Terminal background image.", "edit"),
         ("/clear", "Clear context and start an unnamed empty session.", "submit"),
-        ("/resume", "Switch to a saved CLI session.", "edit"),
+        ("/resume", "Show saved CLI sessions and switch topics.", "submit"),
         ("/todos", "Show or clear the current topic todo list.", "submit"),
         ("/continue", "Continue the last interrupted task.", "submit"),
         ("/commit_memory", "Promote or preview pending memory consolidation.", "submit"),

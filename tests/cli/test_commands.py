@@ -310,6 +310,16 @@ def test_skin_is_only_an_interactive_local_command() -> None:
     assert ("/skin", "Switch the Windows Terminal background image.", "edit") in palette
 
 
+def test_resume_palette_selection_submits_to_show_topic_list() -> None:
+    palette = cli_commands._tui_command_palette()
+
+    assert (
+        "/resume",
+        "Show saved CLI sessions and switch topics.",
+        "submit",
+    ) in palette
+
+
 def test_format_prompt_inspection_shows_system_and_current_context_only() -> None:
     rendered = cli_commands._format_prompt_inspection(
         [
@@ -397,7 +407,10 @@ def test_tui_command_palette_uses_claude_style_session_commands() -> None:
         "submit",
     )
     assert commands["/clear"] == ("Clear context and start an unnamed empty session.", "submit")
-    assert commands["/resume"] == ("Switch to a saved CLI session.", "edit")
+    assert commands["/resume"] == (
+        "Show saved CLI sessions and switch topics.",
+        "submit",
+    )
 
 
 def test_runtime_data_dir_for_custom_workspace_uses_cache(tmp_path: Path):
