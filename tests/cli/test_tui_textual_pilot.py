@@ -57,7 +57,10 @@ async def test_enabled_skin_uses_terminal_default_canvas_but_opaque_popup() -> N
             background = tui._app.query_one(selector).styles.background
             assert background.ansi == -1
             assert background.rich_color.is_default
-        scrollbar_background = tui._app.query_one("#output").styles.scrollbar_background
+        output = tui._app.query_one("#output")
+        assert output.styles.overflow_x == "hidden"
+        assert output.styles.scrollbar_size_horizontal == 0
+        scrollbar_background = output.styles.scrollbar_background
         assert scrollbar_background.ansi == -1
         assert scrollbar_background.rich_color.is_default
         assert tui._app.query_one("#popup").styles.background.hex == "#0C0C0C"

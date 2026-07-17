@@ -847,6 +847,8 @@ if _TEXTUAL_AVAILABLE:
             background: ansi_default;
         }
         Screen.glass-skin #output {
+            overflow-x: hidden;
+            scrollbar-size-horizontal: 0;
             scrollbar-background: ansi_default;
         }
         Screen.glass-skin TextArea .text-area--cursor-line {
