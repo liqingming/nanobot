@@ -298,6 +298,18 @@ def test_system_prompt_is_only_an_interactive_local_command() -> None:
     assert "system-prompt" not in _strip_ansi(result.stdout)
 
 
+def test_skin_is_only_an_interactive_local_command() -> None:
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "skin" not in _strip_ansi(result.stdout)
+    assert cli_commands._is_cli_local_command("/skin")
+    assert cli_commands._is_cli_local_command("/skin next")
+    assert not cli_commands._is_cli_local_command("skin next")
+    palette = cli_commands._tui_command_palette()
+    assert ("/skin", "Switch the Windows Terminal background image.", "edit") in palette
+
+
 def test_format_prompt_inspection_shows_system_and_current_context_only() -> None:
     rendered = cli_commands._format_prompt_inspection(
         [

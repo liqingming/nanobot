@@ -685,6 +685,8 @@ def _is_cli_local_command(text: str) -> bool:
         _is_exit_command(command)
         or command == "/skills"
         or command == "/system-prompt"
+        or command == "/skin"
+        or command.startswith("/skin ")
         or command == "/clear"
         or command == "/rename"
         or command.startswith("/rename ")
@@ -1000,6 +1002,7 @@ def _tui_command_palette() -> list[tuple[str, str, str]]:
     items.extend([
         ("/rename", "Rename the current CLI session.", "edit"),
         ("/system-prompt", "Show the current topic's rendered system rules.", "submit"),
+        ("/skin", "Switch the Windows Terminal background image.", "edit"),
         ("/clear", "Clear context and start an unnamed empty session.", "submit"),
         ("/resume", "Switch to a saved CLI session.", "edit"),
         ("/todos", "Show or clear the current topic todo list.", "submit"),
@@ -2591,6 +2594,54 @@ def agent(
                         unified_session=agent_loop._unified_session,
                     )
                     tui.add_system(_format_prompt_inspection(messages))
+                    return
+
+                if text == "/skin" or text.startswith("/skin "):
+                    from nanobot.cli.terminal_skin import (
+                        SkinError,
+                        current_background,
+                        find_terminal_settings,
+                        format_skin_list,
+                        list_skin_images,
+                        switch_skin,
+                    )
+
+                    def _switch_terminal_skin(selector: str) -> None:
+                        try:
+                            selected, settings, _backup = switch_skin(selector)
+                        except (SkinError, OSError, ValueError) as exc:
+                            tui.add_system(f"切换终端背景失败: {exc}")
+                            return
+                        tui.add_system(
+                            f"已切换 Windows Terminal 背景图: {selected.name}\n"
+                            f"配置: {settings}"
+                        )
+
+                    arg = text[len("/skin"):].strip()
+                    try:
+                        images = list_skin_images()
+                        current = current_background(find_terminal_settings())
+                    except (SkinError, OSError, ValueError) as exc:
+                        tui.add_system(f"读取终端背景失败: {exc}")
+                        return
+                    if arg.casefold() == "list":
+                        tui.add_system(format_skin_list(images, current))
+                        return
+                    if arg:
+                        _switch_terminal_skin(arg)
+                        return
+
+                    async def _on_skin_select(selector: str) -> None:
+                        _switch_terminal_skin(selector)
+
+                    items = [
+                        (
+                            image.name,
+                            f"{'* ' if image == current else '  '}{index}. {image.name}",
+                        )
+                        for index, image in enumerate(images, 1)
+                    ]
+                    tui.show_topic_popup(items, _on_skin_select)
                     return
 
                 if text == "/clear":
