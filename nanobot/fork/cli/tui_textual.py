@@ -829,6 +829,29 @@ if _TEXTUAL_AVAILABLE:
         #todo-bar.visible {
             display: block;
         }
+
+        /* Optional glass skin. The terminal owns the image, opacity, and blur;
+           Textual only stops painting opaque cells over that terminal canvas. */
+        Screen.glass-skin,
+        Screen.glass-skin #output,
+        Screen.glass-skin #sep-row,
+        Screen.glass-skin #sep,
+        Screen.glass-skin #topic-bar,
+        Screen.glass-skin #live,
+        Screen.glass-skin #input,
+        Screen.glass-skin TextArea,
+        Screen.glass-skin #status,
+        Screen.glass-skin #todo-bar {
+            background: transparent;
+        }
+        Screen.glass-skin #output {
+            scrollbar-background: transparent;
+        }
+        /* Keep transient overlays opaque so commands remain readable over
+           arbitrary user-selected terminal background images. */
+        Screen.glass-skin #popup {
+            background: #0c0c0c;
+        }
         """
 
         BINDINGS = [
@@ -902,6 +925,8 @@ if _TEXTUAL_AVAILABLE:
             yield Static("", id="status")
 
         def on_mount(self) -> None:
+            if self._tui._skin_enabled:
+                self.screen.add_class("glass-skin")
             self.query_one("#input").focus()
             self._write_welcome()
             self.update_topic_bar(self._tui._workspace_label, self._tui._topic)
@@ -1318,6 +1343,7 @@ class TextualTUI(TUIBase):
         history_file: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        skin_enabled: bool = False,
         workspace: str | Path | None = None,
     ) -> None:
         if not _TEXTUAL_AVAILABLE:
@@ -1330,6 +1356,7 @@ class TextualTUI(TUIBase):
         self._history_file: Path | None = None
         self._model = model
         self._reasoning_effort = reasoning_effort
+        self._skin_enabled = skin_enabled
         self._workspace_label = _compact_path_label(str(workspace or Path.cwd()))
 
         # Input history is bound to an internal session key by

@@ -2275,6 +2275,7 @@ def agent(
                 model=agent_loop.model,
                 reasoning_effort=getattr(agent_loop.provider.generation, "reasoning_effort", None),
                 backend=config.agents.defaults.tui_backend,
+                skin_enabled=config.agents.defaults.tui_skin_enabled,
                 workspace=agent_loop.workspace,
             )
 

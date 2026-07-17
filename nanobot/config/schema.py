@@ -1,7 +1,7 @@
 """Configuration schema using Pydantic.
 
 Fork additions (kept in core so pydantic can validate):
-  * ``AgentDefaults.enable_learning``, ``tui_backend``,
+  * ``AgentDefaults.enable_learning``, ``tui_backend``, ``tui_skin_enabled``,
     ``promote_pending_on_restart`` — fork self-learning / TUI / consolidation
     knobs. (``pending_promote_threshold_chars`` removed after upstream
     Consolidator+Dream merge made it obsolete.)
@@ -181,6 +181,9 @@ class AgentDefaults(Base):
     # ── fork additions ────────────────────────────────────────────────
     enable_learning: bool = True  # self-learning: TurnSummary injection, memory consolidation, search_history tool
     tui_backend: str = "textual"  # TUI backend for interactive mode: "textual" | "prompt_toolkit"
+    # Optional transparent Textual canvas for terminal-managed background images,
+    # opacity, and Acrylic effects. Disabled preserves the existing opaque UI.
+    tui_skin_enabled: bool = False
     # When True, on startup auto-promote any session's pending consolidation
     # summary into MEMORY.md (rebuilds system prompt → first turn after
     # restart has a cache miss). Default False keeps cache warm across

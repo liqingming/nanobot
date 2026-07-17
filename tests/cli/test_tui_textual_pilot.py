@@ -33,6 +33,31 @@ async def _press_text(pilot, text: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_skin_is_disabled_by_default_and_keeps_opaque_background() -> None:
+    tui = TextualTUI()
+
+    async with tui._app.run_test() as pilot:
+        await pilot.pause()
+        assert "glass-skin" not in tui._app.screen.classes
+        assert tui._app.query_one("#output").styles.background.hex == "#0C0C0C"
+        assert tui._app.query_one("#popup").styles.background.hex == "#0C0C0C"
+
+
+@pytest.mark.asyncio
+async def test_enabled_skin_uses_transparent_canvas_but_opaque_popup() -> None:
+    tui = TextualTUI(skin_enabled=True)
+
+    async with tui._app.run_test() as pilot:
+        await pilot.pause()
+        assert "glass-skin" in tui._app.screen.classes
+        assert tui._app.query_one("#output").styles.background.a == 0
+        assert tui._app.query_one("#input").styles.background.a == 0
+        assert tui._app.query_one("#status").styles.background.a == 0
+        assert tui._app.query_one("#output").styles.scrollbar_background.a == 0
+        assert tui._app.query_one("#popup").styles.background.hex == "#0C0C0C"
+
+
+@pytest.mark.asyncio
 async def test_argument_command_selection_enters_edit_mode_without_submit() -> None:
     tui = TextualTUI()
     submitted: list[str] = []

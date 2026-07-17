@@ -27,6 +27,7 @@ def create_tui(
     model: str | None = None,
     reasoning_effort: str | None = None,
     backend: str = "textual",
+    skin_enabled: bool = False,
     workspace: str | os.PathLike[str] | None = None,
 ) -> "TUIBase":
     # Environment variable overrides config value
@@ -39,6 +40,7 @@ def create_tui(
             history_file=history_file,
             model=model,
             reasoning_effort=reasoning_effort,
+            skin_enabled=skin_enabled,
             workspace=workspace,
         )
 
