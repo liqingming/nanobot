@@ -263,6 +263,16 @@ class LLMProvider(ABC):
     )
     _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
     _TRANSIENT_ERROR_KINDS = frozenset({"timeout", "connection"})
+    # Responses API SSE failures may carry no HTTP status or retry hint. Classify
+    # their structured type/code instead of depending on human-readable text
+    # (for example, ``server_error`` versus ``server error``).
+    _TRANSIENT_ERROR_TOKENS = frozenset({
+        "server_error",
+        "internal_server_error",
+        "service_unavailable",
+        "temporarily_unavailable",
+        "overloaded_error",
+    })
     _NON_RETRYABLE_429_ERROR_TOKENS = frozenset({
         "insufficient_quota",
         "quota_exceeded",
@@ -489,8 +499,16 @@ class LLMProvider(ABC):
             if status in cls._RETRYABLE_STATUS_CODES or status >= 500:
                 return True
 
-        kind = (response.error_kind or "").strip().lower()
+        kind = cls._normalize_error_token(response.error_kind)
         if kind in cls._TRANSIENT_ERROR_KINDS:
+            return True
+
+        structured_tokens = (
+            kind,
+            cls._normalize_error_token(response.error_type),
+            cls._normalize_error_token(response.error_code),
+        )
+        if any(token in cls._TRANSIENT_ERROR_TOKENS for token in structured_tokens):
             return True
 
         return cls._is_transient_error(response.content)

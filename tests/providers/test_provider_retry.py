@@ -97,6 +97,50 @@ async def test_chat_with_retry_reports_structured_transient_error(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_chat_with_retry_retries_structured_server_error_without_status(monkeypatch) -> None:
+    provider = ScriptedProvider([
+        LLMResponse(
+            content="Response failed: request could not be processed",
+            finish_reason="error",
+            error_type="server_error",
+            error_code="server_error",
+        ),
+        LLMResponse(content="ok"),
+    ])
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.content == "ok"
+    assert provider.calls == 2
+    assert delays == [1]
+
+
+@pytest.mark.parametrize(
+    "error_type,error_code",
+    [
+        ("overloaded_error", None),
+        (None, "internal_server_error"),
+        ("service_unavailable", None),
+    ],
+)
+def test_structured_server_failures_are_transient(error_type, error_code) -> None:
+    response = LLMResponse(
+        content="opaque provider failure",
+        finish_reason="error",
+        error_type=error_type,
+        error_code=error_code,
+    )
+
+    assert ScriptedProvider._is_transient_response(response) is True
+
+
+@pytest.mark.asyncio
 async def test_chat_with_retry_does_not_retry_non_transient_error(monkeypatch) -> None:
     provider = ScriptedProvider([
         LLMResponse(content="401 unauthorized", finish_reason="error"),
