@@ -183,7 +183,7 @@ class AgentDefaults(Base):
     tui_backend: str = "textual"  # TUI backend for interactive mode: "textual" | "prompt_toolkit"
     # Root directory scanned by the local ``skin`` and TUI ``/skin`` commands.
     tui_skin_dir: str = Field(
-        default_factory=lambda: str(Path.home() / "cmdSkins"),
+        default_factory=lambda: str(Path(__file__).resolve().parents[1] / "fork" / "cmdSkins"),
         validation_alias=AliasChoices("tuiSkinDir", "tui_skin_dir"),
         serialization_alias="tuiSkinDir",
     )

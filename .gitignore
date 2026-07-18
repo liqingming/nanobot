@@ -104,3 +104,11 @@ _sync_tmp/
 .playwright-mcp/
 bridge/node_modules/
 .nanobot/tool-results
+
+# Local Windows Terminal wallpapers (keep launchers/docs tracked)
+nanobot/fork/cmdSkins/*.[jJ][pP][gG]
+nanobot/fork/cmdSkins/*.[jJ][pP][eE][gG]
+nanobot/fork/cmdSkins/*.[pP][nN][gG]
+nanobot/fork/cmdSkins/*.[wW][eE][bB][pP]
+nanobot/fork/cmdSkins/*.[bB][mM][pP]
+nanobot/fork/cmdSkins/*.[gG][iI][fF]

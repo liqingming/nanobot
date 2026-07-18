@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Sequence
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
-_DEFAULT_SKIN_DIR = Path.home() / "cmdSkins"
+_DEFAULT_SKIN_DIR = Path(__file__).resolve().parents[1] / "fork" / "cmdSkins"
 _STORE_SETTINGS = (
     Path.home()
     / "AppData"

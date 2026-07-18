@@ -14,7 +14,7 @@ from nanobot.cli.terminal_skin import (
     resolve_skin,
     set_background,
 )
-from nanobot.config.schema import Config
+from nanobot.config.schema import AgentDefaults, Config
 
 
 def _settings(path: Path, image: str = r"C:\old\wallpaper.jpg") -> Path:
@@ -92,6 +92,13 @@ def test_set_background_refuses_malformed_settings_without_backup(tmp_path: Path
     with pytest.raises(json.JSONDecodeError):
         set_background(image, settings)
     assert not settings.with_name("settings.skin-backup.json").exists()
+
+
+def test_default_skin_directory_is_bundled_under_fork() -> None:
+    expected = Path(terminal_skin.__file__).resolve().parents[1] / "fork" / "cmdSkins"
+
+    assert terminal_skin._DEFAULT_SKIN_DIR == expected
+    assert AgentDefaults().tui_skin_dir == str(expected)
 
 
 def test_skin_directory_config_uses_camel_case_and_expands_home(tmp_path: Path) -> None:
