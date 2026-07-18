@@ -1,8 +1,8 @@
 """Configuration schema using Pydantic.
 
 Fork additions (kept in core so pydantic can validate):
-  * ``AgentDefaults.enable_learning``, ``tui_backend``, ``tui_skin_enabled``,
-    ``promote_pending_on_restart`` — fork self-learning / TUI / consolidation
+  * ``AgentDefaults.enable_learning``, ``tui_backend``, ``tui_skin_dir``,
+    ``tui_skin_enabled``, ``promote_pending_on_restart`` — fork self-learning / TUI / consolidation
     knobs. (``pending_promote_threshold_chars`` removed after upstream
     Consolidator+Dream merge made it obsolete.)
   * ``AgentDefaults.max_tool_iterations`` default 40 → 1000.
@@ -181,6 +181,12 @@ class AgentDefaults(Base):
     # ── fork additions ────────────────────────────────────────────────
     enable_learning: bool = True  # self-learning: TurnSummary injection, memory consolidation, search_history tool
     tui_backend: str = "textual"  # TUI backend for interactive mode: "textual" | "prompt_toolkit"
+    # Root directory scanned by the local ``skin`` and TUI ``/skin`` commands.
+    tui_skin_dir: str = Field(
+        default_factory=lambda: str(Path.home() / "cmdSkins"),
+        validation_alias=AliasChoices("tuiSkinDir", "tui_skin_dir"),
+        serialization_alias="tuiSkinDir",
+    )
     # Optional transparent Textual canvas for terminal-managed background images,
     # opacity, and Acrylic effects. Disabled preserves the existing opaque UI.
     tui_skin_enabled: bool = False

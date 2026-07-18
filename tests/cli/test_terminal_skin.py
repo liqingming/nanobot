@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from nanobot.cli import terminal_skin
 from nanobot.cli.terminal_skin import (
     SkinError,
     current_background,
@@ -13,6 +14,7 @@ from nanobot.cli.terminal_skin import (
     resolve_skin,
     set_background,
 )
+from nanobot.config.schema import Config
 
 
 def _settings(path: Path, image: str = r"C:\old\wallpaper.jpg") -> Path:
@@ -90,3 +92,21 @@ def test_set_background_refuses_malformed_settings_without_backup(tmp_path: Path
     with pytest.raises(json.JSONDecodeError):
         set_background(image, settings)
     assert not settings.with_name("settings.skin-backup.json").exists()
+
+
+def test_skin_directory_config_uses_camel_case_and_expands_home(tmp_path: Path) -> None:
+    config = Config.model_validate({"agents": {"defaults": {"tuiSkinDir": str(tmp_path)}}})
+
+    assert config.agents.defaults.tui_skin_dir == str(tmp_path)
+    assert config.model_dump(mode="json", by_alias=True)["agents"]["defaults"]["tuiSkinDir"] == str(tmp_path)
+
+
+def test_main_uses_configured_skin_directory(monkeypatch, tmp_path: Path) -> None:
+    image = tmp_path / "configured.jpg"
+    image.write_bytes(b"image")
+    config = Config.model_validate({"agents": {"defaults": {"tuiSkinDir": str(tmp_path)}}})
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda: config)
+    monkeypatch.setattr(terminal_skin, "find_terminal_settings", lambda: tmp_path / "settings.json")
+    monkeypatch.setattr(terminal_skin, "current_background", lambda _settings: image)
+
+    assert terminal_skin.main(["list"]) == 0

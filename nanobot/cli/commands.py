@@ -2606,9 +2606,11 @@ def agent(
                         switch_skin,
                     )
 
+                    skin_dir = Path(config.agents.defaults.tui_skin_dir)
+
                     def _switch_terminal_skin(selector: str) -> None:
                         try:
-                            selected, settings, _backup = switch_skin(selector)
+                            selected, settings, _backup = switch_skin(selector, skin_dir)
                         except (SkinError, OSError, ValueError) as exc:
                             tui.add_system(f"切换终端背景失败: {exc}")
                             return
@@ -2619,7 +2621,7 @@ def agent(
 
                     arg = text[len("/skin"):].strip()
                     try:
-                        images = list_skin_images()
+                        images = list_skin_images(skin_dir)
                         current = current_background(find_terminal_settings())
                     except (SkinError, OSError, ValueError) as exc:
                         tui.add_system(f"读取终端背景失败: {exc}")

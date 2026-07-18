@@ -53,6 +53,7 @@ def _natural_key(path: Path) -> list[object]:
 
 def list_skin_images(skin_dir: Path = _DEFAULT_SKIN_DIR) -> list[Path]:
     """Return supported images in natural filename order."""
+    skin_dir = skin_dir.expanduser()
     if not skin_dir.is_dir():
         raise SkinError(f"背景图目录不存在: {skin_dir}")
     return sorted(
@@ -241,10 +242,16 @@ def _interactive_selector(images: Sequence[Path], current: Path | None) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="skin", description="切换 Windows Terminal 背景图")
     parser.add_argument("selector", nargs="?", help="list/next/prev/random/编号/文件名")
-    parser.add_argument("--dir", dest="skin_dir", type=Path, default=_DEFAULT_SKIN_DIR)
+    parser.add_argument("--dir", dest="skin_dir", type=Path)
     args = parser.parse_args(argv)
     try:
-        images = list_skin_images(args.skin_dir)
+        if args.skin_dir is None:
+            from nanobot.config.loader import load_config
+
+            skin_dir = Path(load_config().agents.defaults.tui_skin_dir)
+        else:
+            skin_dir = args.skin_dir
+        images = list_skin_images(skin_dir)
         settings = find_terminal_settings()
         current = current_background(settings)
         selector = args.selector
