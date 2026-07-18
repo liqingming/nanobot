@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -154,6 +155,57 @@ def test_shutdown_stops_tasks_but_leaves_services_running(tmp_path: Path) -> Non
     assert popen.processes[0].poll() == -15
     assert records[service["id"]]["status"] == "running"
     assert popen.processes[1].poll() is None
+
+
+def test_shutdown_without_running_tasks_does_not_save(tmp_path: Path) -> None:
+    manager, _ = _manager(tmp_path)
+    _start(manager, tmp_path)
+    saves = 0
+
+    def count_save() -> None:
+        nonlocal saves
+        saves += 1
+
+    manager._save_locked = count_save
+
+    manager.shutdown_tasks()
+
+    assert saves == 0
+
+
+def test_close_is_idempotent(tmp_path: Path) -> None:
+    manager, popen = _manager(tmp_path, platform_name="Windows")
+    _start(
+        manager,
+        tmp_path,
+        lifecycle="task",
+        restart_policy="never",
+    )
+    saves = 0
+    original_save = manager._save_locked
+
+    def count_save() -> None:
+        nonlocal saves
+        saves += 1
+        original_save()
+
+    manager._save_locked = count_save
+
+    manager.close()
+    manager.close()
+
+    assert saves == 1
+    assert popen.processes[0].poll() == -15
+
+
+def test_save_uses_process_specific_temporary_file(tmp_path: Path) -> None:
+    manager, _ = _manager(tmp_path)
+    (tmp_path / "state.json.tmp").mkdir()
+
+    manager._save_locked()
+
+    assert (tmp_path / "state.json").is_file()
+    assert not (tmp_path / f"state.{os.getpid()}.json.tmp").exists()
 
 
 def test_task_control_is_limited_to_owner_session(tmp_path: Path) -> None:

@@ -52,6 +52,7 @@ class ManagedProcessManager:
         self._children: dict[str, Any] = {}
         self._records = self._load()
         self._stop_event = threading.Event()
+        self._closed = False
         self._watcher: threading.Thread | None = None
         if start_watcher:
             self._watcher = threading.Thread(
@@ -175,14 +176,21 @@ class ManagedProcessManager:
 
     def shutdown_tasks(self) -> None:
         with self._lock:
+            changed = False
             for rec in self._records.values():
                 if rec.get("lifecycle") == "task" and rec.get("desired") == "running":
                     rec["desired"] = "stopped"
                     self._terminate_locked(rec)
                     rec["status"] = "stopped"
-            self._save_locked()
+                    changed = True
+            if changed:
+                self._save_locked()
 
     def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
         self._stop_event.set()
         self.shutdown_tasks()
 
@@ -410,19 +418,23 @@ class ManagedProcessManager:
 
     def _save_locked(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(
-                {"version": 1, "processes": list(self._records.values())},
-                ensure_ascii=False,
-                indent=2,
+        tmp = self.root / f"state.{os.getpid()}.json.tmp"
+        try:
+            tmp.write_text(
+                json.dumps(
+                    {"version": 1, "processes": list(self._records.values())},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
             )
-            + "\n",
-            encoding="utf-8",
-        )
-        with suppress(OSError):
-            os.chmod(tmp, 0o600)
-        tmp.replace(self.state_path)
+            with suppress(OSError):
+                os.chmod(tmp, 0o600)
+            tmp.replace(self.state_path)
+        finally:
+            with suppress(OSError):
+                tmp.unlink()
 
 
 _DEFAULT_MANAGED_PROCESS_MANAGER: ManagedProcessManager | None = None
