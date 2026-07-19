@@ -158,6 +158,17 @@ if _TEXTUAL_AVAILABLE:
             self._sel_moved: bool = False  # True once mouse moves during drag
             self._user_ranges: list[tuple[int, int]] = []  # gray-bg row ranges
 
+            # RichLog stores only already-wrapped physical lines. Keep the original
+            # renderables as logical records as well, so a terminal resize can
+            # render them again at the new content width instead of retaining the
+            # width that happened to be active when they were written.
+            self._logical_records: list[dict[str, Any]] = []
+            self._record_spans: list[tuple[int, int]] = []
+            self._record_writes = True
+            self._render_width = 0
+            self._reflow_scheduled = False
+            self._on_reflow: Callable[[list[int], list[int]], None] | None = None
+
         def is_at_bottom(self, threshold: int = 0) -> bool:
             """Return True when the viewport is at, or very near, the newest line."""
             try:
@@ -172,13 +183,6 @@ if _TEXTUAL_AVAILABLE:
         def user_is_scrolling(self) -> bool:
             """Return True when the viewport is intentionally away from the bottom."""
             return not self.is_at_bottom()
-
-        def write(self, *args: Any, follow: bool | None = None, **kwargs: Any) -> Any:
-            should_follow = self.is_at_bottom() if follow is None else follow
-            result = super().write(*args, **kwargs)
-            if should_follow:
-                self.scroll_end(animate=False)
-            return result
 
         # ── selection helpers ──────────────────────────────────────────────
         def _selection_points(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
@@ -304,8 +308,176 @@ if _TEXTUAL_AVAILABLE:
 
         def add_user_range(self, start: int, end: int) -> None:
             self._user_ranges.append((start, end))
+            for index, (record_start, record_end) in enumerate(self._record_spans):
+                if record_start <= end and record_end > start:
+                    self._logical_records[index]["user"] = True
             self._line_cache.clear()
             self.refresh()
+
+        def write(
+            self,
+            content: Any,
+            width: int | None = None,
+            expand: bool = False,
+            shrink: bool = True,
+            scroll_end: bool | None = None,
+            animate: bool = False,
+            follow: bool | None = None,
+        ) -> Any:
+            """Write one logical renderable and retain it for resize reflow."""
+            if follow is not None:
+                scroll_end = follow
+            should_follow = self.is_at_bottom() if scroll_end is None else scroll_end
+            before = len(self.lines)
+            if self._record_writes:
+                saved = content.copy() if isinstance(content, Text) else content
+                self._logical_records.append(
+                    {
+                        "content": saved,
+                        "width": width,
+                        "expand": expand,
+                        "shrink": shrink,
+                        "user": False,
+                    }
+                )
+            result = super().write(
+                content,
+                width=width,
+                expand=expand,
+                shrink=shrink,
+                scroll_end=False,
+                animate=animate,
+            )
+            if self._record_writes and self._size_known:
+                self._record_spans.append((before, len(self.lines)))
+                self._render_width = self.scrollable_content_region.width
+            if should_follow:
+                self.scroll_end(animate=False, immediate=True, force=True)
+            return result
+
+        def clear(self) -> Any:
+            if self._record_writes:
+                self._logical_records.clear()
+                self._record_spans.clear()
+                self._user_ranges.clear()
+            return super().clear()
+
+        def on_resize(self, event: Any) -> None:
+            # RichLog replays deferred writes the first time its size is known.
+            # Those writes are already in _logical_records, so suppress recording.
+            was_known = self._size_known
+            self._record_writes = False
+            try:
+                super().on_resize(event)
+            finally:
+                self._record_writes = True
+            if not was_known:
+                self._rebuild_spans_from_current_lines()
+                self._render_width = self.scrollable_content_region.width
+                return
+            if not self._reflow_scheduled:
+                self._reflow_scheduled = True
+                self.call_later(self._reflow_after_resize)
+
+        def _reflow_after_resize(self) -> None:
+            self._reflow_scheduled = False
+            width = self.scrollable_content_region.width
+            if width > 0 and width != self._render_width:
+                self._reflow(width)
+
+        def _rebuild_spans_from_current_lines(self) -> None:
+            """Re-render records after deferred startup writes to recover spans."""
+            if not self._logical_records:
+                self._record_spans = []
+                return
+            self._reflow(max(1, self.scrollable_content_region.width), preserve_view=False)
+
+        @staticmethod
+        def _boundary_map(spans: list[tuple[int, int]], total: int) -> list[int]:
+            return [start for start, _end in spans] + [total]
+
+        def _reflow(self, width: int, *, preserve_view: bool = True) -> None:
+            old_spans = list(self._record_spans)
+            old_total = len(self.lines)
+            old_boundaries = self._boundary_map(old_spans, old_total)
+            was_at_bottom = self.is_at_bottom()
+            old_top = int(self.scroll_offset.y)
+            top_record = 0
+            top_offset = 0
+            if old_spans:
+                top_record = len(old_spans) - 1
+                for index, (start, end) in enumerate(old_spans):
+                    if old_top < end:
+                        top_record = index
+                        top_offset = max(0, old_top - start)
+                        break
+
+            self._record_writes = False
+            try:
+                super().clear()
+                self._record_spans = []
+                self._user_ranges = []
+                for record in self._logical_records:
+                    start = len(self.lines)
+                    # Explicitly use the current output width. This also makes
+                    # Markdown/code blocks and wide CJK text reflow consistently.
+                    super().write(
+                        record["content"],
+                        width=width,
+                        expand=record["expand"],
+                        shrink=record["shrink"],
+                        scroll_end=False,
+                    )
+                    end = len(self.lines)
+                    self._record_spans.append((start, end))
+                    if record.get("user") and end > start:
+                        self._user_ranges.append((start, end - 1))
+            finally:
+                self._record_writes = True
+            self._render_width = width
+            new_boundaries = self._boundary_map(self._record_spans, len(self.lines))
+            if self._on_reflow is not None:
+                self._on_reflow(old_boundaries, new_boundaries)
+            self._clear_selection()
+            if not preserve_view:
+                return
+            if was_at_bottom:
+                self.scroll_end(animate=False, immediate=True, force=True)
+            elif self._record_spans:
+                start, end = self._record_spans[min(top_record, len(self._record_spans) - 1)]
+                new_top = start + min(top_offset, max(0, end - start - 1))
+                self.scroll_to(y=new_top, animate=False, immediate=True, force=True)
+
+        def _record_index_at_line(self, line: int) -> int | None:
+            for index, (start, end) in enumerate(self._record_spans):
+                if start <= line < end:
+                    return index
+            return None
+
+        def replace_line(self, line: int, content: Any) -> bool:
+            """Replace a placeholder record while avoiding a full-history redraw."""
+            from rich.segment import Segment
+
+            index = self._record_index_at_line(line)
+            if index is None:
+                return False
+            saved = content.copy() if isinstance(content, Text) else content
+            self._logical_records[index]["content"] = saved
+            start, end = self._record_spans[index]
+            width = max(1, self.scrollable_content_region.width)
+            renderable = self._make_renderable(content)
+            segments = self.app.console.render(
+                renderable,
+                self.app.console.options.update_width(width),
+            )
+            rendered = Strip.from_lines(Segment.split_lines(segments))
+            if len(rendered) == end - start:
+                self.lines[start:end] = [strip.adjust_cell_length(width) for strip in rendered]
+                self._line_cache.clear()
+                self.refresh()
+            else:
+                self._reflow(width)
+            return True
 
         @staticmethod
         def _force_bgcolor(strip: Strip, bgcolor: str) -> Strip:
@@ -483,18 +655,34 @@ if _TEXTUAL_AVAILABLE:
             event.stop()
 
         def truncate_to(self, n: int) -> None:
-            """Remove all lines after index n, used to overwrite streaming content."""
+            """Remove records at/after physical line boundary ``n``."""
             if n >= len(self.lines):
                 return
-            self.lines = self.lines[:n]
+            keep = 0
+            line_boundary = 0
+            for _start, end in self._record_spans:
+                if end <= n:
+                    keep += 1
+                    line_boundary = end
+                else:
+                    break
+            del self._logical_records[keep:]
+            del self._record_spans[keep:]
+            self.lines = self.lines[:line_boundary]
+            self._user_ranges = [
+                (start, min(end, line_boundary - 1))
+                for start, end in self._user_ranges
+                if start < line_boundary
+            ]
             self._refresh_line_metrics()
 
         def remove_line(self, index: int) -> bool:
-            """Remove one rendered line without discarding later tool activity."""
-            if not 0 <= index < len(self.lines):
+            """Remove the logical record containing a rendered placeholder line."""
+            record_index = self._record_index_at_line(index)
+            if record_index is None:
                 return False
-            del self.lines[index]
-            self._refresh_line_metrics()
+            del self._logical_records[record_index]
+            self._reflow(max(1, self.scrollable_content_region.width))
             return True
 
         def _refresh_line_metrics(self) -> None:
@@ -930,13 +1118,15 @@ if _TEXTUAL_AVAILABLE:
 
         def compose(self) -> ComposeResult:
             user_background = "default" if self._tui._skin_enabled else "#2d2d2d"
-            yield _OutputLog(
+            output = _OutputLog(
                 id="output",
                 markup=True,
                 highlight=False,
                 wrap=True,
                 user_background=user_background,
             )
+            output._on_reflow = self._tui._remap_output_anchors
+            yield output
             yield Static("", id="live")
             yield Static("", id="popup")
             yield Static("", id="todo-bar")
@@ -1188,7 +1378,6 @@ if _TEXTUAL_AVAILABLE:
             self._thinking_start_time = time.monotonic()
 
             def _tick() -> None:
-                from rich.segment import Segment as _Seg
                 self._thinking_frame += 1
                 icon = _SPINNER[self._thinking_frame % len(_SPINNER)]
                 # Use the turn-level anchor when present so the elapsed counter
@@ -1207,17 +1396,7 @@ if _TEXTUAL_AVAILABLE:
                             rt = Text(f"    {icon} {hint}{suffix}", style="cyan")
                         else:
                             rt = Text(f"  {icon} 思考中...{suffix}", style="grey50")
-                        width = max(out.scrollable_content_region.width, out.min_width)
-                        console = out.app.console
-                        segs = list(console.render(rt, console.options.update_width(width)))
-                        line_segs = list(_Seg.split_lines(segs))
-                        if line_segs:
-                            new_strip = Strip.from_lines(line_segs)[0].adjust_cell_length(width)
-                        else:
-                            new_strip = Strip.blank(width)
-                        out.lines[idx] = new_strip
-                        out._line_cache.clear()
-                        out.refresh()
+                        out.replace_line(idx, rt)
                 except Exception:
                     pass
 
@@ -1503,6 +1682,33 @@ class TextualTUI(TUIBase):
         return self._history[self._history_pos]
 
     # ── Log write helpers ──────────────────────────────────────────────────
+
+    def _remap_output_anchors(self, old: list[int], new: list[int]) -> None:
+        """Keep streaming placeholder/header anchors valid after output reflow."""
+        if not old or len(old) != len(new):
+            return
+
+        def remap(value: int | None) -> int | None:
+            if value is None:
+                return None
+            try:
+                return new[old.index(value)]
+            except ValueError:
+                # Anchors should be logical-record boundaries. For defensive
+                # compatibility, preserve their offset within the nearest record.
+                record = max(0, min(len(old) - 2, next(
+                    (i - 1 for i, boundary in enumerate(old) if boundary > value),
+                    len(old) - 2,
+                )))
+                offset = max(0, value - old[record])
+                return min(new[record] + offset, new[record + 1])
+
+        self._stream_header_line = remap(self._stream_header_line) or 0
+        self._tool_placeholder_line = remap(self._tool_placeholder_line) or 0
+        self._initial_thinking_placeholder_line = remap(
+            self._initial_thinking_placeholder_line
+        )
+        self._tool_placeholder_line_backup = remap(self._tool_placeholder_line_backup)
 
     def _log_write(self, *items: Any) -> None:
         """Write Rich renderables or markup strings directly to the output log."""
@@ -1933,24 +2139,10 @@ class TextualTUI(TUIBase):
         self._render_placeholder_line(f"⠋ {text}", "dim")
 
     def _render_placeholder_line(self, content: str, style: str) -> None:
-        """Render `content` into the placeholder line at _tool_placeholder_line."""
+        """Render `content` into the placeholder record at _tool_placeholder_line."""
         try:
-            from rich.segment import Segment as _Seg
             out = self._app.query_one("#output", _OutputLog)
-            idx = self._tool_placeholder_line
-            if 0 <= idx < len(out.lines):
-                rt = Text(content, style=style)
-                width = max(out.scrollable_content_region.width, out.min_width)
-                console = out.app.console
-                segs = list(console.render(rt, console.options.update_width(width)))
-                line_segs = list(_Seg.split_lines(segs))
-                if line_segs:
-                    new_strip = Strip.from_lines(line_segs)[0].adjust_cell_length(width)
-                else:
-                    new_strip = Strip.blank(width)
-                out.lines[idx] = new_strip
-                out._line_cache.clear()
-                out.refresh()
+            out.replace_line(self._tool_placeholder_line, Text(content, style=style))
         except Exception:
             pass
 
@@ -1982,24 +2174,11 @@ class TextualTUI(TUIBase):
             line.append(f"  [+{int(elapsed)}s]", style=self.THEME_MUTED)
         self._render_placeholder_text(line)
 
-    def _render_placeholder_text(self, rt) -> None:
+    def _render_placeholder_text(self, rt: Text) -> None:
         """Like _render_placeholder_line but accepts a pre-built Text object."""
         try:
-            from rich.segment import Segment as _Seg
             out = self._app.query_one("#output", _OutputLog)
-            idx = self._tool_placeholder_line
-            if 0 <= idx < len(out.lines):
-                width = max(out.scrollable_content_region.width, out.min_width)
-                console = out.app.console
-                segs = list(console.render(rt, console.options.update_width(width)))
-                line_segs = list(_Seg.split_lines(segs))
-                if line_segs:
-                    new_strip = Strip.from_lines(line_segs)[0].adjust_cell_length(width)
-                else:
-                    new_strip = Strip.blank(width)
-                out.lines[idx] = new_strip
-                out._line_cache.clear()
-                out.refresh()
+            out.replace_line(self._tool_placeholder_line, rt)
         except Exception:
             pass
 

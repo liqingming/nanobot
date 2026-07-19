@@ -1323,3 +1323,96 @@ async def test_stream_delta_debounce_respects_manual_scroll_window() -> None:
 
         assert out.scroll_offset.y == manual_y
         assert "hidden while scrolling" not in _output_log_text(out)
+
+
+@pytest.mark.asyncio
+async def test_output_history_reflows_when_terminal_width_changes() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+    long_text = "中文历史消息需要根据窗口宽度自动换行 " * 8
+    messages = [
+        {"role": "user", "content": long_text, "timestamp": "2026-07-19T12:00:00"},
+        {
+            "role": "assistant",
+            "content": "## 标题\n\n" + long_text + "\n\n```python\nprint('resize')\n```",
+            "timestamp": "2026-07-19T12:00:01",
+        },
+    ]
+
+    app = tui._app
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app.clear_output()
+        tui.load_session_history(messages)
+        await pilot.pause()
+        out = app.query_one("#output")
+        wide_lines = len(out.lines)
+        logical_records = len(out._logical_records)
+        assert out.scroll_offset.y == out.max_scroll_y
+        assert any(record.get("user") for record in out._logical_records)
+
+        await pilot.resize_terminal(52, 30)
+        await pilot.pause()
+        narrow_lines = len(out.lines)
+        assert narrow_lines > wide_lines
+        assert len(out._logical_records) == logical_records
+        assert out.scroll_offset.y == out.max_scroll_y
+        assert "中文历史消息" in _output_log_text(out)
+        assert out._user_ranges
+
+        await pilot.resize_terminal(120, 30)
+        await pilot.pause()
+        assert len(out.lines) < narrow_lines
+        assert len(out._logical_records) == logical_records
+        assert out.scroll_offset.y == out.max_scroll_y
+
+
+@pytest.mark.asyncio
+async def test_output_resize_preserves_manual_reading_record() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        app.clear_output()
+        out = app.query_one("#output")
+        for i in range(40):
+            out.write(f"record {i}: " + ("自适应内容 " * 10))
+        out.scroll_end(animate=False)
+        await pilot.pause()
+        target_record = 18
+        old_start = out._record_spans[target_record][0]
+        out.scroll_to(y=old_start, animate=False)
+        await pilot.pause()
+        assert out.scroll_offset.y < out.max_scroll_y
+
+        await pilot.resize_terminal(58, 24)
+        await pilot.pause()
+        new_start, new_end = out._record_spans[target_record]
+        assert new_start <= out.scroll_offset.y < new_end
+
+
+@pytest.mark.asyncio
+async def test_stream_anchor_survives_resize_and_final_markdown_replaces_snapshot() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test(size=(96, 24)) as pilot:
+        await pilot.pause()
+        tui.stream_start()
+        tui.stream_delta("流式响应 " * 20)
+        await pilot.pause()
+        out = app.query_one("#output")
+        assert tui._stream_buf.startswith("流式响应")
+
+        await pilot.resize_terminal(50, 24)
+        await pilot.pause()
+        tui.flush_stream()
+        await pilot.pause()
+
+        text = _output_log_text(out)
+        assert "流式响应" in text
+        assert len(out._logical_records) == len(out._record_spans)
+        assert 0 <= tui._tool_placeholder_line <= len(out.lines)
