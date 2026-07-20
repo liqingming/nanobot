@@ -28,13 +28,13 @@ if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
 SNIP_SAFETY_BUFFER = 1024
-MICROCOMPACT_KEEP_RECENT = 8
+MICROCOMPACT_KEEP_RECENT = 4
 MICROCOMPACT_MIN_CHARS = 500
 # Keep enough recent evidence for the next model decision, but do not let a
-# long read/search-heavy tool chain accumulate every earlier raw result until
-# it nearly exhausts the provider context window.
-MICROCOMPACT_SOFT_CHAR_BUDGET = 36_000
-MICROCOMPACT_SOFT_TARGET_CHARS = 24_000
+# read/search-heavy chain repeatedly resend raw results. Raw outputs remain
+# persisted; compacted messages retain an evidence-bearing digest and locator.
+MICROCOMPACT_SOFT_CHAR_BUDGET = 24_000
+MICROCOMPACT_SOFT_TARGET_CHARS = 14_000
 HISTORICAL_TOOL_CALL_KEEP_RECENT = 64
 INFLIGHT_COMPACT_TARGET_RATIO = 0.85
 COMPACTABLE_TOOLS = frozenset({

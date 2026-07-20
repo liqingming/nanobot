@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
@@ -12,6 +13,35 @@ from nanobot.security.workspace_access import current_workspace_scope
 
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
+
+
+_SCOPE_RE = re.compile(
+    r"(?:scope|范围|only|仅限|仅处理|under|目录|路径|files?|文件)",
+    re.IGNORECASE,
+)
+_DELIVERABLE_RE = re.compile(
+    r"(?:deliverable|交付|输出|产出|report|报告|summary|摘要|清单|实现|修复|文档|代码)",
+    re.IGNORECASE,
+)
+_ACCEPTANCE_RE = re.compile(
+    r"(?:acceptance|验收|完成条件|done when|verify|验证|测试|通过|必须|确保|确认)",
+    re.IGNORECASE,
+)
+
+
+def _missing_task_boundaries(task: str) -> list[str]:
+    """Return missing delegation boundaries for non-trivial subagent tasks."""
+    text = task.strip()
+    missing: list[str] = []
+    if len(text) < 40:
+        missing.append("objective/details")
+    if not _SCOPE_RE.search(text):
+        missing.append("scope")
+    if not _DELIVERABLE_RE.search(text):
+        missing.append("expected deliverable")
+    if not _ACCEPTANCE_RE.search(text):
+        missing.append("acceptance criteria")
+    return missing
 
 
 @tool_parameters(
@@ -62,7 +92,10 @@ class SpawnTool(Tool, ContextAware):
     def description(self) -> str:
         return (
             "Spawn a subagent to handle a task in the background. "
-            "Use this for complex or time-consuming tasks that can run independently. "
+            "Use only when the task is independently executable and its objective, scope, "
+            "expected deliverable, and acceptance criteria are explicit in the task text. "
+            "Do not spawn for ambiguous work or when the next step depends on evidence not "
+            "gathered yet; keep that work in the main agent. "
             "The subagent will complete the task and report back when done. "
             "For deliverables or existing projects, inspect the workspace first "
             "and use a dedicated subdirectory when helpful."
@@ -76,6 +109,13 @@ class SpawnTool(Tool, ContextAware):
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
+        missing = _missing_task_boundaries(task)
+        if missing:
+            return (
+                "Cannot spawn subagent: task is not independently executable; missing "
+                + ", ".join(missing)
+                + ". Clarify these boundaries or keep the investigation in the main agent."
+            )
         running = self._manager.get_running_count()
         limit = self._manager.max_concurrent_subagents
         if running >= limit:

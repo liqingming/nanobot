@@ -19,3 +19,16 @@ async def test_read_file_rejects_subpath_from_request_tool_policy(tmp_path):
     finally:
         reset_request_context(token)
     assert "blocked by the request tool_policy for read_file" in str(result)
+
+
+@pytest.mark.asyncio
+async def test_read_file_uses_bounded_default_window(tmp_path):
+    target = tmp_path / "large.txt"
+    target.write_text("".join(f"line-{idx}\n" for idx in range(450)), encoding="utf-8")
+    tool = ReadFileTool(workspace=tmp_path, allowed_dir=tmp_path)
+
+    result = await tool.execute(path="large.txt")
+
+    assert "400| line-399" in result
+    assert "401| line-400" not in result
+    assert "Use offset=401 to continue" in result

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -78,18 +79,22 @@ async def test_spawn_tool_keeps_task_local_context() -> None:
         tool.set_context(RequestContext(channel="whatsapp", chat_id="chat-a"))
         entered.set()
         await release.wait()
-        return await tool.execute(task="one")
+        return await tool.execute(
+            task="Inspect only src/one.py and return a report; verify the report names the file."
+        )
 
     async def task_two() -> str:
         await entered.wait()
         tool.set_context(RequestContext(channel="telegram", chat_id="chat-b"))
         release.set()
-        return await tool.execute(task="two")
+        return await tool.execute(
+            task="Inspect only src/two.py and return a report; verify the report names the file."
+        )
 
     result_one, result_two = await asyncio.gather(task_one(), task_two())
 
-    assert result_one == "whatsapp:chat-a:one"
-    assert result_two == "telegram:chat-b:two"
+    assert result_one.startswith("whatsapp:chat-a:Inspect only src/one.py")
+    assert result_two.startswith("telegram:chat-b:Inspect only src/two.py")
     assert ("whatsapp", "chat-a", "whatsapp:chat-a") in seen
     assert ("telegram", "chat-b", "telegram:chat-b") in seen
 
@@ -196,8 +201,9 @@ async def test_spawn_tool_basic_set_context_and_execute() -> None:
     tool = SpawnTool(_Manager())
     tool.set_context(RequestContext(channel="feishu", chat_id="chat-abc"))
 
-    result = await tool.execute(task="do something")
-    assert result == "ok: do something"
+    task = "Inspect only src/app.py and return a report; verify the report names the file."
+    result = await tool.execute(task=task)
+    assert result == f"ok: {task}"
     assert seen == [("feishu", "chat-abc", "feishu:chat-abc")]
 
 
@@ -229,7 +235,9 @@ async def test_spawn_tool_default_values_without_set_context() -> None:
 
     tool = SpawnTool(_Manager())
 
-    await tool.execute(task="test")
+    await tool.execute(
+        task="Inspect only src/app.py and return a report; verify the report names the file."
+    )
     assert seen == [("cli", "direct", "cli:direct")]
 
 
@@ -314,3 +322,15 @@ async def test_cron_tool_no_context_returns_error(tmp_path) -> None:
 
     result = await tool.execute(action="add", message="test", every_seconds=60)
     assert result == "Error: scheduled cron jobs must be created from a chat session"
+
+
+@pytest.mark.asyncio
+async def test_spawn_tool_rejects_ambiguous_task_before_manager_call() -> None:
+    manager = MagicMock()
+    manager.get_running_count.return_value = 0
+    tool = SpawnTool(manager)
+
+    result = await tool.execute(task="look into this")
+
+    assert "not independently executable" in result
+    manager.spawn.assert_not_called()

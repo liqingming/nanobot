@@ -714,7 +714,7 @@ def test_microcompact_overflow_compacts_to_low_watermark(monkeypatch):
         max_iterations=1,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
         max_tokens=0,
-        context_window_tokens=2224,  # input budget 1200, low target 1020
+        context_window_tokens=1824,  # input budget 800, low target 680
     )
 
     def estimate(_provider, _model, msgs, _tools):

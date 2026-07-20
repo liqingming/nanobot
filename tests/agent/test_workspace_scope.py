@@ -362,7 +362,9 @@ async def test_spawn_tool_forwards_current_workspace_scope(tmp_path: Path) -> No
     tool = SpawnTool(manager)  # type: ignore[arg-type]
     token = bind_workspace_scope(scope)
     try:
-        result = await tool.execute(task="inspect")
+        result = await tool.execute(
+            task="Inspect only the project workspace and return a report; verify scope is preserved."
+        )
     finally:
         reset_workspace_scope(token)
 

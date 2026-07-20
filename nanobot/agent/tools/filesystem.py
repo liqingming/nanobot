@@ -245,8 +245,8 @@ def _parse_page_range(pages: str, total: int) -> tuple[int, int]:
             minimum=1,
         ),
         limit=IntegerSchema(
-            2000,
-            description="Maximum number of lines to read (default 2000)",
+            400,
+            description="Maximum number of lines to read (default 400)",
             minimum=1,
         ),
         pages=StringSchema("Page range for PDF files, e.g. '1-5' (default: all, max 20 pages)"),
@@ -262,7 +262,7 @@ class ReadFileTool(_FsTool):
     _scopes = {"core", "subagent", "memory"}
 
     _MAX_CHARS = 128_000
-    _DEFAULT_LIMIT = 2000
+    _DEFAULT_LIMIT = 400
     _MAX_PDF_PAGES = 20
 
     @property
@@ -279,7 +279,8 @@ class ReadFileTool(_FsTool):
             "Use find_files/list_dir first when the path is uncertain. "
             "Read the relevant range before editing so replacements or patches "
             "are based on current content. "
-            "Use offset and limit for large text files. "
+            "The default is a bounded 400-line window; use offset and an explicit larger "
+            "limit only when the relevant range requires it. "
             "Use force=true to re-read content even if unchanged. "
             "Reads exceeding ~128K chars are truncated."
         )

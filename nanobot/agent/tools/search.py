@@ -14,8 +14,8 @@ from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.filesystem import ListDirTool, _FsTool
 
-_DEFAULT_HEAD_LIMIT = 250
-_DEFAULT_FILE_HEAD_LIMIT = 200
+_DEFAULT_HEAD_LIMIT = 100
+_DEFAULT_FILE_HEAD_LIMIT = 100
 _TOOL_POLICY_METADATA_KEY = "tool_policy"
 T = TypeVar("T")
 _TYPE_GLOB_MAP = {
@@ -406,7 +406,7 @@ class GrepTool(_SearchTool):
                     "description": (
                         "Maximum number of results to return. In content mode this limits "
                         "matching line blocks; in other modes it limits file entries. "
-                        "Default 250"
+                        "Default 100"
                     ),
                     "minimum": 0,
                     "maximum": 1000,

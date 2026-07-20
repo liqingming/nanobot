@@ -11,8 +11,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nanobot.agent.loop import AgentLoop
-from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.subagent import SubagentManager, SubagentStatus
+from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.search import FindFilesTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool
@@ -561,3 +561,21 @@ async def test_exec_read_only_mode_allows_diagnostics_and_blocks_mutation(tmp_pa
         reset_request_context(token)
     assert "not allowed" not in str(allowed)
     assert "not allowed in request read-only mode" in str(blocked)
+
+
+@pytest.mark.asyncio
+async def test_search_tools_use_bounded_default_result_limit(tmp_path: Path) -> None:
+    for idx in range(130):
+        (tmp_path / f"match_{idx:03d}.txt").write_text("needle\n", encoding="utf-8")
+
+    find_result = await FindFilesTool(workspace=tmp_path, allowed_dir=tmp_path).execute(
+        path=".", query="match_"
+    )
+    grep_result = await GrepTool(workspace=tmp_path, allowed_dir=tmp_path).execute(
+        pattern="needle", path="."
+    )
+
+    assert len([line for line in find_result.splitlines() if line.endswith(".txt")]) == 100
+    assert len([line for line in grep_result.splitlines() if line.endswith(".txt")]) == 100
+    assert "pagination: limit=100" in find_result
+    assert "pagination: limit=100" in grep_result
