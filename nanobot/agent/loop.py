@@ -32,13 +32,6 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry, iter_fork_tool_factories
 from nanobot.agent.tools.self import MyTool
-from nanobot.fork.agent.learning import (
-    PATTERN_THRESHOLD,
-    PatternStore,
-    TurnSummary,
-    _compress_tool_sequence,
-    detect_user_delta,
-)
 from nanobot.agent.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.outbound_events import (
@@ -57,6 +50,13 @@ from nanobot.bus.runtime_events import (
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.fork.agent.learning import (
+    PATTERN_THRESHOLD,
+    PatternStore,
+    TurnSummary,
+    _compress_tool_sequence,
+    detect_user_delta,
+)
 from nanobot.providers.base import (
     LLMProvider,
     provider_input_token_budget,
@@ -72,7 +72,9 @@ from nanobot.session import turn_continuation
 from nanobot.session.automation_turns import automation_history_overrides
 from nanobot.session.goal_state import (
     clear_goal_waiting_for_user,
+    goal_state_raw,
     goal_state_runtime_lines,
+    parse_goal_state,
     runner_wall_llm_timeout_s,
     sustained_goal_active,
     sustained_goal_waiting_for_user,
@@ -97,6 +99,7 @@ from nanobot.utils.session_runtime_log import (
     append_session_runtime_log,
     exception_fields,
 )
+
 if TYPE_CHECKING:
     from nanobot.config.schema import (
         ChannelsConfig,
@@ -429,6 +432,7 @@ class AgentLoop:
         # Fork: pre-build the tool-hint formatter once (closes over workspace)
         # so each AgentProgressHook construction in _run_agent_loop is cheap.
         from functools import partial
+
         from nanobot.fork.utils.tool_hints import format_tool_hint as _fork_fmt
         self._tool_hint_formatter = partial(_fork_fmt, workspace=self.workspace)
         self.commands = CommandRouter()
@@ -1131,6 +1135,10 @@ class AgentLoop:
             state.revision += 1
             session.metadata[CONTEXT_STATE_KEY] = state.to_metadata()
 
+        goal_before = parse_goal_state(goal_state_raw(session.metadata)) if session else None
+        completed_at_before = (
+            goal_before.get("completed_at") if isinstance(goal_before, dict) else None
+        )
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
@@ -1188,6 +1196,21 @@ class AgentLoop:
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
+        if result.stop_reason == "error" and session is not None:
+            fallback = _newly_completed_goal_fallback(
+                session.metadata,
+                completed_at_before=completed_at_before,
+            )
+            if fallback is not None:
+                append_session_runtime_log(
+                    runtime_log_path,
+                    "agent_loop.completed_goal_fallback",
+                    session_key=active_session_key,
+                    original_error=result.error or result.final_content,
+                )
+                result.final_content = fallback
+                result.stop_reason = "completed"
+                result.error = None
         self._last_usage = result.usage
         self._last_tool_events = list(result.tool_events or [])
         if result.stop_reason == "max_iterations":
@@ -2478,3 +2501,21 @@ class AgentLoop:
         finally:
             await self._runtime_events().run_status_changed(msg, session_key, "idle")
             self._runtime_events().clear_turn(session_key)
+
+
+def _newly_completed_goal_fallback(
+    metadata: dict[str, Any],
+    *,
+    completed_at_before: Any,
+) -> str | None:
+    """Recover the saved recap only when this runner invocation completed a goal."""
+    goal = parse_goal_state(goal_state_raw(metadata))
+    if not isinstance(goal, dict) or goal.get("status") != "completed":
+        return None
+    completed_at = goal.get("completed_at")
+    if not completed_at or completed_at == completed_at_before:
+        return None
+    recap = str(goal.get("recap") or "").strip()
+    if not recap:
+        recap = "任务已标记完成，但没有保存文字摘要。"
+    return "最终回复生成失败，已恢复任务完成时保存的摘要：\n\n" + recap

@@ -767,3 +767,20 @@ def test_codex_response_failed_preserves_context_error_metadata() -> None:
     assert response.error_code == "context_length_exceeded"
     assert response.error_kind == "context_length"
     assert response.error_should_retry is False
+
+
+def test_codex_response_server_error_without_status_is_retryable() -> None:
+    error = ResponsesAPIError({
+        "type": "server_error",
+        "code": "server_error",
+        "message": "You can retry your request.",
+        "param": None,
+    })
+
+    response = _codex_error_response(error)
+
+    assert response.finish_reason == "error"
+    assert response.error_kind == "server"
+    assert response.error_type == "server_error"
+    assert response.error_code == "server_error"
+    assert response.error_should_retry is True

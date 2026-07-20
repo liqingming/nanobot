@@ -380,3 +380,42 @@ async def test_dispatch_auto_recovers_transient_model_error(tmp_path):
     assert recovery_in.metadata.get("_auto_recovery") is True
     assert recovery_in.metadata.get("_auto_recover_attempt") == 1
     assert recovery_in.session_key == "cli:test"
+
+
+def test_newly_completed_goal_fallback_uses_current_turn_recap() -> None:
+    from nanobot.agent.loop import _newly_completed_goal_fallback
+
+    metadata = {
+        "goal_state": {
+            "status": "completed",
+            "completed_at": "2026-07-20T11:40:06Z",
+            "recap": "取证完成，未修改文件。",
+        }
+    }
+
+    fallback = _newly_completed_goal_fallback(
+        metadata,
+        completed_at_before=None,
+    )
+
+    assert fallback == (
+        "最终回复生成失败，已恢复任务完成时保存的摘要：\n\n"
+        "取证完成，未修改文件。"
+    )
+
+
+def test_newly_completed_goal_fallback_does_not_reuse_stale_recap() -> None:
+    from nanobot.agent.loop import _newly_completed_goal_fallback
+
+    metadata = {
+        "goal_state": {
+            "status": "completed",
+            "completed_at": "2026-07-20T11:40:06Z",
+            "recap": "旧任务摘要",
+        }
+    }
+
+    assert _newly_completed_goal_fallback(
+        metadata,
+        completed_at_before="2026-07-20T11:40:06Z",
+    ) is None

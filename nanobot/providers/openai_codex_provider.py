@@ -518,6 +518,14 @@ def _codex_error_response(exc: Exception) -> LLMResponse:
     if error_code == "context_length_exceeded":
         error_kind = "context_length"
         should_retry = False
+    elif status_code is None and (
+        error_type in {"server_error", "internal_server_error", "service_unavailable"}
+        or error_code in {"server_error", "internal_server_error", "service_unavailable"}
+    ):
+        # Responses API may report transient server failures inside a completed
+        # SSE stream without an HTTP status or explicit should_retry flag.
+        error_kind = "server"
+        should_retry = True if should_retry is None else should_retry
     elif isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
         error_kind = "timeout"
         default_detail = "timed out waiting for response"
