@@ -396,7 +396,13 @@ if _TEXTUAL_AVAILABLE:
         def _boundary_map(spans: list[tuple[int, int]], total: int) -> list[int]:
             return [start for start, _end in spans] + [total]
 
-        def _reflow(self, width: int, *, preserve_view: bool = True) -> None:
+        def _reflow(
+            self,
+            width: int,
+            *,
+            preserve_view: bool = True,
+            notify_reflow: bool = True,
+        ) -> None:
             old_spans = list(self._record_spans)
             old_total = len(self.lines)
             old_boundaries = self._boundary_map(old_spans, old_total)
@@ -436,7 +442,7 @@ if _TEXTUAL_AVAILABLE:
                 self._record_writes = True
             self._render_width = width
             new_boundaries = self._boundary_map(self._record_spans, len(self.lines))
-            if self._on_reflow is not None:
+            if notify_reflow and self._on_reflow is not None:
                 self._on_reflow(old_boundaries, new_boundaries)
             self._clear_selection()
             if not preserve_view:
@@ -653,6 +659,30 @@ if _TEXTUAL_AVAILABLE:
                     pass
                 self._clear_selection()
             event.stop()
+
+        def record_marker(self) -> int:
+            """Return an opaque marker for records written after this point."""
+            return len(self._logical_records)
+
+        def records_since(self, marker: int) -> list[dict[str, Any]]:
+            """Return stable references to logical records written after ``marker``."""
+            return list(self._logical_records[max(0, marker):])
+
+        def remove_records(self, records: list[dict[str, Any]]) -> None:
+            """Remove selected logical records while preserving later records."""
+            record_ids = {id(record) for record in records}
+            if not record_ids:
+                return
+            kept = [record for record in self._logical_records if id(record) not in record_ids]
+            if len(kept) == len(self._logical_records):
+                return
+            self._logical_records = kept
+            # The caller resets the active stream anchor after removal, so avoid
+            # remapping anchors against a deliberately non-contiguous deletion.
+            self._reflow(
+                max(1, self.scrollable_content_region.width),
+                notify_reflow=False,
+            )
 
         def truncate_to(self, n: int) -> None:
             """Remove records at/after physical line boundary ``n``."""
@@ -1572,6 +1602,11 @@ class TextualTUI(TUIBase):
         self._initial_thinking_placeholder_line: int | None = None
         self._tool_placeholder_line: int = 0  # output-log line index of the current thinking/executing placeholder
         self._flushed_parts: list[str] = []  # intermediate LLM text flushed between tool calls
+        # A flushed segment becomes temporary only after actual tool progress
+        # confirms that it accompanied a tool call. Length continuations and
+        # retries therefore remain permanent.
+        self._pending_tool_text_records: list[dict[str, Any]] = []
+        self._temporary_tool_text_records: list[dict[str, Any]] = []
         self._tool_hint: str = ""
         # Accumulates reasoning_content chunks (LLM thinking trace) so we can
         # flush them as a dim italic history block on _reasoning_end. Mirrors
@@ -2065,6 +2100,11 @@ class TextualTUI(TUIBase):
 
     def add_progress(self, text: str) -> None:
         import time
+        # Progress is the first definitive signal that the preceding resuming
+        # stream ended for a tool call rather than a continuation or retry.
+        if self._pending_tool_text_records:
+            self._temporary_tool_text_records.extend(self._pending_tool_text_records)
+            self._pending_tool_text_records = []
         self._tool_hint = text
         # Mark tool start so add_tool_result can show "[+Ns]" elapsed.
         self._tool_start_time = time.monotonic()
@@ -2393,6 +2433,8 @@ class TextualTUI(TUIBase):
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
         self._flushed_parts = []
+        self._pending_tool_text_records = []
+        self._temporary_tool_text_records = []
         self._suppress_segment_sep = False  # reset per turn; pop_stream may set it
         # Anchor the "thinking time" displayed by spinners to the moment the
         # turn began — not to each individual spinner restart. This keeps the
@@ -2613,6 +2655,9 @@ class TextualTUI(TUIBase):
             self._stream_render_task = None
 
     def stream_delta(self, delta: str) -> None:
+        # No tool progress before the next segment means the previous flush was
+        # a continuation/retry and must not be removed with tool-preface text.
+        self._pending_tool_text_records = []
         self._clear_initial_thinking_placeholder()
         self._activity_phase = "stream_delta"
         self._cancel_idle_thinking()
@@ -2646,6 +2691,7 @@ class TextualTUI(TUIBase):
                 render_as_text = (metadata or {}).get("render_as") == "text"
                 # Replace streaming content (including any placeholder) with final rendered version
                 out.truncate_to(self._tool_placeholder_line)
+                record_marker = out.record_marker()
                 # For mid-turn segments (not the first one), prefix a lightweight
                 # timestamp separator so the user can tell distinct LLM segments
                 # apart instead of seeing one giant blob.
@@ -2661,6 +2707,7 @@ class TextualTUI(TUIBase):
                 # Track end so next tool_phase_start appends after this rendered content
                 self._tool_placeholder_line = len(out.lines)
                 self._flushed_parts.append(self._stream_buf.strip())
+                self._pending_tool_text_records = out.records_since(record_marker)
                 self._last_sep = True
             else:
                 # Nothing streamed yet — remove the thinking/executing placeholder,
@@ -2691,8 +2738,14 @@ class TextualTUI(TUIBase):
         try:
             out = self._app.query_one("#output", _OutputLog)
             out.truncate_to(self._tool_placeholder_line)
+            # Tool-preface text was useful during execution, but the final reply
+            # replaces it. Remove only those records; later tool traces survive.
+            out.remove_records(self._temporary_tool_text_records)
+            self._tool_placeholder_line = len(out.lines)
         except Exception:
             pass
+        self._pending_tool_text_records = []
+        self._temporary_tool_text_records = []
         # Fork: deferred reasoning flush. flush_reasoning skipped while stream
         # was active to avoid splitting the response visually; now is the right
         # time — stream chunk is gone, response will be re-written by
