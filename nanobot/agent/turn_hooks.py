@@ -32,6 +32,7 @@ class AgentTurnHookSpec:
     session_key: str | None = None
     workspace: Path | None = None
     tool_hint_max_length: int = 40
+    tool_hint_formatter: Callable[..., str] | None = None
     set_tool_context: Callable[..., None] | None = None
     on_iteration: Callable[[int], None] | None = None
     registered_hook_factories: list[AgentTurnHookFactory] = field(default_factory=list)
@@ -54,6 +55,7 @@ def build_agent_turn_hook(spec: AgentTurnHookSpec) -> AgentHook:
         metadata=spec.metadata,
         session_key=spec.session_key,
         tool_hint_max_length=spec.tool_hint_max_length,
+        tool_hint_formatter=spec.tool_hint_formatter,
         set_tool_context=spec.set_tool_context,
         on_iteration=spec.on_iteration,
     )

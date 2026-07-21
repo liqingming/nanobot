@@ -190,6 +190,10 @@ class AgentDefaults(Base):
     # Optional transparent Textual canvas for terminal-managed background images,
     # opacity, and Acrylic effects. Disabled preserves the existing opaque UI.
     tui_skin_enabled: bool = False
+    # Show streamed assistant text before a tool call is confirmed. Disabling
+    # buffers stream text until the turn outcome is known, preventing prefaces
+    # from flashing before tool traces and then disappearing.
+    tui_show_tool_preface: bool = True
     # When True, on startup auto-promote any session's pending consolidation
     # summary into MEMORY.md (rebuilds system prompt → first turn after
     # restart has a cache miss). Default False keeps cache warm across

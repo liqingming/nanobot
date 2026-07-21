@@ -1896,6 +1896,7 @@ class TextualTUI(TUIBase):
         model: str | None = None,
         reasoning_effort: str | None = None,
         skin_enabled: bool = False,
+        show_tool_preface: bool = True,
         workspace: str | Path | None = None,
     ) -> None:
         if not _TEXTUAL_AVAILABLE:
@@ -1909,7 +1910,9 @@ class TextualTUI(TUIBase):
         self._model = model
         self._reasoning_effort = reasoning_effort
         self._skin_enabled = skin_enabled
-        self._workspace_label = _compact_path_label(str(workspace or Path.cwd()))
+        self._show_tool_preface = show_tool_preface
+        self._workspace = Path(workspace or Path.cwd())
+        self._workspace_label = _compact_path_label(str(self._workspace))
 
         # Input history is bound to an internal session key by
         # set_input_history_topic(); no topic means no browsable history.
@@ -1939,13 +1942,17 @@ class TextualTUI(TUIBase):
         self._pending_tool_text_records: list[dict[str, Any]] = []
         self._temporary_tool_text_records: list[dict[str, Any]] = []
         self._tool_hint: str = ""
+        self._active_tool_events: list[dict[str, Any]] = []
         # Accumulates reasoning_content chunks (LLM thinking trace) so we can
         # flush them as a dim italic history block on _reasoning_end. Mirrors
         # PromptTUI's behavior; required because reasoning models like
         # DeepSeek-v4-pro otherwise have no place to land their trace.
         self._reasoning_buf: str = ""
         self._last_sep: bool = False
-        self._header_already_rendered: bool = False  # set by pop_stream so add_response skips a second header
+        # One persistent state owns the assistant turn header for both live output
+        # and history replay. Every assistant artifact calls
+        # _ensure_assistant_turn_header() before writing; a user message resets it.
+        self._assistant_turn_header_rendered: bool = False
         # Fork: when a turn's header is on screen but NOTHING visible followed
         # it (reasoning suppressed + no tool trace + no mid-turn flush), the
         # continuation "─ts─" separator in _write_response would dangle with
@@ -2169,6 +2176,32 @@ class TextualTUI(TUIBase):
         except Exception:
             pass
 
+    def _start_assistant_turn(self) -> None:
+        """Reset header ownership when a new user turn begins."""
+        self._assistant_turn_header_rendered = False
+        self._suppress_segment_sep = False
+
+    def _ensure_assistant_turn_header(
+        self,
+        ts: str | None = None,
+        *,
+        error: bool = False,
+    ) -> bool:
+        """Write one full nanobot header before the first assistant artifact.
+
+        Returns True only when this call created the header. Tool traces, file
+        edits, streamed text, completed replies, and history replay all share
+        this gate so their ordering cannot diverge.
+        """
+        if self._assistant_turn_header_rendered:
+            return False
+        timestamp = ts or self._stream_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        header_style = "red bold" if error else "cyan"
+        self._log_write(f"[{header_style}]{__logo__} nanobot[/] [dim]{timestamp}[/dim]")
+        self._log_write("")
+        self._assistant_turn_header_rendered = True
+        return True
+
     def _write_response(
         self,
         content: str,
@@ -2199,7 +2232,8 @@ class TextualTUI(TUIBase):
         render_as = (metadata or {}).get("render_as")
         render_as_text = render_as == "text"
         render_as_error = render_as == "error"
-        if self._header_already_rendered:
+        header_created = self._ensure_assistant_turn_header(ts, error=render_as_error)
+        if not header_created:
             # Continuation of an already-headed turn — mark the new segment
             # with a lightweight timestamp so it isn't glued to the previous one.
             # Strip date portion if present ("2026-05-20 22:45:30" → "22:45:30").
@@ -2209,11 +2243,6 @@ class TextualTUI(TUIBase):
                 short_ts = ts.split(" ", 1)[1] if " " in ts else ts
                 self._log_write(f"[{self.THEME_MUTED}]─ {short_ts} ─[/{self.THEME_MUTED}]")
                 self._log_write("")
-        else:
-            header_style = "red bold" if render_as_error else "cyan"
-            self._log_write(f"[{header_style}]{__logo__} nanobot[/] [dim]{ts}[/dim]")
-            self._log_write("")
-        self._header_already_rendered = False  # consume flag
         self._suppress_segment_sep = False  # consume flag
         if render_as_error:
             self._log_write(Text(content, style=self.THEME_ERROR))
@@ -2250,6 +2279,7 @@ class TextualTUI(TUIBase):
             except Exception:
                 pass
         self._log_write("")  # trailing blank (outside gray bg)
+        self._start_assistant_turn()
         # Fork: a full-width rule between the user block and the upcoming
         # response header — turns are separated more clearly than by a bare
         # blank line. Written outside the gray user-range recorded above.
@@ -2416,12 +2446,7 @@ class TextualTUI(TUIBase):
                 if tcid:
                     results_by_id[str(tcid)] = _extract(msg.get("content"))
 
-        # Track whether we've already written a full "🐈 nanobot ts" header
-        # for the current turn. Subsequent assistant segments in the same turn
-        # (those between two user messages) get a lightweight "─ HH:MM:SS ─"
-        # separator instead — matching the live rendering produced by
-        # flush_stream / _write_response in continuation mode.
-        header_written_this_turn = False
+        self._start_assistant_turn()
         for msg in recent:
             role = msg.get("role")
             content = msg.get("content")
@@ -2440,17 +2465,15 @@ class TextualTUI(TUIBase):
                         message_id=str(msg.get("_transcript_id") or "")
                         or self._next_message_id("user", clean_text, ts),
                     )
-                # New user message → next assistant segment starts a fresh turn
-                header_written_this_turn = False
+                # New user message → next assistant artifact starts a fresh turn.
+                self._start_assistant_turn()
             elif role == "assistant":
                 text = _extract(content)
+                tool_calls = msg.get("tool_calls") or []
+                ts = _fmt_ts(msg.get("timestamp"))
+                if tool_calls and not text.strip():
+                    self._ensure_assistant_turn_header(ts)
                 if text.strip():
-                    ts = _fmt_ts(msg.get("timestamp"))
-                    if header_written_this_turn:
-                        # Mid-turn segment: signal _write_response to skip the
-                        # full header and instead write a "─ HH:MM:SS ─" line.
-                        # _write_response will use the historical ts we pass in.
-                        self._header_already_rendered = True
                     clean_text = text.strip()
                     self._write_response(
                         clean_text,
@@ -2458,87 +2481,49 @@ class TextualTUI(TUIBase):
                         message_id=str(msg.get("_transcript_id") or "")
                         or self._next_message_id("assistant", clean_text, ts),
                     )
-                    header_written_this_turn = True
-                # Replay tool calls as static "↳ tool(args)  →  result" traces.
-                for tc in msg.get("tool_calls") or []:
-                    self._replay_tool_trace(tc, results_by_id, tool_registry, workspace)
+                # Replay one assistant tool-call batch using the same structured
+                # visual hierarchy as a live batch.
+                if tool_calls:
+                    self._replay_tool_batch(
+                        tool_calls, results_by_id, tool_registry, workspace
+                    )
         self._refresh_bookmark_markers()
 
-    def _replay_tool_trace(
+    def _replay_tool_batch(
         self,
-        tool_call: dict,
+        tool_calls: list[dict],
         results_by_id: dict[str, str],
         tool_registry: Any = None,
         workspace: Any = None,
     ) -> None:
-        """Render a single historical tool call as a static trace line during
-        load_session_history. Mirrors the live look of _render_tool_trace.
-        """
+        """Replay one historical assistant tool batch with the live hierarchy."""
         import json as _json
 
-        from rich.text import Text as _RText
-
-        try:
-            fn = tool_call.get("function") or {}
-            name = fn.get("name") or tool_call.get("name") or "tool"
-            raw_args = fn.get("arguments")
-            args: dict = {}
-            if isinstance(raw_args, str):
-                try:
+        events: list[dict[str, Any]] = []
+        for tool_call in tool_calls:
+            try:
+                fn = tool_call.get("function") or {}
+                name = fn.get("name") or tool_call.get("name") or "tool"
+                raw_args = fn.get("arguments")
+                args: dict[str, Any] = {}
+                if isinstance(raw_args, str):
                     parsed = _json.loads(raw_args)
                     if isinstance(parsed, dict):
                         args = parsed
-                except Exception:
-                    pass
-            elif isinstance(raw_args, dict):
-                args = raw_args
-
-            # Build the hint using the same logic as live traces (including
-            # path relativization to the workspace). Import from the real module
-            # — loop.py only imports it function-locally as _fork_fmt, so
-            # `from nanobot.agent.loop import format_tool_hint` raised ImportError
-            # and (silently swallowed below) wiped every replayed tool trace.
-            from nanobot.fork.utils.tool_hints import format_tool_hint
-            tc_like = type("TC", (), {"name": name, "arguments": args})()
-            hint = format_tool_hint([tc_like], workspace=workspace)
-
-            # Pair with the tool result (if present) and try to produce the
-            # same structured summary the live UI shows. Falls back to a raw
-            # preview if no registry is available or the tool has no summarizer.
-            tcid = str(tool_call.get("id") or "")
-            result_text = results_by_id.get(tcid, "")
-            summary = ""
-            if result_text:
-                tool = tool_registry.get(name) if tool_registry is not None else None
-                if tool is not None:
-                    from nanobot.agent.tools.summaries import summarize_tool_result
-                    summary = summarize_tool_result(tool, args, result_text)
-                if not summary:
-                    preview = result_text.replace("\n", " ").strip()
-                    # Match extract_error_summary's 120-char budget so replayed
-                    # raw-preview summaries don't look weirdly short next to
-                    # the live structured summaries.
-                    if len(preview) > 120:
-                        preview = preview[:119] + "…"
-                    summary = preview
-
-            line = _RText()
-            line.append(self._TOOL_INDENT, style="")
-            line.append(f"{self._TOOL_MARKER} ", style=self.THEME_MARKER)
-            line.append(hint, style=self.THEME_HINT)
-            if summary:
-                tail_style = self.THEME_ERROR if summary.startswith("Error") else self.THEME_MUTED
-                line.append("  →  ", style=self.THEME_MUTED)
-                line.append(summary, style=tail_style)
-            try:
-                out = self._app.query_one("#output", _OutputLog)
-                out.write(line)
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                result_text = results_by_id.get(str(tool_call.get("id") or ""), "")
+                error = result_text.strip() if result_text.lstrip().startswith("Error") else ""
+                events.append({
+                    "phase": "error" if error else "end",
+                    "name": name,
+                    "arguments": args,
+                    "error": error,
+                })
             except Exception:
-                logger.debug("replay tool trace: write to #output failed", exc_info=True)
-        except Exception:
-            # Log instead of silently swallowing — a swallowed ImportError here
-            # is exactly what hid the lost-tool-trace bug for so long.
-            logger.debug("replay tool trace: render failed", exc_info=True)
+                logger.debug("replay tool batch: decode failed", exc_info=True)
+        if events:
+            self._render_tool_batch(events, elapsed=None)
 
     def add_user_echo(self, text: str, *, message_id: str | None = None) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2557,7 +2542,9 @@ class TextualTUI(TUIBase):
         ts = ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._write_response(content, ts, metadata, message_id=message_id)
 
-    def add_progress(self, text: str) -> None:
+    def add_progress(
+        self, text: str, tool_events: list[dict[str, Any]] | None = None
+    ) -> None:
         import time
         # Progress is the first definitive signal that the preceding resuming
         # stream ended for a tool call rather than a continuation or retry.
@@ -2565,9 +2552,15 @@ class TextualTUI(TUIBase):
             self._temporary_tool_text_records.extend(self._pending_tool_text_records)
             self._pending_tool_text_records = []
         self._tool_hint = text
-        # Mark tool start so add_tool_result can show "[+Ns]" elapsed.
+        self._active_tool_events = [
+            event for event in (tool_events or []) if isinstance(event, dict)
+        ]
+        # Mark tool start so add_tool_result can show the batch elapsed time.
         self._tool_start_time = time.monotonic()
-        self._app._safe_call(self._update_progress_line, text)
+        live_text = text
+        if len(self._active_tool_events) > 1:
+            live_text = f"执行中 · {len(self._active_tool_events)} 项"
+        self._app._safe_call(self._update_progress_line, live_text)
 
     def add_reasoning(self, text: str) -> None:
         """Accumulate a reasoning_content chunk; flushed on _reasoning_end.
@@ -2655,6 +2648,7 @@ class TextualTUI(TUIBase):
         noisy "[+0s]" badge.
         """
         from rich.text import Text as _RText
+        self._ensure_assistant_turn_header()
         line = _RText()
         line.append(self._TOOL_INDENT, style="")
         line.append(f"{self._TOOL_MARKER} ", style=self.THEME_MARKER)
@@ -2675,31 +2669,81 @@ class TextualTUI(TUIBase):
             pass
 
     def _petrify_tool_placeholder(self) -> None:
-        """Commit the active tool as a permanent output trace, if still pending."""
-        if not self._tool_hint:
+        """Commit an unfinished tool batch before another output phase replaces it."""
+        if not self._tool_hint and not self._active_tool_events:
             return
         import time
         elapsed = (
             time.monotonic() - self._tool_start_time
             if self._tool_start_time else None
         )
-        self._render_tool_trace(self._tool_hint, "", elapsed)
+        if self._active_tool_events:
+            self._render_tool_batch(self._active_tool_events, elapsed=elapsed)
+        else:
+            self._render_tool_trace(self._tool_hint, "", elapsed)
         self._tool_hint = ""
+        self._active_tool_events = []
 
-    def add_tool_result(self, summary: str) -> None:
-        """Petrify the current spinner placeholder into a static trace, optionally
-        appending a result summary (e.g. '↳ exec(cmd)  →  exit 0, 12 lines').
+    def _render_tool_batch(
+        self,
+        tool_events: list[dict[str, Any]],
+        *,
+        elapsed: float | None,
+    ) -> None:
+        """Append a readable batch title and one line per distinct tool target."""
+        from rich.text import Text as _RText
 
-        Called once per tool batch — even when summary is empty (so tools that
-        don't define summarize_result still get their trace line frozen
-        immediately on completion, instead of relying on the next operation
-        to petrify them).
+        from nanobot.fork.utils.tool_hints import format_tool_event_items
 
-        After petrifying, schedule an idle "thinking..." spinner so the gap
-        between tool completion and the next LLM action (which can be many
-        seconds of reasoning) doesn't look like the UI hung.
-        """
-        if not self._tool_hint:
+        items = format_tool_event_items(tool_events, workspace=self._workspace)
+        if not items:
+            return
+        self._ensure_assistant_turn_header()
+        out = self._app.query_one("#output", _OutputLog)
+        if len(tool_events) == 1 and len(items) == 1:
+            item = items[0]
+            line = _RText()
+            line.append(self._TOOL_INDENT, style="")
+            line.append(f"{self._TOOL_MARKER} ", style=self.THEME_MARKER)
+            line.append(str(item["label"]), style=self.THEME_HINT)
+            if item["status"] == "error":
+                error = " ".join(str(item["error"] or "执行失败").split())
+                if len(error) > 80:
+                    error = error[:79] + "…"
+                line.append(f"  · 失败：{error}", style=self.THEME_ERROR)
+            if elapsed is not None and elapsed >= 1:
+                line.append(f" · {int(elapsed)}s", style=self.THEME_MUTED)
+            out.write(line)
+            self._tool_placeholder_line = len(out.lines)
+            return
+
+        title = _RText()
+        title.append(self._TOOL_INDENT, style="")
+        title.append(f"{self._TOOL_MARKER} ", style=self.THEME_MARKER)
+        title.append(f"工具 · {len(tool_events)} 项", style=self.THEME_HINT)
+        if elapsed is not None and elapsed >= 1:
+            title.append(f" · {int(elapsed)}s", style=self.THEME_MUTED)
+        out.write(title)
+        for index, item in enumerate(items):
+            line = _RText()
+            branch = "└─ " if index == len(items) - 1 else "├─ "
+            line.append(f"{self._TOOL_INDENT}  {branch}", style=self.THEME_MARKER)
+            line.append(str(item["label"]), style=self.THEME_HINT)
+            if item["status"] == "error":
+                error = " ".join(str(item["error"] or "执行失败").split())
+                if len(error) > 80:
+                    error = error[:79] + "…"
+                line.append(f"  · 失败：{error}", style=self.THEME_ERROR)
+            out.write(line)
+        self._tool_placeholder_line = len(out.lines)
+
+    def add_tool_result(
+        self,
+        summary: str,
+        tool_events: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Commit the current structured tool batch, then resume idle thinking."""
+        if not self._tool_hint and not self._active_tool_events:
             return
         self._hide_live_activity()
         import time
@@ -2707,11 +2751,15 @@ class TextualTUI(TUIBase):
             time.monotonic() - self._tool_start_time
             if self._tool_start_time else None
         )
-        # summary may be "" — _render_tool_trace just skips the tail.
-        self._render_tool_trace(self._tool_hint, summary, elapsed)
+        completed = [
+            event for event in (tool_events or []) if isinstance(event, dict)
+        ]
+        if completed or self._active_tool_events:
+            self._render_tool_batch(completed or self._active_tool_events, elapsed=elapsed)
+        else:
+            self._render_tool_trace(self._tool_hint, summary, elapsed)
         self._tool_hint = ""
-        # If the LLM stays silent for >500ms after the tool finishes, show
-        # a "thinking..." spinner in #live so the user knows we're waiting.
+        self._active_tool_events = []
         self._schedule_idle_thinking()
 
     _FILE_DIFF_VISIBLE_LINES = 120
@@ -2726,6 +2774,7 @@ class TextualTUI(TUIBase):
         rendered = [block for block in rendered if block is not None]
         if not rendered:
             return
+        self._ensure_assistant_turn_header()
         self._petrify_tool_placeholder()
         for block in rendered:
             self._write_file_edit_block(block)
@@ -2860,6 +2909,7 @@ class TextualTUI(TUIBase):
     def stream_start(self) -> None:
         import time
         self._activity_phase = "stream_start"
+        self._start_assistant_turn()
         self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._stream_buf = ""
         self._flushed_parts = []
@@ -2874,8 +2924,7 @@ class TextualTUI(TUIBase):
         try:
             out = self._app.query_one("#output", _OutputLog)
             self._stream_header_line = len(out.lines)
-            out.write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{self._stream_ts}[/dim]")
-            out.write("")
+            self._ensure_assistant_turn_header(self._stream_ts)
             self._tool_placeholder_line = len(out.lines)
             out.scroll_end(animate=False)
         except Exception:
@@ -2961,6 +3010,8 @@ class TextualTUI(TUIBase):
         self._stream_render_follow = False
 
     def _render_stream_live(self) -> None:
+        if not self._show_tool_preface:
+            return
         try:
             out = self._app.query_one("#output", _OutputLog)
             follow = self._stream_render_follow
@@ -2975,6 +3026,8 @@ class TextualTUI(TUIBase):
             pass
 
     def _schedule_stream_render(self, delay: float = 0.075) -> None:
+        if not self._show_tool_preface:
+            return
         task = self._stream_render_task
         if task is not None and not task.done():
             return
@@ -3030,7 +3083,7 @@ class TextualTUI(TUIBase):
         self._app.clear_live()
         try:
             out = self._app.query_one("#output", _OutputLog)
-            if self._stream_buf.strip():
+            if self._stream_buf.strip() and self._show_tool_preface:
                 render_as_text = (metadata or {}).get("render_as") == "text"
                 # Replace the current live-stream text with its final rendered version.
                 out.truncate_to(self._tool_placeholder_line)
@@ -3097,9 +3150,10 @@ class TextualTUI(TUIBase):
             deferred = self._reasoning_buf
             self._reasoning_buf = ""
             self._app._safe_call(self._write_reasoning_block, deferred)
-        # If the streaming session was active, signal add_response to skip
-        # the header (we keep the original one written by stream_start).
-        self._header_already_rendered = bool(ts_was) or self._stream_header_line > 0
+        # stream_start and every assistant artifact share the persistent header
+        # state; pop_stream no longer needs a one-shot skip flag.
+        if bool(ts_was) or self._stream_header_line > 0:
+            self._assistant_turn_header_rendered = True
         # Fork: suppress the continuation "─ts─" separator when no visible
         # content followed the header. _tool_placeholder_line only advances past
         # the header anchor (_stream_header_line + 2 = header line + its trailing
@@ -3109,7 +3163,7 @@ class TextualTUI(TUIBase):
         # "─ts─" line would dangle. NOTE: the "+2" is coupled to stream_start
         # writing a single-line header + one blank; keep them in sync.
         self._suppress_segment_sep = (
-            self._header_already_rendered
+            self._assistant_turn_header_rendered
             and self._tool_placeholder_line <= self._stream_header_line + 2
         )
         return buf
@@ -3200,6 +3254,8 @@ class TextualTUI(TUIBase):
         self._app.clear_live()
         self._stream_buf = ""
         self._stream_ts = ""
+        self._assistant_turn_header_rendered = False
+        self._suppress_segment_sep = False
         self._last_sep = False
         self._ctx_used = 0
         self._ctx_total = 0

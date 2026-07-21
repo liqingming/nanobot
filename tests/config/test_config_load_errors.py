@@ -42,3 +42,13 @@ def test_api_config_allows_wildcard_host_with_key() -> None:
 
     assert config.host == "0.0.0.0"
     assert config.api_key == "secret"
+
+
+def test_tui_show_tool_preface_defaults_true_and_accepts_camel_case() -> None:
+    from nanobot.config.schema import Config
+
+    assert Config().agents.defaults.tui_show_tool_preface is True
+    config = Config.model_validate(
+        {"agents": {"defaults": {"tuiShowToolPreface": False}}}
+    )
+    assert config.agents.defaults.tui_show_tool_preface is False

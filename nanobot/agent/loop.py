@@ -1089,6 +1089,7 @@ class AgentLoop:
             session_key=active_session_key,
             workspace=effective_scope.project_path,
             tool_hint_max_length=self.tool_hint_max_length,
+            tool_hint_formatter=self._tool_hint_formatter,
             set_tool_context=self._set_tool_context,
             on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
             registered_hook_factories=self._hook_factories,

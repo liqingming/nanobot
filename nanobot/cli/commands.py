@@ -2283,6 +2283,7 @@ def agent(
                 reasoning_effort=getattr(agent_loop.provider.generation, "reasoning_effort", None),
                 backend=config.agents.defaults.tui_backend,
                 skin_enabled=config.agents.defaults.tui_skin_enabled,
+                show_tool_preface=config.agents.defaults.tui_show_tool_preface,
                 workspace=agent_loop.workspace,
             )
 
@@ -2865,13 +2866,14 @@ def agent(
                                     summary = _tool_result_summary_from_events(
                                         msg.metadata.get("_tool_events")
                                     )
+                                    tool_events = msg.metadata.get("_tool_events")
                                     if summary is not None:
-                                        tui.add_tool_result(summary)
+                                        tui.add_tool_result(summary, tool_events=tool_events)
                                     elif msg.content:
                                         if msg.metadata.get("_tool_result"):
-                                            tui.add_tool_result(msg.content)
+                                            tui.add_tool_result(msg.content, tool_events=tool_events)
                                         else:
-                                            tui.add_progress(msg.content)
+                                            tui.add_progress(msg.content, tool_events=tool_events)
                             continue
 
                         # Interactive question popup pushed by AskUserTool.

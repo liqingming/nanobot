@@ -286,6 +286,175 @@ async def test_runner_returns_max_iterations_fallback():
 
 
 @pytest.mark.asyncio
+async def test_runner_warns_then_stops_identical_tool_loop():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    requests: list[list[dict]] = []
+
+    async def chat_with_retry(*, messages, **_kwargs):
+        requests.append(messages)
+        call_number = len(requests)
+        return LLMResponse(
+            content="still checking",
+            tool_calls=[ToolCallRequest(
+                id=f"call_{call_number}",
+                name="grep",
+                arguments={"path": "a.py", "pattern": "target"},
+            )],
+        )
+
+    provider = MagicMock()
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="same result")
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=20,
+        max_tool_result_chars=16000,
+    ))
+
+    assert result.stop_reason == "tool_loop"
+    assert "grep" in result.final_content
+    assert len(requests) == 5
+    assert tools.execute.await_count == 4
+    assert any(
+        message.get("role") == "user"
+        and "[Runtime correction]" in message.get("content", "")
+        for message in requests[3]
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_detects_repeated_multi_call_cycle():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    sequence = ["first", "second", "third", "fourth", "fifth"]
+    call_count = 0
+
+    async def chat_with_retry(**_kwargs):
+        nonlocal call_count
+        name = sequence[call_count % len(sequence)]
+        call_count += 1
+        return LLMResponse(
+            content="checking",
+            tool_calls=[ToolCallRequest(
+                id=f"call_{call_count}",
+                name="grep",
+                arguments={"path": "a.py", "pattern": name},
+            )],
+        )
+
+    provider = MagicMock()
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="result")
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=40,
+        max_tool_result_chars=16000,
+    ))
+
+    assert result.stop_reason == "tool_loop"
+    assert "grep → grep → grep → grep → grep" in result.final_content
+    assert call_count == 25
+    assert tools.execute.await_count == 24
+
+
+@pytest.mark.asyncio
+async def test_runner_tool_loop_correction_can_recover():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    call_count = 0
+
+    async def chat_with_retry(**_kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 3:
+            return LLMResponse(
+                content="checking",
+                tool_calls=[ToolCallRequest(
+                    id=f"call_{call_count}",
+                    name="grep",
+                    arguments={"path": "a.py", "pattern": "target"},
+                )],
+            )
+        return LLMResponse(content="changed approach and finished", tool_calls=[])
+
+    provider = MagicMock()
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="same result")
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=10,
+        max_tool_result_chars=16000,
+    ))
+
+    assert result.stop_reason == "completed"
+    assert result.final_content == "changed approach and finished"
+    assert tools.execute.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("write_stdin", {"session_id": "s1", "chars": ""}),
+        ("list_dir", {"path": "."}),
+        ("process_control", {"action": "logs", "process_id": "p1", "tail": 20}),
+    ],
+)
+async def test_runner_exempts_polling_tool_repetition(tool_name, arguments):
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    call_count = 0
+
+    async def chat_with_retry(**_kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 6:
+            return LLMResponse(
+                content="waiting",
+                tool_calls=[ToolCallRequest(
+                    id=f"call_{call_count}",
+                    name=tool_name,
+                    arguments=arguments,
+                )],
+            )
+        return LLMResponse(content="process completed", tool_calls=[])
+
+    provider = MagicMock()
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="still running")
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=10,
+        max_tool_result_chars=16000,
+    ))
+
+    assert result.stop_reason == "completed"
+    assert result.final_content == "process completed"
+    assert tools.execute.await_count == 6
+
+
+@pytest.mark.asyncio
 async def test_runner_returns_structured_tool_error():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 

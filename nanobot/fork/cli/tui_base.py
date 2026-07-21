@@ -69,7 +69,9 @@ class TUIBase(ABC):
     ) -> None: ...
 
     @abstractmethod
-    def add_progress(self, text: str) -> None: ...
+    def add_progress(
+        self, text: str, tool_events: list[dict[str, Any]] | None = None
+    ) -> None: ...
 
     @abstractmethod
     def add_system(self, text: str) -> None: ...
@@ -106,7 +108,9 @@ class TUIBase(ABC):
         """
         return None
 
-    def add_tool_result(self, summary: str) -> None:
+    def add_tool_result(
+        self, summary: str, tool_events: list[dict[str, Any]] | None = None
+    ) -> None:
         """Append a short result summary to the most-recent tool placeholder
         (e.g. turning "⠋ exec(cmd)" into "→ exec(cmd) → exit 0, 12 lines").
 

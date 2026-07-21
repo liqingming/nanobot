@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import time
 from contextlib import suppress
@@ -67,6 +68,18 @@ _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 # A hook must not indefinitely prevent a model-approved tool call from starting.
 _PRE_TOOL_TRANSITION_WATCHDOG_S = 30.0
+
+# Fork: stop model/tool feedback loops before the high per-turn iteration budget
+# is exhausted. Three identical short cycles trigger a correction; five cycles
+# terminate the turn. Polling tools are excluded because repetition is expected.
+_TOOL_LOOP_WARN_REPEATS = 3
+_TOOL_LOOP_STOP_REPEATS = 5
+_TOOL_LOOP_MAX_PERIOD = 8
+_TOOL_LOOP_EXEMPT_TOOLS = frozenset({"list_dir", "list_exec_sessions", "write_stdin"})
+_TOOL_LOOP_STOP_MESSAGE = (
+    "检测到工具调用陷入无进展循环，已安全停止本轮：相同的工具调用序列在纠偏后仍重复。"
+    "请缩小任务范围、提供新的判定依据，或调整方案后再继续。"
+)
 
 @dataclass(slots=True)
 class AgentRunSpec:
@@ -366,6 +379,8 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+        tool_batch_history: list[tuple[tuple[str, str], ...]] = []
+        warned_tool_loops: set[tuple[tuple[tuple[str, str], ...], ...]] = set()
         compacted_tool_call_ids: set[str] = set()
         tool_digests: dict[str, ToolDigest] = {}
         adaptive_context_block_limit: int | None = None
@@ -593,6 +608,51 @@ class AgentRunner:
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
 
+                loop_match = self._record_tool_batch(tool_batch_history, response.tool_calls)
+                loop_correction: str | None = None
+                if loop_match is not None:
+                    loop_pattern, repeat_count = loop_match
+                    pattern_tools = self._tool_loop_pattern_tools(loop_pattern)
+                    if repeat_count >= _TOOL_LOOP_STOP_REPEATS:
+                        final_content = (
+                            f"{_TOOL_LOOP_STOP_MESSAGE}\n\n"
+                            f"重复序列：{pattern_tools}；已连续出现 {repeat_count} 轮。"
+                        )
+                        stop_reason = "tool_loop"
+                        self._append_final_message(messages, final_content)
+                        context.final_content = final_content
+                        context.stop_reason = stop_reason
+                        self._log_event(
+                            spec,
+                            "runner.tool_loop.stopped",
+                            iteration=iteration,
+                            repeat_count=repeat_count,
+                            period=len(loop_pattern),
+                            tools=pattern_tools,
+                        )
+                        await hook.after_iteration(context)
+                        break
+                    if (
+                        repeat_count >= _TOOL_LOOP_WARN_REPEATS
+                        and loop_pattern not in warned_tool_loops
+                    ):
+                        warned_tool_loops.add(loop_pattern)
+                        loop_correction = (
+                            "[Runtime correction] The same tool-call sequence has repeated "
+                            f"{repeat_count} times without a change in arguments: {pattern_tools}. "
+                            "Do not repeat this sequence again. Use the results already returned, "
+                            "change the investigation or implementation approach, or finish with "
+                            "a clear explanation of what blocks progress."
+                        )
+                        self._log_event(
+                            spec,
+                            "runner.tool_loop.warned",
+                            iteration=iteration,
+                            repeat_count=repeat_count,
+                            period=len(loop_pattern),
+                            tools=pattern_tools,
+                        )
+
                 assistant_message = build_assistant_message(
                     response.content or "",
                     tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
@@ -741,6 +801,8 @@ class AgentRunner:
                     }
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
+                if loop_correction is not None:
+                    messages.append({"role": "user", "content": loop_correction})
                 if fatal_error is not None:
                     error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
                     final_content = error
@@ -1019,6 +1081,62 @@ class AgentRunner:
         if spec.reasoning_effort is not None:
             kwargs["reasoning_effort"] = spec.reasoning_effort
         return kwargs
+
+    @staticmethod
+    def _record_tool_batch(
+        history: list[tuple[tuple[str, str], ...]],
+        tool_calls: list[ToolCallRequest],
+    ) -> tuple[tuple[tuple[tuple[str, str], ...], ...], int] | None:
+        """Record a tool batch and detect a repeated suffix cycle."""
+        batch = tuple(
+            (
+                call.name,
+                json.dumps(call.arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            )
+            for call in tool_calls
+        )
+        history.append(batch)
+        if not batch or AgentRunner._tool_loop_batch_is_polling(batch):
+            return None
+
+        max_period = min(_TOOL_LOOP_MAX_PERIOD, len(history) // _TOOL_LOOP_WARN_REPEATS)
+        for period in range(1, max_period + 1):
+            pattern = tuple(history[-period:])
+            repeat_count = 1
+            cursor = len(history) - period
+            while cursor >= period and tuple(history[cursor - period:cursor]) == pattern:
+                repeat_count += 1
+                cursor -= period
+            if repeat_count >= _TOOL_LOOP_WARN_REPEATS:
+                if not all(
+                    AgentRunner._tool_loop_batch_is_polling(pattern_batch)
+                    for pattern_batch in pattern
+                ):
+                    return pattern, repeat_count
+        return None
+
+    @staticmethod
+    def _tool_loop_batch_is_polling(batch: tuple[tuple[str, str], ...]) -> bool:
+        for name, arguments_json in batch:
+            if name in _TOOL_LOOP_EXEMPT_TOOLS:
+                continue
+            if name == "process_control":
+                try:
+                    action = json.loads(arguments_json).get("action")
+                except (AttributeError, json.JSONDecodeError):
+                    return False
+                if action in {"list", "logs"}:
+                    continue
+            return False
+        return True
+
+    @staticmethod
+    def _tool_loop_pattern_tools(
+        pattern: tuple[tuple[tuple[str, str], ...], ...],
+    ) -> str:
+        return " → ".join(
+            "+".join(name for name, _arguments in batch) for batch in pattern
+        )
 
     async def _request_model(
         self,

@@ -1108,7 +1108,9 @@ class PromptTUI(TUIBase):
                 c.print(f"  {ln}", style="dim italic", markup=False)
         return _rich_to_ansi(_fn)
 
-    def add_progress(self, text: str) -> None:
+    def add_progress(
+        self, text: str, tool_events: list[dict[str, Any]] | None = None
+    ) -> None:
         """Show the current tool being executed (with rotation animation)."""
         following = self._is_following_bottom()
         self._tool_hint = text

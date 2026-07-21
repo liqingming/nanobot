@@ -317,3 +317,119 @@ async def test_idle_live_status_does_not_pull_history_reader_to_bottom() -> None
         assert tui._app.query_one("#live").has_class("visible")
         assert int(output.scroll_offset.y) == reading_position
         assert not output.is_at_bottom()
+
+
+@pytest.mark.asyncio
+async def test_live_structured_tool_batch_is_readable_and_shows_error() -> None:
+    tui = TextualTUI(render_markdown=False, workspace=".")
+    here_python = "@'\nimport inspect\nprint(inspect.signature(len))\n'@ | python -X utf8 -"
+    starts = [
+        {"phase": "start", "name": "exec", "arguments": {"command": here_python}},
+        {"phase": "start", "name": "read_file", "arguments": {"path": "a.py"}},
+        {"phase": "start", "name": "read_file", "arguments": {"path": "a.py"}},
+    ]
+    finishes = [
+        {"phase": "end", "name": "exec", "arguments": {"command": here_python}},
+        {"phase": "end", "name": "read_file", "arguments": {"path": "a.py"}},
+        {
+            "phase": "error",
+            "name": "read_file",
+            "arguments": {"path": "a.py"},
+            "error": "file not found",
+        },
+    ]
+
+    async with tui._app.run_test(size=(42, 18)) as pilot:
+        output = tui._app.query_one("#output", _OutputLog)
+        tui.stream_start()
+        tui.tool_phase_start()
+        tui.add_progress("legacy, unreadable hint", tool_events=starts)
+        tui._tool_start_time -= 2
+        await pilot.pause()
+        tui.add_tool_result("Error: file not found", tool_events=finishes)
+        await pilot.pause()
+        rendered = _output_text(output)
+
+    assert "工具 · 3 项 · 2s" in rendered
+    assert "运行 Python 检查脚本" in rendered
+    assert 'read_file("a.py")' in rendered
+    assert "失败：file not found" in rendered
+    assert "legacy, unreadable hint" not in rendered
+    assert "@'" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_live_tool_trace_stays_below_single_assistant_turn_header() -> None:
+    tui = TextualTUI(render_markdown=False)
+
+    async with tui._app.run_test() as pilot:
+        output = tui._app.query_one("#output", _OutputLog)
+        tui.add_user_echo("检查并提交")
+        tui.stream_start()
+        tui.flush_stream()
+        tui.tool_phase_start()
+        tui.add_progress("exec")
+        tui.add_tool_result("clean")
+        tui.stream_delta("已提交。")
+        await _settle_stream_render()
+        final = tui.pop_stream()
+        tui.flush_accumulator()
+        tui.add_response(final)
+        await pilot.pause()
+        rendered = _output_text(output)
+
+    assistant_headers = [
+        line for line in rendered.splitlines() if line.startswith("🐈 nanobot 20")
+    ]
+    assert len(assistant_headers) == 1
+    header_index = rendered.index(assistant_headers[0])
+    assert header_index < rendered.index("exec") < rendered.index("已提交。")
+
+
+@pytest.mark.asyncio
+async def test_disabled_tool_preface_never_enters_output_but_final_reply_survives() -> None:
+    tui = TextualTUI(render_markdown=False, show_tool_preface=False)
+
+    async with tui._app.run_test() as pilot:
+        output = tui._app.query_one("#output", _OutputLog)
+        tui.add_user_echo("检查后回答")
+        tui.stream_start()
+        tui.stream_delta("我先检查实现。")
+        await _settle_stream_render()
+        assert "我先检查实现。" not in _output_text(output)
+
+        tui.flush_stream()
+        tui.tool_phase_start()
+        tui.add_progress("read_file")
+        tui.add_tool_result("ok")
+        assert "我先检查实现。" not in _output_text(output)
+
+        tui.stream_delta("最终结论。")
+        await _settle_stream_render()
+        assert "最终结论。" not in _output_text(output)
+        final = tui.pop_stream()
+        tui.flush_accumulator()
+        tui.add_response(final)
+        await pilot.pause()
+        rendered = _output_text(output)
+
+    assert "我先检查实现。" not in rendered
+    assert "read_file" in rendered
+    assert rendered.count("最终结论。") == 1
+
+
+@pytest.mark.asyncio
+async def test_enabled_tool_preface_remains_visible_during_tool_execution() -> None:
+    tui = TextualTUI(render_markdown=False, show_tool_preface=True)
+
+    async with tui._app.run_test():
+        output = tui._app.query_one("#output", _OutputLog)
+        tui.stream_start()
+        tui.stream_delta("我先检查实现。")
+        await _settle_stream_render()
+        tui.flush_stream()
+        tui.tool_phase_start()
+        tui.add_progress("read_file")
+        tui.add_tool_result("ok")
+
+        assert "我先检查实现。" in _output_text(output)
