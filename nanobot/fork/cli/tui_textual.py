@@ -843,9 +843,14 @@ if _TEXTUAL_AVAILABLE:
             marked: bool,
             overlay: bool,
         ) -> Strip:
-            """用左侧固定栏覆盖行首；逻辑行宽和复制内容保持不变。"""
+            """仅在书签行覆盖左侧固定栏；普通行保持原始宽字符边界。"""
             from rich.segment import Segment
 
+            # Splitting every line at cell 2 corrupts text shaped like
+            # "<space><CJK>": the boundary lands halfway through the wide
+            # character, so Rich replaces both cropped halves with spaces.
+            if not marked:
+                return strip
             gutter_width = min(cls._BOOKMARK_GUTTER_WIDTH, width)
             if gutter_width <= 0:
                 return strip
@@ -1246,11 +1251,14 @@ if _TEXTUAL_AVAILABLE:
             display: block;
         }
         #live {
-            height: auto;
-            min-height: 1;
+            height: 1;
             padding: 0 1;
             background: #0c0c0c;
             color: $text-muted;
+            display: none;
+        }
+        #live.visible {
+            display: block;
         }
         #popup {
             height: auto;
@@ -1348,6 +1356,7 @@ if _TEXTUAL_AVAILABLE:
             self._thinking_timer: Any = None
             self._thinking_frame = 0
             self._thinking_start_time: float = 0.0
+            self._live_layout_generation = 0
             self._lag_timer: Any = None
             self._lag_last: float = 0.0
             self._lag_warn_threshold_s = 0.5
@@ -1669,36 +1678,32 @@ if _TEXTUAL_AVAILABLE:
         def stop_spinner(self) -> None:
             self._stop_spinner()
 
-        # ── thinking spinner (animates inside #output) ─────────────────────
+        # ── thinking/tool spinner (single transient #live line) ────────────
 
         def start_thinking_spinner(self) -> None:
+            """Animate the single transient status line outside output history."""
             import time
             self._stop_thinking_spinner()
+            # A queued start may run after its phase was already cancelled.
+            if not self._tui._live_activity_visible:
+                return
             self._thinking_frame = 0
             self._thinking_start_time = time.monotonic()
 
             def _tick() -> None:
+                if not self._tui._live_activity_visible:
+                    self._stop_thinking_spinner()
+                    return
                 self._thinking_frame += 1
                 icon = _SPINNER[self._thinking_frame % len(_SPINNER)]
-                # Use the turn-level anchor when present so the elapsed counter
-                # tracks the whole "thinking" duration, not just this spinner.
                 base = self._tui._turn_start_time or self._thinking_start_time
                 suffix = self._elapsed_suffix(base)
-                try:
-                    out = self.query_one("#output", _OutputLog)
-                    idx = self._tui._tool_placeholder_line
-                    if 0 <= idx < len(out.lines):
-                        hint = self._tui._tool_hint
-                        # Tool execution → 4-space indent + cyan (matches the
-                        # eventual "↳ tool" trace). Idle thinking → 2-space
-                        # indent + grey50 (subtler, marks waiting state).
-                        if hint:
-                            rt = Text(f"    {icon} {hint}{suffix}", style="cyan")
-                        else:
-                            rt = Text(f"  {icon} 思考中...{suffix}", style="grey50")
-                        out.replace_line(idx, rt)
-                except Exception:
-                    pass
+                hint = self._tui._tool_hint
+                if hint:
+                    rt = Text(f"    {icon} {hint}{suffix}", style="cyan")
+                else:
+                    rt = Text(f"  {icon} 思考中...{suffix}", style="grey50")
+                self.update_live(rt)
 
             self._thinking_timer = self.set_interval(0.1, _tick)
 
@@ -1712,14 +1717,46 @@ if _TEXTUAL_AVAILABLE:
 
         # ── live area helpers ──────────────────────────────────────────────
 
-        def update_live(self, text: str) -> None:
+        def _change_live_visibility(self, live: Static, visible: bool) -> None:
+            """Change #live layout while preserving an existing bottom anchor."""
+            currently_visible = live.has_class("visible")
+            if currently_visible == visible:
+                return
             try:
-                self.query_one("#live", Static).update(text)
+                output = self.query_one("#output", _OutputLog)
+                was_at_bottom = output.is_at_bottom()
+            except Exception:
+                output = None
+                was_at_bottom = False
+            self._live_layout_generation += 1
+            generation = self._live_layout_generation
+            live.set_class(visible, "visible")
+            if not was_at_bottom or output is None:
+                return
+
+            def _restore_bottom_anchor() -> None:
+                if generation != self._live_layout_generation:
+                    return
+                output.scroll_end(animate=False, immediate=True, force=True)
+
+            # display:none/block changes #output's height only after layout.
+            self.call_after_refresh(_restore_bottom_anchor)
+
+        def update_live(self, content: Any) -> None:
+            try:
+                live = self.query_one("#live", Static)
+                live.update(content)
+                self._change_live_visibility(live, True)
             except Exception:
                 pass
 
         def clear_live(self) -> None:
-            self.update_live("")
+            try:
+                live = self.query_one("#live", Static)
+                live.update("")
+                self._change_live_visibility(live, False)
+            except Exception:
+                pass
 
         # ── output helpers ─────────────────────────────────────────────────
 
@@ -1880,8 +1917,7 @@ class TextualTUI(TUIBase):
         self._stream_buf: str = ""
         self._stream_ts: str = ""
         self._stream_header_line: int = 0  # output-log line index where stream header was written
-        self._initial_thinking_placeholder_line: int | None = None
-        self._tool_placeholder_line: int = 0  # output-log line index of the current thinking/executing placeholder
+        self._tool_placeholder_line: int = 0  # output-log boundary of the current live stream chunk
         self._flushed_parts: list[str] = []  # intermediate LLM text flushed between tool calls
         # A flushed segment becomes temporary only after actual tool progress
         # confirms that it accompanied a tool call. Length continuations and
@@ -1901,18 +1937,12 @@ class TextualTUI(TUIBase):
         # continuation "─ts─" separator in _write_response would dangle with
         # nothing to separate. pop_stream sets this so _write_response skips it.
         self._suppress_segment_sep: bool = False
-        self._idle_thinking_task: Any = None  # asyncio.Task scheduling the "still thinking" spinner
-        self._idle_placeholder_visible: bool = False  # whether the idle thinking line is in #output
-        self._initial_thinking_placeholder_visible: bool = False  # stream_start placeholder before visible output
-        # When idle thinking is shown, _tool_placeholder_line is moved to its
-        # line so the spinner updates that line. This backup preserves the
-        # original (stream_delta / tool) anchor so cancel_idle can restore it
-        # — without restoration, pop_stream would truncate the wrong line and
-        # add_response would duplicate the streamed content.
-        self._tool_placeholder_line_backup: int | None = None
+        self._idle_thinking_task: Any = None  # delayed post-tool thinking task
+        self._live_activity_visible: bool = False  # whether #live owns the current transient phase
         self._turn_start_time: float = 0.0  # monotonic timestamp when the current LLM turn started (stream_start)
         self._tool_start_time: float = 0.0  # monotonic timestamp when the current tool started (add_progress)
         self._stream_render_task: Any = None  # debounce task for live stream rendering
+        self._stream_render_follow: bool = False  # preserve bottom-follow across #live collapse
         # State for show_question_popup (sequential multi-question prompt)
         self._question_queue: list[dict] = []
         self._question_answers: dict[str, str] = {}
@@ -2115,10 +2145,6 @@ class TextualTUI(TUIBase):
 
         self._stream_header_line = remap(self._stream_header_line) or 0
         self._tool_placeholder_line = remap(self._tool_placeholder_line) or 0
-        self._initial_thinking_placeholder_line = remap(
-            self._initial_thinking_placeholder_line
-        )
-        self._tool_placeholder_line_backup = remap(self._tool_placeholder_line_backup)
 
     def _log_write(self, *items: Any) -> None:
         """Write Rich renderables or markup strings directly to the output log."""
@@ -2594,16 +2620,10 @@ class TextualTUI(TUIBase):
             pass
 
     def _update_progress_line(self, text: str) -> None:
-        """Overwrite the executing placeholder line with the tool name (runs in Textual context)."""
-        self._render_placeholder_line(f"⠋ {text}", "dim")
-
-    def _render_placeholder_line(self, content: str, style: str) -> None:
-        """Render `content` into the placeholder record at _tool_placeholder_line."""
-        try:
-            out = self._app.query_one("#output", _OutputLog)
-            out.replace_line(self._tool_placeholder_line, Text(content, style=style))
-        except Exception:
-            pass
+        """Show the current tool in the transient single-line status area."""
+        if not self._live_activity_visible:
+            return
+        self._app.update_live(Text(f"    ⠋ {text}", style="cyan"))
 
     # Visual style for petrified tool traces. 4-space indent separates them
     # clearly from LLM text; cyan for the call, dim/red for the result tail.
@@ -2631,27 +2651,17 @@ class TextualTUI(TUIBase):
             line.append(summary, style=tail_style)
         if elapsed is not None and elapsed >= 1:
             line.append(f"  [+{int(elapsed)}s]", style=self.THEME_MUTED)
-        self._render_placeholder_text(line)
-
-    def _render_placeholder_text(self, rt: Text) -> None:
-        """Like _render_placeholder_line but accepts a pre-built Text object."""
         try:
             out = self._app.query_one("#output", _OutputLog)
-            out.replace_line(self._tool_placeholder_line, rt)
+            # Completed tool traces are permanent history. Append rather than
+            # truncating by a physical line anchor, which may move after wrapping.
+            out.write(line)
+            self._tool_placeholder_line = len(out.lines)
         except Exception:
             pass
 
     def _petrify_tool_placeholder(self) -> None:
-        """Convert the current "⠋ tool_name" spinner line into a static
-        "↳ tool_name" trace (with elapsed badge), and advance the placeholder
-        cursor so subsequent streaming / tool_phase_start operations append
-        below it rather than overwriting the trace.
-
-        Called at every transition out of the tool-executing state: the start
-        of the next LLM streaming chunk (stream_delta) and the start of the
-        next tool phase (tool_phase_start). Idempotent — does nothing if no
-        tool hint is currently shown.
-        """
+        """Commit the active tool as a permanent output trace, if still pending."""
         if not self._tool_hint:
             return
         import time
@@ -2659,11 +2669,7 @@ class TextualTUI(TUIBase):
             time.monotonic() - self._tool_start_time
             if self._tool_start_time else None
         )
-        try:
-            self._render_tool_trace(self._tool_hint, "", elapsed)
-            self._tool_placeholder_line += 1
-        except Exception:
-            pass
+        self._render_tool_trace(self._tool_hint, "", elapsed)
         self._tool_hint = ""
 
     def add_tool_result(self, summary: str) -> None:
@@ -2681,23 +2687,14 @@ class TextualTUI(TUIBase):
         """
         if not self._tool_hint:
             return
-        # The tool spinner was animating on the placeholder; stop it before
-        # we rewrite that line as a static trace.
-        try:
-            self._app.stop_thinking_spinner()
-        except Exception:
-            pass
+        self._hide_live_activity()
         import time
         elapsed = (
             time.monotonic() - self._tool_start_time
             if self._tool_start_time else None
         )
-        try:
-            # summary may be "" — _render_tool_trace just skips the tail.
-            self._render_tool_trace(self._tool_hint, summary, elapsed)
-            self._tool_placeholder_line += 1
-        except Exception:
-            pass
+        # summary may be "" — _render_tool_trace just skips the tail.
+        self._render_tool_trace(self._tool_hint, summary, elapsed)
         self._tool_hint = ""
         # If the LLM stays silent for >500ms after the tool finishes, show
         # a "thinking..." spinner in #live so the user knows we're waiting.
@@ -2859,135 +2856,66 @@ class TextualTUI(TUIBase):
         # turn began — not to each individual spinner restart. This keeps the
         # elapsed counter continuous across idle gaps + tool calls.
         self._turn_start_time = time.monotonic()
-        # Write header + thinking placeholder directly into #output so the
-        # animation is inside the message area, not in the separate #live strip.
+        # The response header is permanent history; activity remains in #live.
         try:
             out = self._app.query_one("#output", _OutputLog)
             self._stream_header_line = len(out.lines)
             out.write(f"[cyan]{__logo__} nanobot[/cyan] [dim]{self._stream_ts}[/dim]")
             out.write("")
             self._tool_placeholder_line = len(out.lines)
-            self._initial_thinking_placeholder_line = self._tool_placeholder_line
-            # Match the idle thinking style — _tick will overwrite this with
-            # the same format on each frame anyway.
-            out.write(Text("  ⠋ 思考中...", style="grey50"))
-            self._initial_thinking_placeholder_visible = True
             out.scroll_end(animate=False)
         except Exception:
             self._stream_header_line = 0
-            self._initial_thinking_placeholder_line = None
             self._tool_placeholder_line = 0
-        # Use _safe_call so the spinner timer task is created inside
-        # Textual's active_app context even if stream_start is invoked
-        # from a non-Textual code path.
-        self._app._safe_call(self._app.start_thinking_spinner)
+        self._show_live_activity()
 
     def tool_phase_start(self) -> None:
-        self._clear_initial_thinking_placeholder()
         self._activity_phase = "tool_phase"
         self._cancel_idle_thinking()
-        # Petrify the previous tool's spinner line into a static "→ tool" trace
-        # before starting a new one, so chained tool calls stay visible.
         self._petrify_tool_placeholder()
-
         self._stream_buf = ""
         if not self._stream_ts:
             self._stream_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._tool_hint = "执行中..."
-        # Append placeholder at the current end of output — do NOT truncate so
-        # any content flush_stream already rendered between tool calls is preserved.
-        # Fork: intermediate-content folding removed — mid-turn text now stays
-        # fully expanded (the collapse/expand machinery in _OutputLog was deleted).
-        try:
-            out = self._app.query_one("#output", _OutputLog)
-            self._tool_placeholder_line = len(out.lines)
-            # 4-space indent + cyan matches the eventual "↳ tool" trace.
-            # _tick will overwrite with the tool hint once add_progress runs.
-            out.write(Text("    ⠋ 执行中...", style="cyan"))
-        except Exception:
-            pass
-        # Schedule via _safe_call so the timer task is created inside
-        # Textual's context (active_app ContextVar must be set, otherwise
-        # set_interval's task silently crashes on shutdown).
+        self._show_live_activity()
+
+    def _show_live_activity(self) -> None:
+        """Show exactly one transient activity line below the output history."""
+        self._live_activity_visible = True
+        if self._tool_hint:
+            content = Text(f"    ⠋ {self._tool_hint}", style="cyan")
+        else:
+            content = Text("  ⠋ 思考中...", style="grey50")
+        self._app.update_live(content)
         self._app._safe_call(self._app.start_thinking_spinner)
 
-    def _clear_initial_thinking_placeholder(self) -> None:
-        """Remove the stream-start thinking line once visible activity replaces it."""
-        if not self._initial_thinking_placeholder_visible:
-            return
-        self._initial_thinking_placeholder_visible = False
-        initial_line = self._initial_thinking_placeholder_line
-        self._initial_thinking_placeholder_line = None
-        try:
-            # A later idle/tool spinner may be actively animating at another
-            # line. Stop the timer only while it still owns the initial line.
-            if initial_line == self._tool_placeholder_line:
-                self._app.stop_thinking_spinner()
-            out = self._app.query_one("#output", _OutputLog)
-            if initial_line is not None and out.remove_line(initial_line):
-                if self._tool_placeholder_line > initial_line:
-                    self._tool_placeholder_line -= 1
-                if (
-                    self._tool_placeholder_line_backup is not None
-                    and self._tool_placeholder_line_backup > initial_line
-                ):
-                    self._tool_placeholder_line_backup -= 1
-        except Exception:
-            pass
-
-    def _cancel_idle_thinking(self) -> None:
-        """Stop any pending idle-thinking spinner task and remove the
-        placeholder line it wrote to #output (if any)."""
-        task = self._idle_thinking_task
-        if task is not None and not task.done():
-            task.cancel()
-        self._idle_thinking_task = None
-        # Stop the timer-driven spinner update.
+    def _hide_live_activity(self) -> None:
+        """Stop and collapse the transient activity line without touching history."""
+        self._live_activity_visible = False
         try:
             self._app.stop_thinking_spinner()
         except Exception:
             pass
-        # Remove the idle thinking placeholder line so it doesn't linger
-        # before the next stream content / tool call writes at the same idx.
-        if self._idle_placeholder_visible:
-            self._idle_placeholder_visible = False
-            try:
-                out = self._app.query_one("#output", _OutputLog)
-                if 0 <= self._tool_placeholder_line <= len(out.lines):
-                    out.truncate_to(self._tool_placeholder_line)
-            except Exception:
-                pass
-            # Restore the original anchor so subsequent stream_delta /
-            # pop_stream operate on the right line (otherwise pop_stream
-            # would truncate the wrong line and add_response would write
-            # the stream content a second time → duplicated message).
-            if self._tool_placeholder_line_backup is not None:
-                self._tool_placeholder_line = self._tool_placeholder_line_backup
-                self._tool_placeholder_line_backup = None
+        self._app.clear_live()
+
+    def _clear_initial_thinking_placeholder(self) -> None:
+        """Compatibility hook: visible progress replaces the transient status."""
+        self._hide_live_activity()
+
+    def _cancel_idle_thinking(self) -> None:
+        task = self._idle_thinking_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._idle_thinking_task = None
+        self._hide_live_activity()
 
     def clear_initial_thinking(self) -> None:
-        """Remove only the stream-start thinking placeholder.
-
-        Todo plans are visible progress, so they replace the initial waiting
-        state. Do not cancel a later idle-thinking spinner: it represents the
-        model's active post-tool deliberation and should remain visible.
-        """
-        self._clear_initial_thinking_placeholder()
+        self._cancel_idle_thinking()
 
     def clear_idle_thinking(self) -> None:
-        """Remove the stale idle-thinking placeholder before visible progress.
-
-        System/todo progress messages are already user-visible activity. Keeping
-        the previous "思考中" line below them makes the UI look stuck, and the
-        elapsed counter can restart on a second placeholder.
-        """
         self._cancel_idle_thinking()
+
     def stop_thinking(self) -> None:
-        """TUIBase hook: stop the idle/thinking spinner on turn completion so it
-        never outlives the turn. The non-streaming reply path has no pop_stream
-        to stop it, so the idle spinner scheduled after the last tool call would
-        otherwise spin (and keep counting) forever.
-        """
         self._cancel_idle_thinking()
         try:
             self._app.stop_spinner()
@@ -2995,13 +2923,7 @@ class TextualTUI(TUIBase):
             pass
 
     def _schedule_idle_thinking(self, delay: float = 0.5) -> None:
-        """Schedule a "still thinking..." spinner in #live after ``delay`` seconds
-        of no further stream_delta. Provides UX feedback during LLM reasoning
-        gaps where no tokens are being emitted (e.g. reasoning_content phase).
-
-        Cancelled by the next stream_delta, tool_phase_start, flush_stream, or
-        pop_stream — whichever comes first.
-        """
+        """Show post-tool/provider waiting state after a quiet delay."""
         self._cancel_idle_thinking()
 
         async def _wait_then_show() -> None:
@@ -3009,28 +2931,8 @@ class TextualTUI(TUIBase):
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 return
-            # Show the idle thinking spinner inline at the end of #output
-            # so it stays visually attached to the most recent message
-            # (instead of jumping down to #live above the input).
-            try:
-                out = self._app.query_one("#output", _OutputLog)
-                # Back up the existing anchor so pop_stream / stream_delta can
-                # later truncate the right line (the stream content), not the
-                # idle thinking line we're about to add.
-                if self._tool_placeholder_line_backup is None:
-                    self._tool_placeholder_line_backup = self._tool_placeholder_line
-                self._tool_placeholder_line = len(out.lines)
-                # 2-space indent + grey50 distinguishes idle thinking from
-                # the 4-space cyan tool traces above it (so users don't
-                # mistake "still thinking" for a new tool call).
-                out.write(Text("  ⠋ 思考中...", style="grey50"))
-                self._idle_placeholder_visible = True
-            except Exception:
-                return
-            # _safe_call ensures start_thinking_spinner's set_interval task
-            # runs inside Textual's active_app context (otherwise the timer
-            # crashes on shutdown with LookupError).
-            self._app._safe_call(self._app.start_thinking_spinner)
+            self._idle_thinking_task = None
+            self._show_live_activity()
 
         try:
             self._idle_thinking_task = asyncio.ensure_future(_wait_then_show())
@@ -3042,16 +2944,19 @@ class TextualTUI(TUIBase):
         if task is not None and not task.done():
             task.cancel()
         self._stream_render_task = None
+        self._stream_render_follow = False
 
     def _render_stream_live(self) -> None:
         try:
             out = self._app.query_one("#output", _OutputLog)
-            if out.user_is_scrolling() and not out.is_at_bottom():
+            follow = self._stream_render_follow
+            self._stream_render_follow = False
+            if not follow and out.user_is_scrolling() and not out.is_at_bottom():
                 return
-            if not out.is_at_bottom():
+            if not follow and not out.is_at_bottom():
                 return
             out.truncate_to(self._tool_placeholder_line)
-            out.write(Text(self._stream_buf))
+            out.write(Text(self._stream_buf), scroll_end=follow)
         except Exception:
             pass
 
@@ -3074,6 +2979,12 @@ class TextualTUI(TUIBase):
             self._stream_render_task = None
 
     def stream_delta(self, delta: str) -> None:
+        # Capture bottom-follow before hiding #live changes the output viewport.
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            self._stream_render_follow = self._stream_render_follow or out.is_at_bottom()
+        except Exception:
+            pass
         # No tool progress before the next segment means the previous flush was
         # a continuation/retry and must not be removed with tool-preface text.
         self._pending_tool_text_records = []
@@ -3083,9 +2994,8 @@ class TextualTUI(TUIBase):
         self._app.stop_thinking_spinner()
         self._app.stop_spinner()
         self._app.clear_live()
-        # First delta after a tool call: petrify the tool placeholder so the
-        # previous "⠋ tool_name" line becomes a static "→ tool_name" trace
-        # before this new text starts overwriting at _tool_placeholder_line.
+        # If a result event was omitted, commit the active tool before streamed
+        # response text starts replacing the current live stream chunk.
         if self._tool_hint:
             self._petrify_tool_placeholder()
         self._stream_buf += delta
@@ -3108,7 +3018,7 @@ class TextualTUI(TUIBase):
             out = self._app.query_one("#output", _OutputLog)
             if self._stream_buf.strip():
                 render_as_text = (metadata or {}).get("render_as") == "text"
-                # Replace streaming content (including any placeholder) with final rendered version
+                # Replace the current live-stream text with its final rendered version.
                 out.truncate_to(self._tool_placeholder_line)
                 record_marker = out.record_marker()
                 # For mid-turn segments (not the first one), prefix a lightweight

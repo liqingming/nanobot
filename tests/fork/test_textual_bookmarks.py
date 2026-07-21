@@ -4,6 +4,9 @@ from __future__ import annotations
 import json
 
 import pytest
+from rich.cells import cell_len
+from rich.segment import Segment
+from textual.strip import Strip
 
 from nanobot.fork.cli.tui_textual import (
     _TEXTUAL_AVAILABLE,
@@ -354,6 +357,21 @@ async def test_bookmark_delete_popup_removes_selected_bookmark(tmp_path) -> None
         await tui._popup_on_select(bookmark["bookmark_id"])
 
         assert bookmark["bookmark_id"] not in tui._bookmarks
+
+
+def test_unmarked_line_preserves_cjk_character_crossing_gutter_boundary() -> None:
+    source = " 平时在 Editor 中"
+    strip = Strip([Segment(source)], cell_len(source))
+
+    rendered = _OutputLog._add_bookmark_gutter(
+        strip,
+        strip.cell_length,
+        marked=False,
+        overlay=False,
+    )
+
+    assert rendered is strip
+    assert rendered.text == source
 
 
 @pytest.mark.asyncio

@@ -128,7 +128,10 @@ async def test_error_response_replaces_tool_preface_and_keeps_trace() -> None:
 
     async with tui._app.run_test():
         output = tui._app.query_one("#output", _OutputLog)
+        live = tui._app.query_one("#live")
         tui.stream_start()
+        assert live.has_class("visible")
+        assert "思考中" not in _output_text(output)
         tui.stream_delta("先尝试读取。")
         await _settle_stream_render()
         tui.flush_stream()
@@ -146,6 +149,8 @@ async def test_error_response_replaces_tool_preface_and_keeps_trace() -> None:
         assert "先尝试读取。" not in completed
         assert "read_file" in completed
         assert completed.count("读取失败。") == 1
+        assert not live.has_class("visible")
+        assert "思考中" not in completed
 
 
 @pytest.mark.asyncio
@@ -161,9 +166,150 @@ async def test_cancel_flush_keeps_visible_text_and_next_turn_resets_state() -> N
         tui.add_system("已取消当前请求。")
 
         cancelled = _output_text(output)
+        assert not tui._app.query_one("#live").has_class("visible")
+        assert "思考中" not in cancelled
         assert cancelled.count("取消前已经输出。") == 1
         assert "已取消当前请求。" in cancelled
 
         tui.stream_start()
         assert tui._pending_tool_text_records == []
         assert tui._temporary_tool_text_records == []
+
+
+@pytest.mark.asyncio
+async def test_transient_activity_stays_out_of_output_for_wrapped_tool_traces() -> None:
+    tui = TextualTUI(render_markdown=False)
+
+    async with tui._app.run_test() as pilot:
+        output = tui._app.query_one("#output", _OutputLog)
+        live = tui._app.query_one("#live")
+        tui.stream_start()
+        await pilot.pause()
+
+        assert live.has_class("visible")
+        assert "思考中" in str(live.render())
+        assert "思考中" not in _output_text(output)
+
+        long_hint = "read " + "very-long-path/" * 20
+        tui.flush_stream()
+        tui.tool_phase_start()
+        tui.add_progress(long_hint)
+        await pilot.pause(0.1)
+
+        assert live.has_class("visible")
+        assert "very-long-path" in str(live.render())
+        assert "执行中" not in _output_text(output)
+        assert "very-long-path" not in _output_text(output)
+
+        tui.add_tool_result("ok")
+        await asyncio.sleep(0.6)
+        await pilot.pause()
+
+        completed_tool = _output_text(output)
+        assert completed_tool.count("very-long-path") >= 1
+        assert "思考中" not in completed_tool
+        assert live.has_class("visible")
+        assert "思考中" in str(live.render())
+
+        tui.pop_stream()
+        await pilot.pause()
+
+        assert not live.has_class("visible")
+        assert "思考中" not in _output_text(output)
+
+
+@pytest.mark.asyncio
+async def test_consecutive_wrapped_tool_traces_all_survive_live_status_cycles() -> None:
+    tui = TextualTUI(render_markdown=False)
+
+    async with tui._app.run_test() as pilot:
+        output = tui._app.query_one("#output", _OutputLog)
+        live = tui._app.query_one("#live")
+        tui.stream_start()
+        await pilot.pause()
+
+        for index in range(4):
+            tui.flush_stream()
+            tui.tool_phase_start()
+            tui.add_progress(f"read-{index} " + "very-long-path/" * 20)
+            await pilot.pause(0.1)
+            tui.add_tool_result(f"summary-{index}")
+            await asyncio.sleep(0.6)
+            await pilot.pause()
+
+            history = _output_text(output)
+            assert all(f"summary-{seen}" in history for seen in range(index + 1))
+            assert "思考中" not in history
+            assert "执行中" not in history
+            assert live.has_class("visible")
+
+        tui.pop_stream()
+        await pilot.pause()
+
+        history = _output_text(output)
+        assert all(f"summary-{index}" in history for index in range(4))
+        assert not live.has_class("visible")
+
+
+@pytest.mark.asyncio
+async def test_idle_live_status_preserves_bottom_follow_for_next_stream_delta() -> None:
+    tui = TextualTUI(render_markdown=False)
+
+    async with tui._app.run_test(size=(80, 24)) as pilot:
+        output = tui._app.query_one("#output", _OutputLog)
+        for index in range(80):
+            output.write(f"history-{index}")
+        output.scroll_end(animate=False, immediate=True, force=True)
+        await pilot.pause()
+
+        tui.stream_start()
+        tui.stream_delta("first " * 500)
+        await _settle_stream_render()
+        assert output.is_at_bottom()
+
+        # Reproduce the quiet-period transition that expands #live by one row.
+        tui._schedule_idle_thinking(delay=0.01)
+        await asyncio.sleep(0.05)
+        await pilot.pause()
+
+        assert tui._app.query_one("#live").has_class("visible")
+        assert output.is_at_bottom()
+
+        tui.stream_delta("LATEST-STREAM-OUTPUT " * 100)
+        await _settle_stream_render()
+
+        assert "LATEST-STREAM-OUTPUT" in _output_text(output)
+        assert output.is_at_bottom()
+
+
+@pytest.mark.asyncio
+async def test_idle_live_status_does_not_pull_history_reader_to_bottom() -> None:
+    tui = TextualTUI(render_markdown=False)
+
+    async with tui._app.run_test(size=(80, 24)) as pilot:
+        output = tui._app.query_one("#output", _OutputLog)
+        for index in range(80):
+            output.write(f"history-{index}")
+        output.scroll_end(animate=False, immediate=True, force=True)
+        await pilot.pause()
+
+        tui.stream_start()
+        tui.stream_delta("first " * 500)
+        await _settle_stream_render()
+        output.scroll_to(
+            y=max(0, int(output.max_scroll_y) - 5),
+            animate=False,
+            immediate=True,
+            force=True,
+        )
+        await pilot.pause()
+        reading_position = int(output.scroll_offset.y)
+        assert not output.is_at_bottom()
+
+        tui._schedule_idle_thinking(delay=0.01)
+        await asyncio.sleep(0.05)
+        await pilot.pause()
+
+        assert tui._app.query_one("#live").has_class("visible")
+        assert int(output.scroll_offset.y) == reading_position
+        assert not output.is_at_bottom()
