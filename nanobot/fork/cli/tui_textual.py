@@ -138,7 +138,7 @@ if _TEXTUAL_AVAILABLE:
 
     from rich.style import Style as _Style
     from textual.events import MouseDown, MouseMove, MouseScrollDown, MouseScrollUp, MouseUp
-    from textual.geometry import Size
+    from textual.geometry import Region, Size
     from textual.strip import Strip
 
     class _OutputLog(RichLog):
@@ -618,13 +618,60 @@ if _TEXTUAL_AVAILABLE:
                         bgcolor="white",
                         color="black",
                     )
-            strip = self._add_bookmark_gutter(
-                strip,
-                width,
-                marked=self._line_has_bookmark_marker(content_row),
-                overlay=self._bookmark_highlight is not None or points is not None,
-            )
             return strip
+
+        _BOOKMARK_MARKER = "◆"
+
+        @classmethod
+        def _draw_bookmark_marker(cls, strip: Strip, column: int) -> Strip:
+            """Draw a marker over one padding cell without touching content."""
+            from rich.segment import Segment
+
+            if not 0 <= column < strip.cell_length:
+                return strip
+            cell = strip.crop(column, column + 1)
+            background = (
+                cell._segments[0].style.bgcolor
+                if cell._segments and cell._segments[0].style
+                else None
+            )
+            marker = Segment(
+                cls._BOOKMARK_MARKER,
+                _Style(color="#ffd75f", bgcolor=background, bold=True),
+            )
+            return Strip(
+                [
+                    *strip.crop(0, column)._segments,
+                    marker,
+                    *strip.crop(column + 1, strip.cell_length)._segments,
+                ],
+                strip.cell_length,
+            )
+
+        def render_lines(self, crop: Region) -> list[Strip]:
+            """Render bookmark markers in the dedicated left padding column."""
+            strips = super().render_lines(crop)
+            marker_x = self.styles.gutter.left - self.styles.padding.left
+            if not crop.x <= marker_x < crop.right:
+                return strips
+            marker_column = marker_x - crop.x
+            scroll_y = int(self.scroll_offset.y)
+            content_top = self.styles.gutter.top
+            for index, strip in enumerate(strips):
+                content_y = crop.y + index - content_top
+                if content_y < 0:
+                    continue
+                if self._line_has_bookmark_marker(scroll_y + content_y):
+                    strips[index] = self._draw_bookmark_marker(strip, marker_column)
+            return strips
+
+        def _mouse_content_point(
+            self, event: MouseDown | MouseMove | MouseUp
+        ) -> tuple[int, int]:
+            """Map widget-relative mouse coordinates to RichLog content coordinates."""
+            offset = event.get_content_offset_capture(self)
+            scroll_x, scroll_y = self.scroll_offset
+            return int(scroll_y + offset.y), int(scroll_x + offset.x)
 
         # ── mouse events ───────────────────────────────────────────────────
 
@@ -635,9 +682,9 @@ if _TEXTUAL_AVAILABLE:
                 n = len(self.lines)
                 if n == 0:
                     return
-                scroll_x, scroll_y = self.scroll_offset
-                row = max(0, min(scroll_y + event.y, n - 1))
-                col = max(0, scroll_x + event.x)
+                content_row, content_col = self._mouse_content_point(event)
+                row = max(0, min(content_row, n - 1))
+                col = max(0, content_col)
                 self._sel_start = (row, col)
                 self._sel_end = (row, col)
                 self._selecting = True
@@ -651,9 +698,9 @@ if _TEXTUAL_AVAILABLE:
             if not self._selecting:
                 return
             try:
-                scroll_x, scroll_y = self.scroll_offset
-                row = max(0, min(scroll_y + event.y, len(self.lines) - 1))
-                col = max(0, scroll_x + event.x)
+                content_row, content_col = self._mouse_content_point(event)
+                row = max(0, min(content_row, len(self.lines) - 1))
+                col = max(0, content_col)
                 point = (row, col)
                 if point != self._sel_end:
                     self._sel_moved = True
@@ -667,9 +714,9 @@ if _TEXTUAL_AVAILABLE:
             if not self._selecting:
                 return
             try:
-                scroll_x, scroll_y = self.scroll_offset
-                row = max(0, min(scroll_y + event.y, len(self.lines) - 1))
-                col = max(0, scroll_x + event.x)
+                content_row, content_col = self._mouse_content_point(event)
+                row = max(0, min(content_row, len(self.lines) - 1))
+                col = max(0, content_col)
                 if (row, col) != self._sel_end:
                     self._sel_moved = True
                 self._sel_end = (row, col)
@@ -831,40 +878,6 @@ if _TEXTUAL_AVAILABLE:
 
         def _line_has_bookmark_marker(self, line: int) -> bool:
             return line in self._bookmark_lines
-
-        _BOOKMARK_GUTTER_WIDTH = 2
-
-        @classmethod
-        def _add_bookmark_gutter(
-            cls,
-            strip: Strip,
-            width: int,
-            *,
-            marked: bool,
-            overlay: bool,
-        ) -> Strip:
-            """仅在书签行覆盖左侧固定栏；普通行保持原始宽字符边界。"""
-            from rich.segment import Segment
-
-            # Splitting every line at cell 2 corrupts text shaped like
-            # "<space><CJK>": the boundary lands halfway through the wide
-            # character, so Rich replaces both cropped halves with spaces.
-            if not marked:
-                return strip
-            gutter_width = min(cls._BOOKMARK_GUTTER_WIDTH, width)
-            if gutter_width <= 0:
-                return strip
-            if marked and gutter_width >= cls._BOOKMARK_GUTTER_WIDTH:
-                gutter_style = _Style(color="#ffd75f", bold=True)
-                if overlay:
-                    first = strip.crop(0, 1)
-                    first_style = first._segments[0].style if first._segments else None
-                    gutter_style = gutter_style + (first_style or _Style())
-                gutter = Strip([Segment("🔖", gutter_style)])
-            else:
-                gutter = strip.crop(0, gutter_width)
-            content = strip.crop(gutter_width, width)
-            return Strip.join((gutter, content))
 
         def message_line_range(self, message_id: str) -> tuple[int, int] | None:
             for block in self._message_blocks:
@@ -1231,6 +1244,7 @@ if _TEXTUAL_AVAILABLE:
             scrollbar-color-active: grey;
             scrollbar-background: #0c0c0c;
             border: none;
+            padding: 0 0 0 1;
             background: #0c0c0c;
         }
         #sep-row {

@@ -277,6 +277,8 @@ async def test_idle_live_status_preserves_bottom_follow_for_next_stream_delta() 
 
         tui.stream_delta("LATEST-STREAM-OUTPUT " * 100)
         await _settle_stream_render()
+        # The debounce task posts rendering back to Textual's message loop.
+        await pilot.pause()
 
         assert "LATEST-STREAM-OUTPUT" in _output_text(output)
         assert output.is_at_bottom()
@@ -296,6 +298,8 @@ async def test_idle_live_status_does_not_pull_history_reader_to_bottom() -> None
         tui.stream_start()
         tui.stream_delta("first " * 500)
         await _settle_stream_render()
+        # Finish the preceding #live collapse refresh before simulating a user scroll.
+        await pilot.pause()
         output.scroll_to(
             y=max(0, int(output.max_scroll_y) - 5),
             animate=False,

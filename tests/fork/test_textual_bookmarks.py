@@ -4,9 +4,8 @@ from __future__ import annotations
 import json
 
 import pytest
-from rich.cells import cell_len
-from rich.segment import Segment
-from textual.strip import Strip
+from textual.events import MouseDown
+from textual.geometry import Region
 
 from nanobot.fork.cli.tui_textual import (
     _TEXTUAL_AVAILABLE,
@@ -359,19 +358,73 @@ async def test_bookmark_delete_popup_removes_selected_bookmark(tmp_path) -> None
         assert bookmark["bookmark_id"] not in tui._bookmarks
 
 
-def test_unmarked_line_preserves_cjk_character_crossing_gutter_boundary() -> None:
-    source = " 平时在 Editor 中"
-    strip = Strip([Segment(source)], cell_len(source))
+@pytest.mark.asyncio
+async def test_bookmark_marker_uses_padding_without_changing_cjk_content(tmp_path) -> None:
+    message = {
+        "role": "assistant",
+        "content": " 平时在 Editor 中不持续生成图集纹理。",
+        "timestamp": "2026-07-21T09:00:00",
+    }
+    tui = _make_tui(tmp_path)
+    async with tui._app.run_test(size=(48, 18)) as pilot:
+        tui.load_session_history([message])
+        output = tui._app.query_one("#output", _OutputLog)
+        block = output.message_blocks()[0]
+        target_line = output.message_start_line(block["id"])
+        assert target_line is not None
+        source_text = output.lines[target_line].text
+        anchor = output.bookmark_anchor_at_line(target_line)
+        assert anchor is not None
+        bookmark_id = tui._bookmark_id(
+            anchor["message_id"], anchor["record_index"], anchor["char_offset"]
+        )
+        bookmark = {
+            "bookmark_id": bookmark_id,
+            **anchor,
+            "created_at": "2026-07-21T09:00:01",
+        }
+        tui._bookmarks[bookmark_id] = bookmark
+        tui._refresh_bookmark_markers()
+        assert output.bookmark_line(bookmark) == target_line
+        await pilot.pause()
 
-    rendered = _OutputLog._add_bookmark_gutter(
-        strip,
-        strip.cell_length,
-        marked=False,
-        overlay=False,
-    )
+        screen_line = target_line - int(output.scroll_offset.y)
+        full_width = output.size.width
+        rendered = output.render_lines(Region(0, screen_line, full_width, 1))[0]
 
-    assert rendered is strip
-    assert rendered.text == source
+        assert rendered.text.startswith("◆")
+        assert rendered.text[1:].startswith(source_text)
+        assert output.lines[target_line].text == source_text
+        output._sel_start = (target_line, 0)
+        output._sel_end = (target_line, output.lines[target_line].cell_length - 1)
+        assert output._extract_selected_text() == source_text
+
+        # Horizontal partial redraws outside the padding must contain only content.
+        content_crop = output.render_lines(
+            Region(1, screen_line, full_width - 1, 1)
+        )[0]
+        assert not content_crop.text.startswith("◆")
+        assert content_crop.text.startswith(source_text)
+
+        # Mouse x=1 is the first content cell after the one-cell padding.
+        mouse_down = MouseDown(output, 1, screen_line, 0, 0, 1, False, False, False)
+        output.on_mouse_down(mouse_down)
+        assert output._sel_start == (target_line, 0)
+        output.release_mouse()
+        output._selecting = False
+        output._clear_selection()
+
+        output._reflow(24)
+        reflowed_line = output.bookmark_line(bookmark)
+        assert reflowed_line is not None
+        output.scroll_to(y=reflowed_line, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        reflowed_screen_line = reflowed_line - int(output.scroll_offset.y)
+        reflowed = output.render_lines(
+            Region(0, reflowed_screen_line, output.size.width, 1)
+        )[0]
+        assert reflowed.text.startswith("◆")
+        assert "◆" not in "".join(line.text for line in output.lines)
 
 
 @pytest.mark.asyncio
@@ -387,13 +440,17 @@ async def test_bookmark_icon_is_drawn_on_exact_reading_line(tmp_path) -> None:
         marker_line = output.bookmark_line(bookmark)
         assert marker_line == target_line
         screen_line = marker_line - int(output.scroll_offset.y)
-        rendered = output.render_line(screen_line).text
-        assert rendered.startswith("🔖")
+        rendered = output.render_lines(
+            Region(0, screen_line, output.size.width, 1)
+        )[0].text
+        assert rendered.startswith("◆")
 
         tui.toggle_bookmark_at_view()
         assert bookmark["bookmark_id"] not in tui._bookmarks
-        rendered_without_bookmark = output.render_line(screen_line).text
-        assert "🔖" not in rendered_without_bookmark
+        rendered_without_bookmark = output.render_lines(
+            Region(0, screen_line, output.size.width, 1)
+        )[0].text
+        assert not rendered_without_bookmark.startswith("◆")
 
 
 @pytest.mark.asyncio
@@ -432,4 +489,7 @@ async def test_live_bookmark_restores_from_persisted_transcript_id(tmp_path) -> 
         assert restored.jump_to_previous_bookmark()
         assert output._bookmark_highlight == (restored_line, restored_line)
         screen_line = restored_line - int(output.scroll_offset.y)
-        assert "🔖" in output.render_line(screen_line).text
+        rendered = output.render_lines(
+            Region(0, screen_line, output.size.width, 1)
+        )[0].text
+        assert rendered.startswith("◆")
