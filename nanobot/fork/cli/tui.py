@@ -1046,7 +1046,7 @@ class PromptTUI(TUIBase):
         self._live_progress = ""
         self._invalidate()
 
-    def add_user_echo(self, text: str) -> None:
+    def add_user_echo(self, text: str, *, message_id: str | None = None) -> None:
         """Echo the user's submitted message to the output pane."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._append_sep()
@@ -1055,7 +1055,14 @@ class PromptTUI(TUIBase):
         self._pin_to_bottom()
         self._invalidate()
 
-    def add_response(self, content: str, metadata: dict | None = None, ts: str | None = None) -> None:
+    def add_response(
+        self,
+        content: str,
+        metadata: dict | None = None,
+        ts: str | None = None,
+        *,
+        message_id: str | None = None,
+    ) -> None:
         """Add a completed nanobot response block."""
         self._append_block(self._render_response(content, metadata, ts))
         self._pin_to_bottom()

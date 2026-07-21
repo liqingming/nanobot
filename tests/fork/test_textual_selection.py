@@ -45,6 +45,26 @@ def test_output_log_preserves_selected_trailing_spaces() -> None:
     assert output._extract_selected_text() == "c  "
 
 
+def test_selected_bookmark_line_uses_drag_endpoint_direction() -> None:
+    output = _OutputLog()
+    output.lines = [_line("first"), _line("second"), _line("third")]
+    output._sel_start = (2, 3)
+    output._sel_end = (0, 1)
+    output._sel_moved = True
+
+    assert output.selected_bookmark_line() == 0
+
+
+def test_selected_bookmark_line_rejects_click_without_drag() -> None:
+    output = _OutputLog()
+    output.lines = [_line("first")]
+    output._sel_start = (0, 1)
+    output._sel_end = (0, 1)
+    output._sel_moved = False
+
+    assert output.selected_bookmark_line() is None
+
+
 def test_output_log_highlights_only_selected_columns() -> None:
     strip = Strip([Segment("abcdef", Style(color="red"))], 6)
 

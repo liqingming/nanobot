@@ -1920,6 +1920,9 @@ class AgentLoop:
             event = StreamedResponseEvent()
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
+        assistant_transcript_id = msg.metadata.get("_assistant_transcript_id")
+        if isinstance(assistant_transcript_id, str) and assistant_transcript_id:
+            meta["_transcript_id"] = assistant_transcript_id
         if stop_reason in {"error", "tool_error"}:
             meta["_error"] = True
             meta["render_as"] = "error"
@@ -2165,8 +2168,11 @@ class AgentLoop:
         )
         ctx.turn_latency_ms = max(0, int((time.time() - latency_started_at) * 1000))
         self._save_turn(
-            ctx.session, ctx.all_messages, ctx.save_skip,
+            ctx.session,
+            ctx.all_messages,
+            ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
+            transcript_ids=ctx.msg.metadata,
         )
         self._runtime_events().record_turn_latency(
             ctx.session_key,
@@ -2252,10 +2258,26 @@ class AgentLoop:
         skip: int,
         *,
         turn_latency_ms: int | None = None,
+        transcript_ids: dict[str, Any] | None = None,
     ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
 
+        transcript_ids = transcript_ids or {}
+        new_messages = messages[skip:]
+        stable_user_index = next(
+            (index for index, item in enumerate(new_messages) if item.get("role") == "user"),
+            None,
+        )
+        stable_assistant_index = next(
+            (
+                index
+                for index in range(len(new_messages) - 1, -1, -1)
+                if new_messages[index].get("role") == "assistant"
+                and new_messages[index].get("content")
+            ),
+            None,
+        )
         declared_tool_call_ids = {
             str(tc["id"])
             for m in session.messages
@@ -2264,7 +2286,7 @@ class AgentLoop:
             if isinstance(tc, dict) and tc.get("id")
         }
         last_assistant_idx: int | None = None
-        for m in messages[skip:]:
+        for message_index, m in enumerate(new_messages):
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
@@ -2290,6 +2312,13 @@ class AgentLoop:
                         ]
                     entry["content"] = filtered
             elif role == "user":
+                user_transcript_id = transcript_ids.get("_user_transcript_id")
+                if (
+                    message_index == stable_user_index
+                    and isinstance(user_transcript_id, str)
+                    and user_transcript_id
+                ):
+                    entry.setdefault("_transcript_id", user_transcript_id)
                 if isinstance(content, str) and ContextBuilder._RUNTIME_CONTEXT_TAG in content:
                     # Strip all metadata prefixes (TurnSummary + RuntimeContext).
                     # RuntimeContext tag is always present; split there, then skip its lines.
@@ -2304,6 +2333,14 @@ class AgentLoop:
                     if not filtered:
                         continue
                     entry["content"] = filtered
+            if role == "assistant":
+                assistant_transcript_id = transcript_ids.get("_assistant_transcript_id")
+                if (
+                    message_index == stable_assistant_index
+                    and isinstance(assistant_transcript_id, str)
+                    and assistant_transcript_id
+                ):
+                    entry.setdefault("_transcript_id", assistant_transcript_id)
             entry.setdefault("timestamp", datetime.now().isoformat())
             entry.setdefault("_transcript_id", uuid.uuid4().hex)
             session.messages.append(entry)

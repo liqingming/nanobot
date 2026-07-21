@@ -694,6 +694,7 @@ def _is_cli_local_command(text: str) -> bool:
         or command.startswith("/commit_memory ")
         or command == "/todos"
         or command.startswith("/todos ")
+        or command in {"/bookmarks", "/bookmarks-delete", "/bookmarks-clear"}
         or command == "/resume"
         or command.startswith("/resume ")
     )
@@ -1005,6 +1006,9 @@ def _tui_command_palette() -> list[tuple[str, str, str]]:
         ("/skin", "Switch the Windows Terminal background image.", "edit"),
         ("/clear", "Clear context and start an unnamed empty session.", "submit"),
         ("/resume", "Show saved CLI sessions and switch topics.", "submit"),
+        ("/bookmarks", "Show bookmarks for the current topic.", "submit"),
+        ("/bookmarks-delete", "Select and delete a bookmark.", "submit"),
+        ("/bookmarks-clear", "Clear all bookmarks in the current topic.", "submit"),
         ("/todos", "Show or clear the current topic todo list.", "submit"),
         ("/continue", "Continue the last interrupted task.", "submit"),
         ("/commit_memory", "Promote or preview pending memory consolidation.", "submit"),
@@ -2313,6 +2317,9 @@ def agent(
                 display_name = _cli_session_display_name(
                     {"key": s.key, "metadata": s.metadata}, cli_channel
                 )
+                set_runtime_log_path = getattr(tui, "set_session_runtime_log_path", None)
+                if callable(set_runtime_log_path):
+                    set_runtime_log_path(agent_loop.sessions.get_session_runtime_log_path(s.key))
                 tui.set_input_history_topic(s.key)
                 tui.set_topic("" if display_name == _CLI_UNNAMED_SESSION_LABEL else display_name or name)
                 tui.load_session_history(
@@ -2377,6 +2384,7 @@ def agent(
             is_processing = False
             pending_queue: list[str] = []
             _pre_submitted: list[bool] = [False]
+            _pending_transcript_ids: dict[str, str] = {}
             _turn_cancelled: list[bool] = [False]
             _todo_bar_waiting_for_new_plan: list[bool] = [False]
 
@@ -2415,7 +2423,9 @@ def agent(
 
             def _pre_submit(text: str) -> None:
                 if not is_processing and not _is_cli_local_command(text):
-                    tui.add_user_echo(text)
+                    _pending_transcript_ids["user"] = uuid.uuid4().hex
+                    _pending_transcript_ids["assistant"] = uuid.uuid4().hex
+                    tui.add_user_echo(text, message_id=_pending_transcript_ids["user"])
                     tui.stream_start()
                     _pre_submitted[0] = True
 
@@ -2446,7 +2456,9 @@ def agent(
                 if _pre_submitted[0]:
                     _pre_submitted[0] = False
                 else:
-                    tui.add_user_echo(text)
+                    _pending_transcript_ids["user"] = uuid.uuid4().hex
+                    _pending_transcript_ids["assistant"] = uuid.uuid4().hex
+                    tui.add_user_echo(text, message_id=_pending_transcript_ids["user"])
                     tui.stream_start()
                 # Exceed prompt_toolkit's max_render_postpone_time (0.01s) so the
                 # thinking animation is guaranteed to reach the screen before the
@@ -2458,7 +2470,11 @@ def agent(
                     sender_id="user",
                     chat_id=topic_state["chat_id"],
                     content=text,
-                    metadata={"_wants_stream": True},
+                    metadata={
+                        "_wants_stream": True,
+                        "_user_transcript_id": _pending_transcript_ids.get("user"),
+                        "_assistant_transcript_id": _pending_transcript_ids.get("assistant"),
+                    },
                 ))
 
             async def _turn_complete() -> None:
@@ -2699,6 +2715,30 @@ def agent(
                     )
                     return
 
+                if text == "/bookmarks":
+                    show_bookmarks = getattr(tui, "show_bookmark_popup", None)
+                    if callable(show_bookmarks):
+                        show_bookmarks()
+                    else:
+                        tui.add_system("当前 TUI 不支持书签列表。")
+                    return
+
+                if text == "/bookmarks-delete":
+                    show_delete = getattr(tui, "show_bookmark_delete_popup", None)
+                    if callable(show_delete):
+                        show_delete()
+                    else:
+                        tui.add_system("当前 TUI 不支持删除书签。")
+                    return
+
+                if text == "/bookmarks-clear":
+                    clear_bookmarks = getattr(tui, "clear_topic_bookmarks", None)
+                    if callable(clear_bookmarks):
+                        clear_bookmarks()
+                    else:
+                        tui.add_system("当前 TUI 不支持清理书签。")
+                    return
+
                 if text == "/todos" or text.startswith("/todos "):
                     from nanobot.fork.agent.tools.todo import format_todos
                     arg = text[len("/todos"):].strip()
@@ -2789,7 +2829,11 @@ def agent(
                                 final = streamed or msg.content or ""
                             content = "\n\n".join(p for p in [intermediate, final] if p.strip())
                             if content.strip():
-                                tui.add_response(content, dict(msg.metadata or {}))
+                                tui.add_response(
+                                    content,
+                                    dict(msg.metadata or {}),
+                                    message_id=(msg.metadata or {}).get("_transcript_id"),
+                                )
                             await _turn_complete()
                             continue
 
@@ -2880,14 +2924,22 @@ def agent(
                             except Exception:
                                 pass
                             content = msg.content or "nanobot task failed. See this topic's runtime.log for details."
-                            tui.add_response(content, dict(msg.metadata or {}))
+                            tui.add_response(
+                                content,
+                                dict(msg.metadata or {}),
+                                message_id=(msg.metadata or {}).get("_transcript_id"),
+                            )
                             if is_processing:
                                 await _turn_complete()
                             continue
 
                         # Non-streaming response (or unsolicited push from cron etc.)
                         if msg.content:
-                            tui.add_response(msg.content, dict(msg.metadata or {}))
+                            tui.add_response(
+                                msg.content,
+                                dict(msg.metadata or {}),
+                                message_id=(msg.metadata or {}).get("_transcript_id"),
+                            )
                         if is_processing:
                             await _turn_complete()
 

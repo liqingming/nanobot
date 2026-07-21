@@ -43,6 +43,8 @@ Safe to call directly (already inside Textual's event handlers):
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -64,6 +66,7 @@ from nanobot.fork.cli.tui_keys import (
     decide_enter_action,
     decide_popup_key,
 )
+from nanobot.utils.session_runtime_log import append_session_runtime_log
 
 # ---------------------------------------------------------------------------
 # Textual imports — lazy-guarded so the module can be imported even when
@@ -164,6 +167,13 @@ if _TEXTUAL_AVAILABLE:
             # width that happened to be active when they were written.
             self._logical_records: list[dict[str, Any]] = []
             self._record_spans: list[tuple[int, int]] = []
+            # Message blocks retain logical-record references, so bookmark
+            # targets remain valid when resize reflows physical output lines.
+            self._message_blocks: list[dict[str, Any]] = []
+            self._active_message_block: dict[str, Any] | None = None
+            self._bookmark_highlight: tuple[int, int] | None = None
+            self._bookmark_entries: list[dict[str, Any]] = []
+            self._bookmark_lines: set[int] = set()
             self._record_writes = True
             self._render_width = 0
             self._reflow_scheduled = False
@@ -231,7 +241,14 @@ if _TEXTUAL_AVAILABLE:
         def _clear_selection(self) -> None:
             self._sel_start = None
             self._sel_end = None
+            self._sel_moved = False
             self.refresh()
+
+        def selected_bookmark_line(self) -> int | None:
+            """返回拖选终点行；单击或空选区不作为书签目标。"""
+            if not self._sel_moved or self._sel_end is None:
+                return None
+            return self._sel_end[0] if self._extract_selected_text().strip() else None
 
         def _extract_selected_text(self) -> str:
             points = self._selection_points()
@@ -340,6 +357,8 @@ if _TEXTUAL_AVAILABLE:
                         "user": False,
                     }
                 )
+                if self._active_message_block is not None:
+                    self._active_message_block["records"].append(self._logical_records[-1])
             result = super().write(
                 content,
                 width=width,
@@ -360,6 +379,9 @@ if _TEXTUAL_AVAILABLE:
                 self._logical_records.clear()
                 self._record_spans.clear()
                 self._user_ranges.clear()
+                self._message_blocks.clear()
+                self._active_message_block = None
+                self._bookmark_highlight = None
             return super().clear()
 
         def on_resize(self, event: Any) -> None:
@@ -441,6 +463,7 @@ if _TEXTUAL_AVAILABLE:
             finally:
                 self._record_writes = True
             self._render_width = width
+            self._rebuild_bookmark_lines()
             new_boundaries = self._boundary_map(self._record_spans, len(self.lines))
             if notify_reflow and self._on_reflow is not None:
                 self._on_reflow(old_boundaries, new_boundaries)
@@ -571,6 +594,11 @@ if _TEXTUAL_AVAILABLE:
                 strip = super().render_line(y)
             if self._user_ranges and any(s <= content_row <= e for s, e in self._user_ranges):
                 strip = self._force_bgcolor(strip, self._user_background)
+            if (
+                self._bookmark_highlight is not None
+                and self._bookmark_highlight[0] <= content_row <= self._bookmark_highlight[1]
+            ):
+                strip = self._force_bgcolor(strip, "#665500")
             points = self._selection_points()
             if points is not None:
                 cols = self._selection_cols_for_row(
@@ -590,6 +618,12 @@ if _TEXTUAL_AVAILABLE:
                         bgcolor="white",
                         color="black",
                     )
+            strip = self._add_bookmark_gutter(
+                strip,
+                width,
+                marked=self._line_has_bookmark_marker(content_row),
+                overlay=self._bookmark_highlight is not None or points is not None,
+            )
             return strip
 
         # ── mouse events ───────────────────────────────────────────────────
@@ -641,14 +675,9 @@ if _TEXTUAL_AVAILABLE:
                 self._sel_end = (row, col)
                 self._selecting = False
                 self.release_mouse()
-                if self._sel_moved:
-                    # Drag → copy selected text
-                    text = self._extract_selected_text()
-                    if text.strip():
-                        self._copy_to_clipboard(text)
-                        self.set_timer(1.5, self._clear_selection)
-                    else:
-                        self._clear_selection()
+                # 拖选只保留高亮；复制统一由 Ctrl+C 触发。
+                if self._sel_moved and self._extract_selected_text().strip():
+                    self.refresh()
                 else:
                     self._clear_selection()
             except Exception:
@@ -659,6 +688,214 @@ if _TEXTUAL_AVAILABLE:
                     pass
                 self._clear_selection()
             event.stop()
+
+        def begin_message(self, message_id: str, role: str, summary: str) -> None:
+            block = {
+                "id": message_id,
+                "role": role,
+                "summary": summary,
+                "records": [],
+            }
+            self._message_blocks.append(block)
+            self._active_message_block = block
+
+        def end_message(self) -> None:
+            self._active_message_block = None
+
+        def message_blocks(self) -> list[dict[str, Any]]:
+            return list(self._message_blocks)
+
+        def message_start_line(self, message_id: str) -> int | None:
+            for block in self._message_blocks:
+                if block["id"] != message_id:
+                    continue
+                record_ids = {id(record) for record in block["records"]}
+                for index, record in enumerate(self._logical_records):
+                    if id(record) in record_ids and index < len(self._record_spans):
+                        return self._record_spans[index][0]
+                return None
+            return None
+
+        @staticmethod
+        def _anchor_text_length(text: str) -> int:
+            """使用非空白字符计数，使锚点不受终端自动换行影响。"""
+            return sum(not char.isspace() for char in text)
+
+        def bookmark_anchor_at_line(self, line: int) -> dict[str, Any] | None:
+            """把物理行转换成消息内稳定锚点。"""
+            for block in self._message_blocks:
+                record_ids = {id(record): index for index, record in enumerate(block["records"])}
+                for global_index, record in enumerate(self._logical_records):
+                    record_index = record_ids.get(id(record))
+                    if record_index is None or global_index >= len(self._record_spans):
+                        continue
+                    start, end = self._record_spans[global_index]
+                    if not start <= line < end:
+                        continue
+                    char_offset = sum(
+                        self._anchor_text_length(self.lines[row].text)
+                        for row in range(start, line)
+                    )
+                    line_text = " ".join(self.lines[line].text.split())
+                    return {
+                        "message_id": block["id"],
+                        "record_index": record_index,
+                        "char_offset": char_offset,
+                        "role": block["role"],
+                        "summary": line_text or block["summary"],
+                    }
+            return None
+
+        def _bookmark_record_span(
+            self, bookmark: dict[str, Any]
+        ) -> tuple[int, int] | None:
+            message_id = str(bookmark.get("message_id", ""))
+            try:
+                record_index = int(bookmark.get("record_index", 0))
+            except (TypeError, ValueError):
+                return None
+            for block in self._message_blocks:
+                if block["id"] != message_id or not 0 <= record_index < len(block["records"]):
+                    continue
+                target_record = block["records"][record_index]
+                for global_index, record in enumerate(self._logical_records):
+                    if record is target_record and global_index < len(self._record_spans):
+                        return self._record_spans[global_index]
+            return None
+
+        def bookmark_line(self, bookmark: dict[str, Any]) -> int | None:
+            """在当前排版中解析消息内书签锚点。"""
+            try:
+                target_offset = max(0, int(bookmark.get("char_offset", 0)))
+            except (TypeError, ValueError):
+                return None
+            span = self._bookmark_record_span(bookmark)
+            if span is None:
+                return None
+            start, end = span
+            consumed = 0
+            for row in range(start, end):
+                row_length = self._anchor_text_length(self.lines[row].text)
+                if row_length and target_offset < consumed + row_length:
+                    return row
+                consumed += row_length
+            return max(start, end - 1) if end > start else None
+
+        def bookmark_context_summary(
+            self, bookmark: dict[str, Any], *, limit: int = 120
+        ) -> str | None:
+            """动态生成带相邻行语境的书签摘要，兼容旧书签。"""
+            line = self.bookmark_line(bookmark)
+            span = self._bookmark_record_span(bookmark)
+            if line is None or span is None:
+                return None
+            start, end = span
+
+            def normalized(row: int) -> str:
+                return " ".join(self.lines[row].text.split())
+
+            before = [
+                text
+                for row in range(max(start, line - 4), line)
+                if (text := normalized(row))
+            ][-1:]
+            target = normalized(line) or "书签位置"
+            after = [
+                text
+                for row in range(line + 1, min(end, line + 5))
+                if (text := normalized(row))
+            ][:1]
+
+            def clipped(text: str, size: int) -> str:
+                return text if len(text) <= size else text[: size - 1].rstrip() + "…"
+
+            parts = [f"【{clipped(target, 48)}】"]
+            if before:
+                parts.append(f"前：{clipped(before[0], 30)}")
+            if after:
+                parts.append(f"后：{clipped(after[0], 30)}")
+            summary = "  ·  ".join(parts)
+            return summary if len(summary) <= limit else summary[: limit - 1].rstrip() + "…"
+
+        def set_bookmarks(self, bookmarks: list[dict[str, Any]]) -> None:
+            self._bookmark_entries = list(bookmarks)
+            self._rebuild_bookmark_lines()
+            self.refresh()
+
+        def _rebuild_bookmark_lines(self) -> None:
+            self._bookmark_lines = {
+                line
+                for bookmark in self._bookmark_entries
+                if (line := self.bookmark_line(bookmark)) is not None
+            }
+
+        def _line_has_bookmark_marker(self, line: int) -> bool:
+            return line in self._bookmark_lines
+
+        _BOOKMARK_GUTTER_WIDTH = 2
+
+        @classmethod
+        def _add_bookmark_gutter(
+            cls,
+            strip: Strip,
+            width: int,
+            *,
+            marked: bool,
+            overlay: bool,
+        ) -> Strip:
+            """用左侧固定栏覆盖行首；逻辑行宽和复制内容保持不变。"""
+            from rich.segment import Segment
+
+            gutter_width = min(cls._BOOKMARK_GUTTER_WIDTH, width)
+            if gutter_width <= 0:
+                return strip
+            if marked and gutter_width >= cls._BOOKMARK_GUTTER_WIDTH:
+                gutter_style = _Style(color="#ffd75f", bold=True)
+                if overlay:
+                    first = strip.crop(0, 1)
+                    first_style = first._segments[0].style if first._segments else None
+                    gutter_style = gutter_style + (first_style or _Style())
+                gutter = Strip([Segment("🔖", gutter_style)])
+            else:
+                gutter = strip.crop(0, gutter_width)
+            content = strip.crop(gutter_width, width)
+            return Strip.join((gutter, content))
+
+        def message_line_range(self, message_id: str) -> tuple[int, int] | None:
+            for block in self._message_blocks:
+                if block["id"] != message_id:
+                    continue
+                record_ids = {id(record) for record in block["records"]}
+                spans = [
+                    self._record_spans[index]
+                    for index, record in enumerate(self._logical_records)
+                    if id(record) in record_ids and index < len(self._record_spans)
+                ]
+                if spans:
+                    return spans[0][0], max(end - 1 for _start, end in spans)
+                return None
+            return None
+
+        def flash_bookmark(self, bookmark: dict[str, Any]) -> None:
+            line = self.bookmark_line(bookmark)
+            self._bookmark_highlight = (line, line) if line is not None else None
+            self.refresh()
+            if self._bookmark_highlight is not None:
+                self.set_timer(1.2, self.clear_bookmark_highlight)
+
+        def clear_bookmark_highlight(self) -> None:
+            self._bookmark_highlight = None
+            self.refresh()
+
+        def message_at_line(self, line: int) -> dict[str, Any] | None:
+            candidate: dict[str, Any] | None = None
+            candidate_start = -1
+            for block in self._message_blocks:
+                start = self.message_start_line(block["id"])
+                if start is not None and start <= line and start >= candidate_start:
+                    candidate = block
+                    candidate_start = start
+            return candidate
 
         def record_marker(self) -> int:
             """Return an opaque marker for records written after this point."""
@@ -677,6 +914,11 @@ if _TEXTUAL_AVAILABLE:
             if len(kept) == len(self._logical_records):
                 return
             self._logical_records = kept
+            self._message_blocks = [
+                block
+                for block in self._message_blocks
+                if any(id(record) not in record_ids for record in block["records"])
+            ]
             # The caller resets the active stream anchor after removal, so avoid
             # remapping anchors against a deliberately non-contiguous deletion.
             self._reflow(
@@ -1090,6 +1332,8 @@ if _TEXTUAL_AVAILABLE:
             Binding("escape", "escape_app", show=False, priority=True),
             Binding("pageup", "page_up", show=False),
             Binding("pagedown", "page_down", show=False),
+            Binding("ctrl+b", "toggle_bookmark", show=False, priority=True),
+            Binding("f6", "previous_bookmark", show=False, priority=True),
         ]
 
         def __init__(self, tui: "TextualTUI") -> None:
@@ -1107,6 +1351,20 @@ if _TEXTUAL_AVAILABLE:
             self._lag_timer: Any = None
             self._lag_last: float = 0.0
             self._lag_warn_threshold_s = 0.5
+
+        async def _check_bindings(self, key: str, priority: bool = False) -> bool:
+            """在 Textual 查找绑定前记录书签快捷键。"""
+            normalized = key.lower()
+            if normalized == "f6" or (
+                "b" in normalized and any(modifier in normalized for modifier in ("ctrl", "alt"))
+            ):
+                self._tui._bookmark_runtime_log(
+                    "tui.bookmark.key",
+                    key=key,
+                    priority=priority,
+                    focused=type(self.focused).__name__ if self.focused is not None else None,
+                )
+            return await super()._check_bindings(key, priority)
 
         def _safe_call(self, fn: Any, *args: Any) -> None:
             """Schedule ``fn(*args)`` via ``call_later`` so it runs inside
@@ -1222,6 +1480,10 @@ if _TEXTUAL_AVAILABLE:
             out.write("  [cyan]PageUp / PageDown[/cyan]   滚动历史记录")
             out.write("  [cyan]↑ / ↓[/cyan]              切换输入历史")
             out.write("  [cyan]ESC[/cyan]                取消当前请求")
+            out.write("  [cyan]Ctrl+B[/cyan]             添加/删除当前位置书签")
+            out.write("  [cyan]Ctrl+Shift+B[/cyan]       打开本话题书签列表")
+            out.write("  [cyan]Alt+B[/cyan]              跳到上方最近书签")
+            out.write("  [cyan]Ctrl+Alt+B[/cyan]         清理本话题全部书签")
             out.write("  [cyan]Ctrl+C / Ctrl+D[/cyan]    退出")
             out.write("  [cyan]鼠标拖选[/cyan]            选中行后自动复制到剪贴板")
             out.write("")
@@ -1311,11 +1573,19 @@ if _TEXTUAL_AVAILABLE:
                     text = out._extract_selected_text()
                     if text.strip():
                         out._copy_to_clipboard(text)
-                        out.set_timer(1.5, out._clear_selection)
+                        out._clear_selection()
                         return
             except Exception:
                 pass
             self.exit()
+
+        def action_toggle_bookmark(self) -> None:
+            self._tui._bookmark_runtime_log("tui.bookmark.action", action="toggle_bookmark")
+            self._tui.toggle_bookmark_at_view()
+
+        def action_previous_bookmark(self) -> None:
+            self._tui._bookmark_runtime_log("tui.bookmark.action", action="previous_bookmark")
+            self._tui.jump_to_previous_bookmark()
 
         def action_eof_app(self) -> None:
             if not self.query_one("#input", _ComposerInput).value:
@@ -1595,6 +1865,17 @@ class TextualTUI(TUIBase):
         self._history: list[str] = []
         self._history_pos: int = -1  # -1 = not navigating
 
+        # Topic-local persistent bookmarks live beside the existing input
+        # history file, keeping this fork feature independent of session schema.
+        bookmark_base = self._history_base_file or (Path.home() / ".nanobot" / "history")
+        self._bookmark_dir = bookmark_base.parent / f"{bookmark_base.name}.bookmarks"
+        self._bookmark_file: Path | None = None
+        self._bookmarks: dict[str, dict[str, Any]] = {}
+        self._message_occurrences: dict[tuple[str, str], int] = {}
+        self._bookmark_popup_ids: list[str] = []
+        self._bookmark_notice_task: Any = None
+        self._runtime_log_path: Path | None = None
+
         # Streaming state
         self._stream_buf: str = ""
         self._stream_ts: str = ""
@@ -1664,7 +1945,101 @@ class TextualTUI(TUIBase):
 
         self._app = _NanobotApp(self)
 
-    # ── History file ───────────────────────────────────────────────────────
+    # ── History file / topic bookmarks ─────────────────────────────────────
+
+    @staticmethod
+    def _topic_file_key(topic: str) -> str:
+        return hashlib.sha256(topic.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _message_fingerprint(role: str, content: str) -> str:
+        normalized = " ".join(content.split())
+        return hashlib.sha256(f"{role}\0{normalized}".encode("utf-8")).hexdigest()[:20]
+
+    @staticmethod
+    def _message_summary(content: str, limit: int = 56) -> str:
+        summary = " ".join(content.split()) or "（空消息）"
+        return summary if len(summary) <= limit else summary[: limit - 1] + "…"
+
+    def _next_message_id(self, role: str, content: str, timestamp: str = "") -> str:
+        fingerprint = self._message_fingerprint(role, f"{timestamp}\0{content}")
+        key = (role, fingerprint)
+        occurrence = self._message_occurrences.get(key, 0) + 1
+        self._message_occurrences[key] = occurrence
+        return f"{role}:{fingerprint}:{occurrence}"
+
+    def _bookmark_runtime_log(self, event_name: str, **fields: Any) -> None:
+        append_session_runtime_log(
+            self._runtime_log_path,
+            event_name,
+            topic=self._topic,
+            bookmark_file=str(self._bookmark_file) if self._bookmark_file else None,
+            bookmark_count=len(self._bookmarks),
+            **fields,
+        )
+
+    def set_session_runtime_log_path(self, path: str | Path | None) -> None:
+        self._runtime_log_path = Path(path) if path is not None else None
+        self._bookmark_runtime_log("tui.bookmark.runtime_attached")
+
+    def _load_bookmarks(self) -> None:
+        self._bookmarks = {}
+        if self._bookmark_file is None or not self._bookmark_file.exists():
+            self._bookmark_runtime_log("tui.bookmark.loaded", file_exists=False)
+            return
+        try:
+            payload = json.loads(self._bookmark_file.read_text(encoding="utf-8"))
+            entries = payload.get("bookmarks", []) if isinstance(payload, dict) else []
+            for entry in entries:
+                message_id = str(entry.get("message_id", ""))
+                if not message_id:
+                    continue
+                try:
+                    record_index = max(0, int(entry.get("record_index", 0)))
+                    char_offset = max(0, int(entry.get("char_offset", 0)))
+                except (TypeError, ValueError):
+                    continue
+                bookmark_id = str(entry.get("bookmark_id", "")) or self._bookmark_id(
+                    message_id,
+                    record_index,
+                    char_offset,
+                )
+                self._bookmarks[bookmark_id] = {
+                    "bookmark_id": bookmark_id,
+                    "message_id": message_id,
+                    "record_index": record_index,
+                    "char_offset": char_offset,
+                    "role": str(entry.get("role", "")),
+                    "summary": str(entry.get("summary", "")),
+                    "created_at": str(entry.get("created_at", "")),
+                }
+            self._bookmark_runtime_log("tui.bookmark.loaded", file_exists=True)
+        except Exception as exc:
+            logger.warning("Failed to load topic bookmarks {}: {}", self._bookmark_file, exc)
+            self._bookmark_runtime_log(
+                "tui.bookmark.load_failed",
+                exception_type=type(exc).__name__,
+                exception=str(exc),
+            )
+
+    def _save_bookmarks(self) -> None:
+        if self._bookmark_file is None:
+            return
+        payload = {
+            "schema": 2,
+            "topic": self._topic,
+            "bookmarks": list(self._bookmarks.values()),
+        }
+        try:
+            self._bookmark_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._bookmark_file.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(self._bookmark_file)
+        except Exception as exc:
+            logger.warning("Failed to save topic bookmarks {}: {}", self._bookmark_file, exc)
 
     def _load_history(self) -> list[str]:
         if not self._history_file or not self._history_file.exists():
@@ -1754,7 +2129,14 @@ class TextualTUI(TUIBase):
         except Exception:
             pass
 
-    def _write_response(self, content: str, ts: str, metadata: dict | None = None) -> None:
+    def _write_response(
+        self,
+        content: str,
+        ts: str,
+        metadata: dict | None = None,
+        *,
+        message_id: str | None = None,
+    ) -> None:
         """Write a completed response block as Rich objects (no ANSI conversion).
 
         When the response follows a streaming session that already rendered
@@ -1763,6 +2145,17 @@ class TextualTUI(TUIBase):
         short "─ HH:MM:SS ─" separator marks the new segment.
         """
         self._activity_phase = "write_response"
+        out: _OutputLog | None = None
+        if (metadata or {}).get("render_as") not in {"error", "system"}:
+            try:
+                out = self._app.query_one("#output", _OutputLog)
+                out.begin_message(
+                    message_id or self._next_message_id("assistant", content, ts),
+                    "assistant",
+                    self._message_summary(content),
+                )
+            except Exception:
+                out = None
         render_as = (metadata or {}).get("render_as")
         render_as_text = render_as == "text"
         render_as_error = render_as == "error"
@@ -1792,12 +2185,19 @@ class TextualTUI(TUIBase):
         self._last_sep = True
         # Reset streaming header anchor so the next turn starts fresh.
         self._stream_header_line = 0
+        if out is not None:
+            out.end_message()
 
-    def _write_user(self, text: str, ts: str) -> None:
+    def _write_user(self, text: str, ts: str, *, message_id: str | None = None) -> None:
         """Write a user message block; records line range for gray background."""
         try:
             out = self._app.query_one("#output", _OutputLog)
             start = len(out.lines)
+            out.begin_message(
+                message_id or self._next_message_id("user", text, ts),
+                "user",
+                self._message_summary(text),
+            )
         except Exception:
             start = None
         self._log_write(f"[bold blue]You[/bold blue] [dim]{ts}[/dim]")
@@ -1816,6 +2216,10 @@ class TextualTUI(TUIBase):
         self._log_write(f"[{self.THEME_MUTED}]{'─' * 80}[/{self.THEME_MUTED}]")
         self._log_write("")
         self._last_sep = True
+        try:
+            out.end_message()
+        except Exception:
+            pass
 
     # ── Popup helpers ──────────────────────────────────────────────────────
 
@@ -1989,7 +2393,13 @@ class TextualTUI(TUIBase):
                 if text.strip():
                     ts = _fmt_ts(msg.get("timestamp"))
                     self._append_sep()
-                    self._write_user(text.strip(), ts)
+                    clean_text = text.strip()
+                    self._write_user(
+                        clean_text,
+                        ts,
+                        message_id=str(msg.get("_transcript_id") or "")
+                        or self._next_message_id("user", clean_text, ts),
+                    )
                 # New user message → next assistant segment starts a fresh turn
                 header_written_this_turn = False
             elif role == "assistant":
@@ -2001,11 +2411,18 @@ class TextualTUI(TUIBase):
                         # full header and instead write a "─ HH:MM:SS ─" line.
                         # _write_response will use the historical ts we pass in.
                         self._header_already_rendered = True
-                    self._write_response(text.strip(), ts)
+                    clean_text = text.strip()
+                    self._write_response(
+                        clean_text,
+                        ts,
+                        message_id=str(msg.get("_transcript_id") or "")
+                        or self._next_message_id("assistant", clean_text, ts),
+                    )
                     header_written_this_turn = True
                 # Replay tool calls as static "↳ tool(args)  →  result" traces.
                 for tc in msg.get("tool_calls") or []:
                     self._replay_tool_trace(tc, results_by_id, tool_registry, workspace)
+        self._refresh_bookmark_markers()
 
     def _replay_tool_trace(
         self,
@@ -2083,20 +2500,22 @@ class TextualTUI(TUIBase):
             # is exactly what hid the lost-tool-trace bug for so long.
             logger.debug("replay tool trace: render failed", exc_info=True)
 
-    def add_user_echo(self, text: str) -> None:
+    def add_user_echo(self, text: str, *, message_id: str | None = None) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._append_sep()
-        self._write_user(text, ts)
+        self._write_user(text, ts, message_id=message_id)
 
     def add_response(
         self,
         content: str,
         metadata: dict | None = None,
         ts: str | None = None,
+        *,
+        message_id: str | None = None,
     ) -> None:
         self._clear_initial_thinking_placeholder()
         ts = ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._write_response(content, ts, metadata)
+        self._write_response(content, ts, metadata, message_id=message_id)
 
     def add_progress(self, text: str) -> None:
         import time
@@ -2801,6 +3220,10 @@ class TextualTUI(TUIBase):
 
     def set_input_history_topic(self, topic_key: str) -> None:
         self._history_file = input_history_path(self._history_base_file, topic_key)
+        self._bookmark_file = self._bookmark_dir / f"{self._topic_file_key(topic_key)}.json"
+        self._load_bookmarks()
+        self._refresh_bookmark_markers()
+        self._message_occurrences = {}
         self._history = self._load_history()
         self._history_pos = -1
         try:
@@ -2849,6 +3272,7 @@ class TextualTUI(TUIBase):
     def reset_history(self) -> None:
         self._app.stop_spinner()
         self._app.clear_output()
+        self._message_occurrences = {}
         self._app.clear_live()
         self._stream_buf = ""
         self._stream_ts = ""
@@ -2889,6 +3313,198 @@ class TextualTUI(TUIBase):
                 edit_values.add(command)
         self._all_commands = normalized
         self._command_edit_values = edit_values
+
+    def _notify_bookmark(self, text: str) -> None:
+        try:
+            self._app.notify(text, timeout=1.5)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _bookmark_id(message_id: str, record_index: int, char_offset: int) -> str:
+        raw = f"{message_id}\0{record_index}\0{char_offset}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _visible_bookmark_targets(self) -> list[tuple[int, dict[str, Any]]]:
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+        except Exception:
+            return []
+        targets = []
+        for bookmark in self._bookmarks.values():
+            line = out.bookmark_line(bookmark)
+            if line is not None:
+                targets.append((line, bookmark))
+        return sorted(targets, key=lambda item: item[0])
+
+    def _refresh_bookmark_markers(self) -> None:
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+        except Exception:
+            return
+        out.set_bookmarks(list(self._bookmarks.values()))
+
+    def toggle_bookmark_at_view(self) -> None:
+        diagnostic: dict[str, Any] = {}
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            scroll_line = int(out.scroll_offset.y)
+            selected_line = out.selected_bookmark_line()
+            target_line = selected_line if selected_line is not None else scroll_line
+            anchor = out.bookmark_anchor_at_line(target_line)
+            diagnostic = {
+                "scroll_line": scroll_line,
+                "selected_line": selected_line,
+                "target_line": target_line,
+                "target_source": "selection" if selected_line is not None else "viewport_top",
+                "line_count": len(out.lines),
+                "message_block_count": len(out.message_blocks()),
+                "record_span_count": len(out._record_spans),
+                "anchor_found": anchor is not None,
+                "anchor_role": anchor.get("role") if anchor else None,
+                "anchor_record_index": anchor.get("record_index") if anchor else None,
+                "anchor_char_offset": anchor.get("char_offset") if anchor else None,
+                "anchor_message_id": anchor.get("message_id") if anchor else None,
+            }
+        except Exception as exc:
+            anchor = None
+            diagnostic = {
+                "anchor_found": False,
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+            }
+        self._bookmark_runtime_log("tui.bookmark.toggle_resolved", **diagnostic)
+        if anchor is None:
+            self._notify_bookmark("当前位置没有可添加书签的消息")
+            return
+        bookmark_id = self._bookmark_id(
+            anchor["message_id"],
+            anchor["record_index"],
+            anchor["char_offset"],
+        )
+        if bookmark_id in self._bookmarks:
+            del self._bookmarks[bookmark_id]
+            self._save_bookmarks()
+            self._refresh_bookmark_markers()
+            out._clear_selection()
+            self._notify_bookmark("已删除书签")
+            return
+        self._bookmarks[bookmark_id] = {
+            "bookmark_id": bookmark_id,
+            **anchor,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._save_bookmarks()
+        self._refresh_bookmark_markers()
+        out._clear_selection()
+        self._notify_bookmark("已添加书签")
+
+    def jump_to_bookmark(self, bookmark_id: str) -> bool:
+        bookmark = self._bookmarks.get(bookmark_id)
+        if bookmark is None:
+            return False
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            line = out.bookmark_line(bookmark)
+            if line is None:
+                self._notify_bookmark("该书签对应消息已失效")
+                return False
+            out.scroll_to(y=line, animate=False, immediate=True, force=True)
+            out.flash_bookmark(bookmark)
+            self._notify_bookmark("已定位到书签")
+            return True
+        except Exception:
+            return False
+
+    def jump_to_previous_bookmark(self) -> bool:
+        targets = self._visible_bookmark_targets()
+        self._bookmark_runtime_log(
+            "tui.bookmark.jump_resolved",
+            visible_target_count=len(targets),
+            target_lines=[line for line, _bookmark in targets],
+        )
+        if not targets:
+            self._notify_bookmark("本话题没有可用书签")
+            return False
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            current = int(out.scroll_offset.y)
+        except Exception:
+            return False
+        earlier = [item for item in targets if item[0] < current]
+        target = earlier[-1] if earlier else targets[-1]
+        result = self.jump_to_bookmark(target[1]["bookmark_id"])
+        self._bookmark_runtime_log(
+            "tui.bookmark.jump_completed",
+            current_line=current,
+            target_line=target[0],
+            result=result,
+        )
+        return result
+
+    def delete_bookmark(self, bookmark_id: str) -> bool:
+        if bookmark_id not in self._bookmarks:
+            return False
+        del self._bookmarks[bookmark_id]
+        self._save_bookmarks()
+        self._refresh_bookmark_markers()
+        return True
+
+    def clear_topic_bookmarks(self) -> int:
+        count = len(self._bookmarks)
+        self._bookmarks = {}
+        self._save_bookmarks()
+        self._refresh_bookmark_markers()
+        self.hide_popup()
+        self._notify_bookmark(f"已清理本话题 {count} 个书签")
+        return count
+
+    def _bookmark_popup_items(self) -> list[tuple[str, str]]:
+        entries = list(self._bookmarks.values())
+        valid = self._visible_bookmark_targets()
+        valid_ids = {bookmark["bookmark_id"] for _line, bookmark in valid}
+        order = {bookmark["bookmark_id"]: line for line, bookmark in valid}
+        entries.sort(key=lambda entry: order.get(entry["bookmark_id"], 10**18))
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+        except Exception:
+            out = None
+        items: list[tuple[str, str]] = []
+        for entry in entries:
+            role = "你" if entry["role"] == "user" else "nanobot"
+            is_valid = entry["bookmark_id"] in valid_ids
+            context = out.bookmark_context_summary(entry) if out is not None and is_valid else None
+            summary = context or str(entry.get("summary", "")) or "（无摘要）"
+            marker = "" if is_valid else " [失效]"
+            items.append((entry["bookmark_id"], f"{role}: {summary}{marker}"))
+        return items
+
+    def show_bookmark_popup(self) -> None:
+        self._bookmark_runtime_log("tui.bookmark.popup_requested")
+        items = self._bookmark_popup_items()
+        if not items:
+            self._notify_bookmark("本话题没有书签")
+            return
+
+        async def _jump(bookmark_id: str) -> None:
+            self.jump_to_bookmark(bookmark_id)
+
+        self._bookmark_popup_ids = [value for value, _label in items]
+        self.show_topic_popup(items, _jump)
+
+    def show_bookmark_delete_popup(self) -> None:
+        self._bookmark_runtime_log("tui.bookmark.delete_popup_requested")
+        items = self._bookmark_popup_items()
+        if not items:
+            self._notify_bookmark("本话题没有书签")
+            return
+
+        async def _delete(bookmark_id: str) -> None:
+            if self.delete_bookmark(bookmark_id):
+                self._notify_bookmark("已删除书签")
+
+        self._bookmark_popup_ids = [value for value, _label in items]
+        self.show_topic_popup(items, _delete)
 
     def show_topic_popup(
         self,

@@ -453,6 +453,46 @@ def test_save_turn_keeps_tool_results_under_16k() -> None:
     assert session.messages[1]["content"] == content
 
 
+def test_save_turn_uses_preallocated_transcript_ids() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:stable-transcript-ids")
+
+    loop._save_turn(
+        session,
+        [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        skip=0,
+        transcript_ids={
+            "_user_transcript_id": "stable-user-id",
+            "_assistant_transcript_id": "stable-assistant-id",
+        },
+    )
+
+    assert session.messages[0]["_transcript_id"] == "stable-user-id"
+    assert session.messages[1]["_transcript_id"] == "stable-assistant-id"
+
+
+def test_save_turn_assigns_assistant_transcript_id_only_to_final_text() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:stable-final-assistant-id")
+
+    loop._save_turn(
+        session,
+        [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "preface"},
+            {"role": "assistant", "content": "final answer"},
+        ],
+        skip=0,
+        transcript_ids={"_assistant_transcript_id": "stable-final-id"},
+    )
+
+    assert session.messages[1]["_transcript_id"] != "stable-final-id"
+    assert session.messages[2]["_transcript_id"] == "stable-final-id"
+
+
 def test_save_turn_stamps_latency_on_last_assistant() -> None:
     loop = _mk_loop()
     session = Session(key="test:latency")

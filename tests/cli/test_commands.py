@@ -320,6 +320,15 @@ def test_resume_palette_selection_submits_to_show_topic_list() -> None:
     ) in palette
 
 
+def test_bookmark_commands_are_cli_local_palette_actions() -> None:
+    palette = cli_commands._tui_command_palette()
+    actions = {command: action for command, _description, action in palette}
+
+    for command in ("/bookmarks", "/bookmarks-delete", "/bookmarks-clear"):
+        assert cli_commands._is_cli_local_command(command)
+        assert actions[command] == "submit"
+
+
 def test_format_prompt_inspection_shows_system_and_current_context_only() -> None:
     rendered = cli_commands._format_prompt_inspection(
         [
@@ -3306,7 +3315,17 @@ def test_fork_tui_command_palette_includes_cli_local_commands() -> None:
     commands = {item[0] for item in _tui_command_palette()}
 
     assert {
-        "/rename", "/system-prompt", "/clear", "/resume", "/todos", "/continue", "/commit_memory", "/exit"
+        "/rename",
+        "/system-prompt",
+        "/clear",
+        "/resume",
+        "/todos",
+        "/continue",
+        "/commit_memory",
+        "/bookmarks",
+        "/bookmarks-delete",
+        "/bookmarks-clear",
+        "/exit",
     } <= commands
 
 

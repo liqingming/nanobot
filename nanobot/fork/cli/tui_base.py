@@ -56,7 +56,7 @@ class TUIBase(ABC):
     ) -> None: ...
 
     @abstractmethod
-    def add_user_echo(self, text: str) -> None: ...
+    def add_user_echo(self, text: str, *, message_id: str | None = None) -> None: ...
 
     @abstractmethod
     def add_response(
@@ -64,6 +64,8 @@ class TUIBase(ABC):
         content: str,
         metadata: dict | None = None,
         ts: str | None = None,
+        *,
+        message_id: str | None = None,
     ) -> None: ...
 
     @abstractmethod
