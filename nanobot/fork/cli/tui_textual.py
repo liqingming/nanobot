@@ -1505,7 +1505,7 @@ if _TEXTUAL_AVAILABLE:
             out.write("  [cyan]ESC[/cyan]                取消当前请求")
             out.write("  [cyan]Ctrl+B[/cyan]             添加/删除当前位置书签")
             out.write("  [cyan]Ctrl+Shift+B[/cyan]       打开本话题书签列表")
-            out.write("  [cyan]Alt+B[/cyan]              跳到上方最近书签")
+            out.write("  [cyan]Alt+B[/cyan]              循环切换上方书签与底部")
             out.write("  [cyan]Ctrl+Alt+B[/cyan]         清理本话题全部书签")
             out.write("  [cyan]Ctrl+C / Ctrl+D[/cyan]    退出")
             out.write("  [cyan]鼠标拖选[/cyan]            选中行后自动复制到剪贴板")
@@ -3411,13 +3411,26 @@ class TextualTUI(TUIBase):
             current = int(out.scroll_offset.y)
         except Exception:
             return False
-        earlier = [item for item in targets if item[0] < current]
-        target = earlier[-1] if earlier else targets[-1]
-        result = self.jump_to_bookmark(target[1]["bookmark_id"])
+        if out.is_at_bottom():
+            target = targets[-1]
+            result = self.jump_to_bookmark(target[1]["bookmark_id"])
+            target_line: int | str = target[0]
+        else:
+            earlier = [item for item in targets if item[0] < current]
+            if earlier:
+                target = earlier[-1]
+                result = self.jump_to_bookmark(target[1]["bookmark_id"])
+                target_line = target[0]
+            else:
+                out.clear_bookmark_highlight()
+                out.scroll_end(animate=False, immediate=True, force=True)
+                self._notify_bookmark("已定位到底部")
+                result = True
+                target_line = "bottom"
         self._bookmark_runtime_log(
             "tui.bookmark.jump_completed",
             current_line=current,
-            target_line=target[0],
+            target_line=target_line,
             result=result,
         )
         return result

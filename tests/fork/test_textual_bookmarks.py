@@ -138,7 +138,7 @@ async def test_position_bookmark_survives_output_reflow(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_previous_bookmark_uses_position_and_wraps(tmp_path) -> None:
+async def test_previous_bookmark_cycles_through_bottom(tmp_path) -> None:
     tui = _make_tui(tmp_path)
     async with tui._app.run_test():
         tui.load_session_history(LONG_MESSAGES)
@@ -156,6 +156,11 @@ async def test_previous_bookmark_uses_position_and_wraps(tmp_path) -> None:
         assert output._bookmark_highlight == (last_line, last_line)
 
         output.scroll_to(y=first_line, animate=False, immediate=True, force=True)
+        assert not output.is_at_bottom()
+        assert tui.jump_to_previous_bookmark()
+        assert output.is_at_bottom()
+        assert output._bookmark_highlight is None
+
         assert tui.jump_to_previous_bookmark()
         assert output._bookmark_highlight == (last_line, last_line)
 
