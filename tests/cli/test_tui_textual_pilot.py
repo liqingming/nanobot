@@ -1417,3 +1417,55 @@ async def test_stream_anchor_survives_resize_and_final_markdown_replaces_snapsho
         assert "流式响应" in text
         assert len(out._logical_records) == len(out._record_spans)
         assert 0 <= tui._tool_placeholder_line <= len(out.lines)
+
+
+@pytest.mark.asyncio
+async def test_escape_cancels_active_turn_even_when_popup_is_visible() -> None:
+    tui = TextualTUI()
+    tui.set_commands([("/status", "status")])
+    cancelled: list[bool] = []
+
+    async def cancel() -> None:
+        cancelled.append(True)
+
+    tui.set_on_cancel(cancel)
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tui.set_is_processing(True)
+        app.set_input_value("/s")
+        tui._on_input_changed("/s")
+        assert tui._popup_mode != "hidden"
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert cancelled == [True]
+        assert tui._popup_mode == "hidden"
+
+
+@pytest.mark.asyncio
+async def test_empty_enter_jumps_output_to_bottom_without_submitting() -> None:
+    tui = TextualTUI(render_markdown=False)
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    tui.set_on_submit(on_submit)
+    async with tui._app.run_test(size=(60, 12)) as pilot:
+        output = tui._app.query_one("#output")
+        for index in range(80):
+            output.write(f"history-{index}")
+        output.scroll_end(animate=False, immediate=True, force=True)
+        await pilot.pause()
+        output.scroll_to(y=0, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        assert not output.is_at_bottom()
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert output.is_at_bottom()
+        assert submitted == []
+        assert tui._app.query_one("#input").value == ""

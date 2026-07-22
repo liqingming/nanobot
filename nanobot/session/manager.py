@@ -17,7 +17,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
-from nanobot.session.transcript_archive import TranscriptArchive
+from nanobot.session.transcript_archive import TranscriptArchive, TranscriptPage
 from nanobot.utils.atomic_write import replace_file_with_retry
 from nanobot.utils.helpers import (
     ensure_dir,
@@ -744,6 +744,27 @@ class SessionManager:
         archived = self.transcripts.read(key)
         seen = {m.get("_transcript_id") for m in archived}
         return archived + [m for m in live_messages if m.get("_transcript_id") not in seen]
+
+    def display_history_page(
+        self,
+        key: str,
+        live_messages: list[dict[str, Any]],
+        *,
+        before_offset: int | None = None,
+        turn_limit: int = 30,
+    ) -> TranscriptPage:
+        """Return one complete-turn display page without loading the full transcript."""
+        # Seed sessions created before the archive feature. Existing transcripts
+        # are already synced before every session save; do not call sync() here,
+        # because its first use builds an ID set by scanning the entire archive.
+        if not self.transcripts.path_for(key).exists() and live_messages:
+            self._ensure_transcript_ids(live_messages)
+            self.transcripts.sync(key, live_messages)
+        return self.transcripts.read_turn_page(
+            key,
+            before_offset=before_offset,
+            turn_limit=turn_limit,
+        )
 
     def flush_all(self) -> int:
         """Re-save every cached session with fsync for durable shutdown.

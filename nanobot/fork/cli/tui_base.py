@@ -42,7 +42,7 @@ class TUIBase(ABC):
     def set_on_pre_submit(self, callback: Callable[[str], None]) -> None: ...
 
     @abstractmethod
-    def set_on_cancel(self, callback: Callable[[], None]) -> None: ...
+    def set_on_cancel(self, callback: Callable[[], Awaitable[None]]) -> None: ...
 
     # ── Content write API ──────────────────────────────────────────────────
 
@@ -50,9 +50,18 @@ class TUIBase(ABC):
     def load_session_history(
         self,
         messages: list[dict],
-        max_messages: int = 200,
+        max_messages: int = 10,
         tool_registry: Any = None,
         workspace: Any = None,
+    ) -> None: ...
+
+    @abstractmethod
+    def set_history_page_loader(
+        self,
+        callback: Callable[[int | None], Awaitable[tuple[list[dict], int | None, bool]]] | None,
+        *,
+        before_offset: int | None = None,
+        has_older: bool = False,
     ) -> None: ...
 
     @abstractmethod
@@ -180,3 +189,18 @@ class TUIBase(ABC):
 
     @abstractmethod
     def hide_popup(self) -> None: ...
+
+
+def recent_complete_turns(messages: list[dict], turn_limit: int) -> list[dict]:
+    """Return the newest complete user turns in normal display order."""
+    if turn_limit <= 0 or not messages:
+        return []
+    start = 0
+    seen = 0
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            seen += 1
+            start = index
+            if seen >= turn_limit:
+                return messages[start:]
+    return messages

@@ -1715,3 +1715,87 @@ def test_save_turn_keeps_tool_results_declared_in_prior_history() -> None:
     )
 
     assert [m["role"] for m in session.messages] == ["assistant", "tool"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_session_turn_drops_request_before_dispatch(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    request_id = "queued-request"
+    key = "cli:cancel-race"
+    msg = InboundMessage(
+        channel="cli",
+        sender_id="user",
+        chat_id="cancel-race",
+        content="must not run",
+        metadata={"_turn_request_id": request_id},
+    )
+    loop._process_message = AsyncMock()  # type: ignore[method-assign]
+
+    await loop.cancel_session_turn(key, request_id=request_id)
+    await loop._dispatch(msg)
+
+    loop._process_message.assert_not_awaited()
+    assert (key, request_id) not in loop._cancelled_turn_requests
+
+
+@pytest.mark.asyncio
+async def test_cancel_session_turn_awaits_matching_active_task_and_subagents(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    key = "cli:active-cancel"
+    request_id = "active-request"
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def work() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            cleaned.set()
+
+    task = asyncio.create_task(work())
+    loop._active_tasks[key] = [task]
+    loop._active_task_request_ids[task] = request_id
+    loop.subagents.cancel_by_session = AsyncMock(return_value=2)
+    await started.wait()
+
+    total = await loop.cancel_session_turn(key, request_id=request_id)
+
+    assert total == 3
+    assert task.done()
+    assert cleaned.is_set()
+    assert task not in loop._active_task_request_ids
+    loop.subagents.cancel_by_session.assert_awaited_once_with(key)
+
+
+@pytest.mark.asyncio
+async def test_cancel_session_turn_removes_matching_message_from_inbound_bus(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    target = InboundMessage(
+        channel="cli",
+        sender_id="user",
+        chat_id="target",
+        content="cancel me",
+        metadata={"_turn_request_id": "request-1"},
+    )
+    retained = InboundMessage(
+        channel="cli",
+        sender_id="user",
+        chat_id="other",
+        content="keep me",
+        metadata={"_turn_request_id": "request-2"},
+    )
+    await loop.bus.publish_inbound(target)
+    await loop.bus.publish_inbound(retained)
+
+    total = await loop.cancel_session_turn("cli:target", request_id="request-1")
+
+    assert total == 1
+    assert loop.bus.inbound_size == 1
+    assert await loop.bus.consume_inbound() is retained
+    assert ("cli:target", "request-1") not in loop._cancelled_turn_requests

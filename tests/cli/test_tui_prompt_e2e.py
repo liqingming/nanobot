@@ -212,10 +212,17 @@ def test_escape_with_popup_hides_popup(prompt_tui: PromptTUI) -> None:
     assert prompt_tui._popup_mode == "hidden"
 
 
-def test_escape_otherwise_calls_on_cancel(prompt_tui: PromptTUI) -> None:
+@pytest.mark.asyncio
+async def test_escape_otherwise_calls_on_cancel(prompt_tui: PromptTUI) -> None:
     cancelled: list[bool] = []
-    prompt_tui.set_on_cancel(lambda: cancelled.append(True))
+
+    async def cancel() -> None:
+        cancelled.append(True)
+
+    prompt_tui.set_on_cancel(cancel)
+    prompt_tui.set_is_processing(True)
     prompt_tui._handle_escape_key()
+    await asyncio.sleep(0)
     assert cancelled == [True]
 
 
@@ -260,3 +267,22 @@ def test_flush_stream_preserves_manual_scroll_offset(prompt_tui: PromptTUI) -> N
     prompt_tui.flush_stream()
 
     assert prompt_tui._scroll_offset == 7
+
+
+@pytest.mark.asyncio
+async def test_empty_enter_jumps_prompt_output_to_bottom_without_submitting(
+    prompt_tui: PromptTUI,
+) -> None:
+    submitted: list[str] = []
+
+    async def on_submit(text: str) -> None:
+        submitted.append(text)
+
+    prompt_tui.set_on_submit(on_submit)
+    prompt_tui._scroll_offset = 25
+    prompt_tui._handle_enter_key()
+    await _drain()
+
+    assert prompt_tui._scroll_offset == 0
+    assert prompt_tui._input_buffer.text == ""
+    assert submitted == []

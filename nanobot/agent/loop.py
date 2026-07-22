@@ -369,6 +369,10 @@ class AgentLoop:
         self._mcp_stacks: dict[str, AsyncExitStack] = {}
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._active_task_request_ids: dict[asyncio.Task, str | None] = {}
+        # Request-id tombstones close the gap between enqueueing an inbound message and
+        # registering its dispatch task. The run loop and _dispatch both consume them.
+        self._cancelled_turn_requests: set[tuple[str, str]] = set()
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Per-session pending queues for mid-turn message injection.
@@ -790,18 +794,69 @@ class AgentLoop:
         else:
             logger.warning("Command '{}' matched but dispatch returned None", raw)
 
-    async def _cancel_active_tasks(self, key: str) -> int:
-        """Cancel and await all active tasks and subagents for *key*.
+    @staticmethod
+    def _turn_request_id(msg: InboundMessage) -> str | None:
+        value = msg.metadata.get("_turn_request_id")
+        return str(value) if value else None
 
-        Returns the total number of cancelled tasks + subagents.
+    def _consume_cancelled_turn_request(self, key: str, request_id: str | None) -> bool:
+        if request_id is None:
+            return False
+        marker = (key, request_id)
+        if marker not in self._cancelled_turn_requests:
+            return False
+        self._cancelled_turn_requests.discard(marker)
+        return True
+
+    async def cancel_session_turn(self, key: str, *, request_id: str | None = None) -> int:
+        """Cancel and await a session turn, including its queue and subagents.
+
+        A request-id tombstone is installed before inspecting active tasks so cancellation
+        also covers the enqueue-to-dispatch race. When *request_id* is omitted, all active
+        tasks for the session are cancelled (the behavior used by ``/stop``).
         """
-        tasks = self._active_tasks.pop(key, [])
-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-        for t in tasks:
+        if request_id is not None:
+            self._cancelled_turn_requests.add((key, request_id))
+
+        active_before_discard = list(self._active_tasks.get(key, []))
+
+        def _matches_queued_turn(msg: InboundMessage) -> bool:
+            if self._effective_session_key(msg) != key:
+                return False
+            return request_id is None or self._turn_request_id(msg) == request_id
+
+        cancelled = self.bus.discard_inbound(_matches_queued_turn)
+        if cancelled and request_id is not None and not active_before_discard:
+            self._cancelled_turn_requests.discard((key, request_id))
+
+        active = list(self._active_tasks.get(key, []))
+        tasks = [
+            task for task in active
+            if request_id is None or self._active_task_request_ids.get(task) == request_id
+        ]
+        cancelled += sum(1 for task in tasks if not task.done() and task.cancel())
+        for task in tasks:
             with suppress(asyncio.CancelledError, Exception):
-                await t
+                await task
+            self._active_task_request_ids.pop(task, None)
+        if tasks and request_id is not None:
+            self._cancelled_turn_requests.discard((key, request_id))
+
+        pending = self._pending_queues.pop(key, None)
+        if pending is not None:
+            while True:
+                try:
+                    pending.get_nowait()
+                    cancelled += 1
+                except asyncio.QueueEmpty:
+                    break
+
         sub_cancelled = await self.subagents.cancel_by_session(key)
         return cancelled + sub_cancelled
+
+    async def _cancel_active_tasks(self, key: str) -> int:
+        """Backward-compatible wrapper for the unified cancellation protocol."""
+        return await self.cancel_session_turn(key)
 
     def _effective_session_key(self, msg: InboundMessage) -> str:
         """Return the session key used for task routing and mid-turn injections."""
@@ -1274,6 +1329,11 @@ class AgentLoop:
 
                 raw = msg.content.strip()
                 effective_key = self._effective_session_key(msg)
+                if self._consume_cancelled_turn_request(
+                    effective_key, self._turn_request_id(msg)
+                ):
+                    logger.info("Dropped cancelled queued turn for session {}", effective_key)
+                    continue
                 if await agent_context.handle_runtime_control(self, msg, self.tools):
                     continue
                 if self.commands.is_priority(raw):
@@ -1333,12 +1393,17 @@ class AgentLoop:
                 # This ensures /stop command can find tasks correctly when unified session is enabled
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(effective_key, []).append(task)
-                task.add_done_callback(
-                    lambda t, k=effective_key: self._active_tasks.get(k, [])
-                    and self._active_tasks[k].remove(t)
-                    if t in self._active_tasks.get(k, [])
-                    else None
-                )
+                self._active_task_request_ids[task] = self._turn_request_id(msg)
+
+                def _forget_active_task(t: asyncio.Task, k: str = effective_key) -> None:
+                    tasks = self._active_tasks.get(k, [])
+                    if t in tasks:
+                        tasks.remove(t)
+                    if not tasks:
+                        self._active_tasks.pop(k, None)
+                    self._active_task_request_ids.pop(t, None)
+
+                task.add_done_callback(_forget_active_task)
         finally:
             # MCP stdio transports use AnyIO cancel scopes; close them from the task that opened them.
             await self.close_mcp()
@@ -1412,12 +1477,16 @@ class AgentLoop:
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
         session_key = self._effective_session_key(msg)
+        if self._consume_cancelled_turn_request(session_key, self._turn_request_id(msg)):
+            logger.info("Skipped cancelled turn before dispatch for session {}", session_key)
+            return
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
 
         pending: asyncio.Queue | None = None
+        turn_cancelled = False
         try:
             async with lock, gate:
                 # Only the task that owns the session lock may publish the
@@ -1492,6 +1561,7 @@ class AgentLoop:
                     for _, coordinator in self._automation_turn_coordinators:
                         coordinator.complete(msg, response=response)
                 except asyncio.CancelledError:
+                    turn_cancelled = True
                     for _, coordinator in self._automation_turn_coordinators:
                         coordinator.complete(msg, error=asyncio.CancelledError())
                     logger.info("Task cancelled for session {}", session_key)
@@ -1558,12 +1628,14 @@ class AgentLoop:
                                 item = queue.get_nowait()
                             except asyncio.QueueEmpty:
                                 break
-                            await self.bus.publish_inbound(item)
+                            if not turn_cancelled:
+                                await self.bus.publish_inbound(item)
                             leftover += 1
                         if leftover:
+                            action = "Discarded" if turn_cancelled else "Re-published"
                             logger.info(
-                                "Re-published {} leftover message(s) to bus for session {}",
-                                leftover, session_key,
+                                "{} {} leftover message(s) for session {}",
+                                action, leftover, session_key,
                             )
                     if not turn_continuation.internal_continuation_pending(msg.metadata):
                         await self._runtime_events().run_status_changed(

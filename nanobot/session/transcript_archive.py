@@ -4,8 +4,18 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+@dataclass(frozen=True)
+class TranscriptPage:
+    """One reverse-chronological page, returned in normal display order."""
+
+    messages: list[dict[str, Any]]
+    before_offset: int | None
+    has_older: bool
 
 
 class TranscriptArchive:
@@ -60,6 +70,75 @@ class TranscriptArchive:
                 ]
         except (OSError, json.JSONDecodeError):
             return []
+
+    def read_turn_page(
+        self,
+        key: str,
+        *,
+        before_offset: int | None = None,
+        turn_limit: int = 30,
+    ) -> TranscriptPage:
+        """Read up to ``turn_limit`` complete user turns backwards from disk.
+
+        ``before_offset`` is an opaque byte cursor returned by the previous call.
+        Reading proceeds from the file tail in bounded chunks, so opening a large
+        transcript does not deserialize the whole archive.
+        """
+        path = self.path_for(key)
+        if turn_limit <= 0:
+            return TranscriptPage([], before_offset, bool(before_offset))
+        try:
+            with open(path, "rb") as f:
+                file_size = f.seek(0, 2)
+                end = file_size if before_offset is None else max(0, min(before_offset, file_size))
+                position = end
+                carry = b""
+                newest_first: list[tuple[int, dict[str, Any]]] = []
+                user_turns = 0
+                oldest_offset: int | None = None
+
+                while position > 0 and user_turns < turn_limit:
+                    chunk_size = min(64 * 1024, position)
+                    position -= chunk_size
+                    f.seek(position)
+                    chunk = f.read(chunk_size) + carry
+                    lines = chunk.split(b"\n")
+                    carry = lines.pop(0) if position > 0 else b""
+                    offsets: list[int] = []
+                    cursor = position + (len(carry) if position > 0 else 0)
+                    if position > 0:
+                        cursor += 1
+                    for raw in lines:
+                        offsets.append(cursor)
+                        cursor += len(raw) + 1
+                    for line_offset, raw in reversed(list(zip(offsets, lines, strict=True))):
+                        if not raw.strip() or line_offset >= end:
+                            continue
+                        try:
+                            row = json.loads(raw.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        message = row.get("message") if isinstance(row, dict) else None
+                        if not isinstance(message, dict):
+                            continue
+                        newest_first.append((line_offset, message))
+                        oldest_offset = line_offset
+                        if message.get("role") == "user":
+                            user_turns += 1
+                            if user_turns >= turn_limit:
+                                break
+
+                # A transcript with no user rows (for example proactive delivery)
+                # is still a valid final page.
+                messages = [message for _offset, message in reversed(newest_first)]
+                has_older = bool(oldest_offset is not None and oldest_offset > 0)
+                return TranscriptPage(
+                    messages,
+                    oldest_offset if has_older else None,
+                    has_older,
+                )
+        except OSError:
+            return TranscriptPage([], None, False)
 
     def delete(self, key: str) -> None:
         self.known.pop(key, None)

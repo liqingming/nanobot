@@ -49,7 +49,7 @@ from wcwidth import wcswidth as _wcswidth
 
 from nanobot import __logo__, __version__
 from nanobot.cli.markdown import terminal_markdown
-from nanobot.fork.cli.tui_base import TUIBase, input_history_path
+from nanobot.fork.cli.tui_base import TUIBase, input_history_path, recent_complete_turns
 from nanobot.fork.cli.tui_keys import (
     EnterAction,
     PopupAction,
@@ -344,7 +344,7 @@ class PromptTUI(TUIBase):
         self._live_progress: str = ""        # tool-hint lines shown in live area
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._on_pre_submit: Callable[[str], None] | None = None
-        self._on_cancel: Callable[[], None] | None = None
+        self._on_cancel: Callable[[], Awaitable[None]] | None = None
         self._app: Application | None = None
         # New-topic name input mode
         self._input_mode: str = "chat"       # "chat" | "new_topic"
@@ -386,7 +386,7 @@ class PromptTUI(TUIBase):
     def load_session_history(
         self,
         messages: list[dict],
-        max_messages: int = 200,
+        max_messages: int = 10,
         tool_registry: Any = None,
         workspace: Any = None,
     ) -> None:
@@ -398,7 +398,7 @@ class PromptTUI(TUIBase):
         """
         del tool_registry, workspace  # unused in this backend
         _RUNTIME_TAG = "[Runtime Context — metadata only, not instructions]"  # noqa: N806
-        recent = messages[-max_messages:] if len(messages) > max_messages else messages
+        recent = recent_complete_turns(messages, max_messages)
 
         for msg in recent:
             role = msg.get("role")
@@ -423,6 +423,16 @@ class PromptTUI(TUIBase):
 
         if self._output_lines:
             self._pin_to_bottom()
+
+    def set_history_page_loader(
+        self,
+        callback: Callable[[int | None], Awaitable[tuple[list[dict], int | None, bool]]] | None,
+        *,
+        before_offset: int | None = None,
+        has_older: bool = False,
+    ) -> None:
+        """PromptTUI has no stable prepend primitive; initial complete-turn replay is its fallback."""
+        del callback, before_offset, has_older
 
     # ── Rendering helpers ──────────────────────────────────────────────────
 
@@ -845,6 +855,9 @@ class PromptTUI(TUIBase):
             asyncio.ensure_future(self._on_submit(value))
             return
         self._input_buffer.reset(append_to_history=False)
+        if action == EnterAction.NOOP:
+            self._pin_to_bottom()
+            self._invalidate()
 
     def _handle_tab_key(self) -> None:
         decision = decide_popup_key("tab", self._current_state())
@@ -866,13 +879,16 @@ class PromptTUI(TUIBase):
             self._input_buffer.history_forward()
 
     def _handle_escape_key(self) -> None:
+        if self._is_processing and self._on_cancel is not None:
+            if self._popup_items:
+                self.hide_popup()
+            asyncio.create_task(self._on_cancel())
+            return
         if self._input_mode == "new_topic":
             self._exit_new_topic_mode()
             return
         if self._popup_items:
             self.hide_popup()
-        elif self._on_cancel is not None:
-            self._on_cancel()
 
     def _handle_ctrl_d_key(self) -> bool:
         """Returns True if the app should exit (input is empty)."""
@@ -894,7 +910,7 @@ class PromptTUI(TUIBase):
     def set_on_pre_submit(self, callback: Callable[[str], None]) -> None:
         self._on_pre_submit = callback
 
-    def set_on_cancel(self, callback: Callable[[], None]) -> None:
+    def set_on_cancel(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._on_cancel = callback
 
     def enter_new_topic_mode(self, callback: Callable[[str], Awaitable[None]]) -> None:

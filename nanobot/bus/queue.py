@@ -1,6 +1,7 @@
 """Async message queue for decoupled channel-agent communication."""
 
 import asyncio
+from collections.abc import Callable
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 
@@ -24,6 +25,27 @@ class MessageBus:
     async def consume_inbound(self) -> InboundMessage:
         """Consume the next inbound message (blocks until available)."""
         return await self.inbound.get()
+
+    def discard_inbound(self, predicate: Callable[[InboundMessage], bool]) -> int:
+        """Atomically discard queued inbound messages matching *predicate*.
+
+        The method contains no await points, so callers on the owning event loop can close
+        enqueue-to-dispatch cancellation races without reordering retained messages.
+        """
+        retained: list[InboundMessage] = []
+        discarded = 0
+        while True:
+            try:
+                msg = self.inbound.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if predicate(msg):
+                discarded += 1
+            else:
+                retained.append(msg)
+        for msg in retained:
+            self.inbound.put_nowait(msg)
+        return discarded
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""

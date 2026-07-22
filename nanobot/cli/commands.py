@@ -2323,10 +2323,36 @@ def agent(
                     set_runtime_log_path(agent_loop.sessions.get_session_runtime_log_path(s.key))
                 tui.set_input_history_topic(s.key)
                 tui.set_topic("" if display_name == _CLI_UNNAMED_SESSION_LABEL else display_name or name)
+                page = agent_loop.sessions.display_history_page(
+                    s.key,
+                    s.messages,
+                    turn_limit=10,
+                )
                 tui.load_session_history(
-                    agent_loop.sessions.display_history(s.key, s.messages),
+                    page.messages,
+                    max_messages=10,
                     tool_registry=agent_loop.tools,
                     workspace=agent_loop.workspace,
+                )
+
+                async def _load_older_history(
+                    before_offset: int | None,
+                    *,
+                    session_key: str = s.key,
+                ) -> tuple[list[dict], int | None, bool]:
+                    older = await asyncio.to_thread(
+                        agent_loop.sessions.display_history_page,
+                        session_key,
+                        [],
+                        before_offset=before_offset,
+                        turn_limit=10,
+                    )
+                    return older.messages, older.before_offset, older.has_older
+
+                tui.set_history_page_loader(
+                    _load_older_history,
+                    before_offset=page.before_offset,
+                    has_older=page.has_older,
                 )
                 tui.set_todos(s.todos)
                 if agent_loop.context_window_tokens:
@@ -2387,6 +2413,8 @@ def agent(
             _pre_submitted: list[bool] = [False]
             _pending_transcript_ids: dict[str, str] = {}
             _turn_cancelled: list[bool] = [False]
+            _active_turn_request_id: list[str | None] = [None]
+            _cancel_in_progress: list[bool] = [False]
             _todo_bar_waiting_for_new_plan: list[bool] = [False]
 
             # Override signals so Ctrl+C / SIGTERM cleanly exit the TUI
@@ -2400,20 +2428,33 @@ def agent(
             if hasattr(signal, "SIGPIPE"):
                 signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
-            def _cancel_current() -> None:
+            async def _cancel_current() -> None:
                 nonlocal is_processing
-                if not is_processing:
+                if not is_processing or _cancel_in_progress[0]:
                     return
+                _cancel_in_progress[0] = True
                 _turn_cancelled[0] = True
-                session_key = f"{cli_channel}:{topic_state['chat_id']}"
-                tasks = agent_loop._active_tasks.get(session_key, [])
-                for task in list(tasks):
-                    task.cancel()
-                tui.flush_stream()
-                is_processing = False
-                tui.set_is_processing(False)
-                pending_queue.clear()
-                tui.add_system("已取消当前请求。")
+                _set_activity_phase("cancelling")
+                try:
+                    session_key = agent_loop._effective_session_key(InboundMessage(
+                        channel=cli_channel,
+                        sender_id="user",
+                        chat_id=topic_state["chat_id"],
+                        content="",
+                    ))
+                    await agent_loop.cancel_session_turn(
+                        session_key,
+                        request_id=_active_turn_request_id[0],
+                    )
+                finally:
+                    tui.flush_stream()
+                    is_processing = False
+                    tui.set_is_processing(False)
+                    pending_queue.clear()
+                    _active_turn_request_id[0] = None
+                    _cancel_in_progress[0] = False
+                    _set_activity_phase("idle")
+                    tui.add_system("已取消当前请求。")
 
             tui.set_on_cancel(_cancel_current)
 
@@ -2433,6 +2474,8 @@ def agent(
             async def _send_message(text: str) -> None:
                 nonlocal is_processing
                 _turn_cancelled[0] = False
+                request_id = uuid.uuid4().hex
+                _active_turn_request_id[0] = request_id
                 is_processing = True
                 tui.set_is_processing(True)
                 _set_activity_phase("prepare_turn")
@@ -2475,6 +2518,7 @@ def agent(
                         "_wants_stream": True,
                         "_user_transcript_id": _pending_transcript_ids.get("user"),
                         "_assistant_transcript_id": _pending_transcript_ids.get("assistant"),
+                        "_turn_request_id": request_id,
                     },
                 ))
 

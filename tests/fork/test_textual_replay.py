@@ -175,3 +175,132 @@ async def test_history_resets_assistant_header_once_per_user_turn() -> None:
 
     assert rendered.count("nanobot 2026-") == 2
     assert rendered.index("第二问") < rendered.index("read_file") < rendered.index("第二答")
+
+
+@pytest.mark.asyncio
+async def test_history_initial_limit_counts_complete_user_turns() -> None:
+    tui = TextualTUI(render_markdown=False)
+    messages = []
+    for turn in range(3):
+        messages.extend([
+            {"role": "user", "content": f"question-{turn}"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": f"c{turn}",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": f"c{turn}", "content": "ok"},
+            {"role": "assistant", "content": f"answer-{turn}"},
+        ])
+
+    async with tui._app.run_test() as pilot:
+        tui.load_session_history(messages, max_messages=2)
+        await pilot.pause()
+        rendered = "\n".join(strip.text for strip in tui._app.query_one("#output").lines)
+
+    assert "question-0" not in rendered
+    assert "question-1" in rendered and "answer-1" in rendered
+    assert "question-2" in rendered and "answer-2" in rendered
+
+
+@pytest.mark.asyncio
+async def test_older_history_page_prepends_and_preserves_view_anchor() -> None:
+    tui = TextualTUI(render_markdown=False)
+    initial = [
+        {"role": "user", "content": "new-question", "_transcript_id": "new-u"},
+        {"role": "assistant", "content": "new-answer", "_transcript_id": "new-a"},
+    ]
+    older = [
+        {"role": "user", "content": "old-question", "_transcript_id": "old-u"},
+        {"role": "assistant", "content": "old-answer", "_transcript_id": "old-a"},
+    ]
+    calls = []
+
+    async def loader(cursor):
+        calls.append(cursor)
+        return older, None, False
+
+    async with tui._app.run_test(size=(60, 12)) as pilot:
+        tui.load_session_history(initial)
+        out = tui._app.query_one("#output")
+        tui.set_history_page_loader(loader, before_offset=123, has_older=True)
+        out.scroll_to(y=0, animate=False, immediate=True, force=True)
+        old_new_line = out.message_start_line("new-u")
+        assert old_new_line is not None
+
+        out._notify_top_if_needed()
+        await pilot.pause()
+        await pilot.pause()
+
+        new_new_line = out.message_start_line("new-u")
+        old_line = out.message_start_line("old-u")
+        assert calls == [123]
+        assert old_line is not None and new_new_line is not None
+        assert old_line < new_new_line
+        assert int(out.scroll_offset.y) == new_new_line - old_new_line
+        rendered = "\n".join(strip.text for strip in out.lines)
+        assert rendered.index("old-question") < rendered.index("new-question")
+        assert not tui._history_has_older
+
+
+@pytest.mark.asyncio
+async def test_stale_older_page_is_ignored_after_topic_reset() -> None:
+    import asyncio
+
+    tui = TextualTUI(render_markdown=False)
+    release = asyncio.Event()
+
+    async def loader(cursor):
+        await release.wait()
+        return [{"role": "user", "content": "stale-topic"}], None, False
+
+    async with tui._app.run_test() as pilot:
+        tui.load_session_history([
+            {"role": "user", "content": "current-topic", "_transcript_id": "current"}
+        ])
+        out = tui._app.query_one("#output")
+        tui.set_history_page_loader(loader, before_offset=99, has_older=True)
+        out.scroll_to(y=0, animate=False, immediate=True, force=True)
+        out._notify_top_if_needed()
+        await pilot.pause()
+
+        tui.reset_history()
+        tui.load_session_history([
+            {"role": "user", "content": "next-topic", "_transcript_id": "next"}
+        ])
+        release.set()
+        await pilot.pause()
+        await pilot.pause()
+
+        rendered = "\n".join(strip.text for strip in out.lines)
+        assert "next-topic" in rendered
+        assert "stale-topic" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_programmatic_scroll_to_top_requests_older_history() -> None:
+    tui = TextualTUI(render_markdown=False)
+    called = []
+
+    async def loader(cursor):
+        called.append(cursor)
+        return [], None, False
+
+    async with tui._app.run_test(size=(50, 10)) as pilot:
+        tui.load_session_history([
+            {"role": "user", "content": "new\n" * 80, "_transcript_id": "new"}
+        ])
+        out = tui._app.query_one("#output")
+        tui.set_history_page_loader(loader, before_offset=7, has_older=True)
+        out.scroll_end(animate=False, immediate=True, force=True)
+        await pilot.pause()
+        assert out.scroll_offset.y > 0
+
+        out.scroll_to(y=0, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        await pilot.pause()
+
+        assert called == [7]

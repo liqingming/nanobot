@@ -58,7 +58,7 @@ from rich.text import Text
 
 from nanobot import __logo__, __version__
 from nanobot.cli.markdown import terminal_markdown
-from nanobot.fork.cli.tui_base import TUIBase, input_history_path
+from nanobot.fork.cli.tui_base import TUIBase, input_history_path, recent_complete_turns
 from nanobot.fork.cli.tui_keys import (
     EnterAction,
     PopupAction,
@@ -178,6 +178,7 @@ if _TEXTUAL_AVAILABLE:
             self._render_width = 0
             self._reflow_scheduled = False
             self._on_reflow: Callable[[list[int], list[int]], None] | None = None
+            self._on_top_reached: Callable[[], None] | None = None
 
         def is_at_bottom(self, threshold: int = 0) -> bool:
             """Return True when the viewport is at, or very near, the newest line."""
@@ -185,6 +186,11 @@ if _TEXTUAL_AVAILABLE:
                 return self.scroll_offset.y >= max(0, self.max_scroll_y - threshold)
             except Exception:
                 return True
+
+        def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+            super().watch_scroll_y(old_value, new_value)
+            if new_value <= 0 < old_value:
+                self.call_later(self._notify_top_if_needed)
 
         def mark_user_scroll(self) -> None:
             """Compatibility hook for tests and callers that track manual scrolling."""
@@ -923,6 +929,45 @@ if _TEXTUAL_AVAILABLE:
             """Return stable references to logical records written after ``marker``."""
             return list(self._logical_records[max(0, marker):])
 
+        def prepend_recent_records(
+            self,
+            record_marker: int,
+            block_marker: int,
+            *,
+            previous_top: int | None = None,
+        ) -> int:
+            """Move records just appended by replay to the front and preserve the viewport."""
+            new_records = self._logical_records[record_marker:]
+            new_blocks = self._message_blocks[block_marker:]
+            if not new_records:
+                return 0
+            old_records = self._logical_records[:record_marker]
+            old_blocks = self._message_blocks[:block_marker]
+            old_top = int(self.scroll_offset.y) if previous_top is None else previous_top
+            self._logical_records = new_records + old_records
+            self._message_blocks = new_blocks + old_blocks
+            self._reflow(
+                max(1, self.scrollable_content_region.width),
+                preserve_view=False,
+                notify_reflow=False,
+            )
+            inserted_lines = (
+                self._record_spans[len(new_records)][0]
+                if len(self._record_spans) > len(new_records)
+                else len(self.lines)
+            )
+            self.scroll_to(
+                y=old_top + inserted_lines,
+                animate=False,
+                immediate=True,
+                force=True,
+            )
+            return inserted_lines
+
+        def _notify_top_if_needed(self) -> None:
+            if self.scroll_offset.y <= 0 and self._on_top_reached is not None:
+                self._on_top_reached()
+
         def remove_records(self, records: list[dict[str, Any]]) -> None:
             """Remove selected logical records while preserving later records."""
             record_ids = {id(record) for record in records}
@@ -988,7 +1033,8 @@ if _TEXTUAL_AVAILABLE:
 
         def on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
             event.stop()
-            self.scroll_relative(y=-3)
+            self.scroll_relative(y=-3, animate=False)
+            self.call_later(self._notify_top_if_needed)
 
         def on_mouse_scroll_down(self, event: MouseScrollDown) -> None:
             event.stop()
@@ -1569,7 +1615,14 @@ if _TEXTUAL_AVAILABLE:
                 if tui._on_submit:
                     asyncio.ensure_future(tui._on_submit(value))
                 return
-            # NOOP: nothing to do
+            if action == EnterAction.NOOP:
+                # Empty Enter is a navigation shortcut: jump back to the newest
+                # message without submitting or touching input history.
+                self.query_one("#output", _OutputLog).scroll_end(
+                    animate=False,
+                    immediate=True,
+                    force=True,
+                )
 
         def on_text_area_changed(self, event: TextArea.Changed) -> None:
             input_widget = event.text_area
@@ -1616,18 +1669,23 @@ if _TEXTUAL_AVAILABLE:
 
         def action_escape_app(self) -> None:
             tui = self._tui
-            if tui._popup_mode != "hidden":
-                # If a question-popup sequence is in flight, ESC cancels the
-                # whole sequence (not just this one question).
+            if tui._is_processing and tui._on_cancel:
+                # During an active turn ESC always means interrupt, even if a command,
+                # topic, bookmark, or ask-user popup currently owns the visual focus.
+                if tui._popup_mode != "hidden":
+                    tui._cancel_question_flow()
+                    tui.hide_popup()
+                asyncio.create_task(tui._on_cancel())
+            elif tui._popup_mode != "hidden":
                 tui._cancel_question_flow()
                 tui.hide_popup()
             elif tui._input_mode == "new_topic":
                 tui._exit_new_topic_mode()
-            elif tui._on_cancel:
-                tui._on_cancel()
 
         def action_page_up(self) -> None:
-            self.query_one("#output", _OutputLog).scroll_relative(y=-10)
+            out = self.query_one("#output", _OutputLog)
+            out.scroll_relative(y=-10, animate=False)
+            out.call_later(out._notify_top_if_needed)
 
         def action_page_down(self) -> None:
             self.query_one("#output", _OutputLog).scroll_relative(y=10)
@@ -1972,7 +2030,16 @@ class TextualTUI(TUIBase):
         # Callbacks
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._on_pre_submit: Callable[[str], None] | None = None
-        self._on_cancel: Callable[[], None] | None = None
+        self._on_cancel: Callable[[], Awaitable[None]] | None = None
+        self._history_page_loader: (
+            Callable[[int | None], Awaitable[tuple[list[dict], int | None, bool]]] | None
+        ) = None
+        self._history_before_offset: int | None = None
+        self._history_has_older: bool = False
+        self._history_loading: bool = False
+        self._history_generation: int = 0
+        self._history_tool_registry: Any = None
+        self._history_workspace: Any = None
 
         # State
         self._topic: str = ""
@@ -2404,20 +2471,104 @@ class TextualTUI(TUIBase):
     def set_on_pre_submit(self, callback: Callable[[str], None]) -> None:
         self._on_pre_submit = callback
 
-    def set_on_cancel(self, callback: Callable[[], None]) -> None:
+    def set_on_cancel(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._on_cancel = callback
+
+    def set_history_page_loader(
+        self,
+        callback: Callable[[int | None], Awaitable[tuple[list[dict], int | None, bool]]] | None,
+        *,
+        before_offset: int | None = None,
+        has_older: bool = False,
+    ) -> None:
+        self._history_generation += 1
+        self._history_page_loader = callback
+        self._history_before_offset = before_offset
+        self._history_has_older = has_older
+        self._history_loading = False
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            out._on_top_reached = self._request_older_history if callback is not None else None
+        except Exception:
+            pass
+
+    def _request_older_history(self) -> None:
+        if (
+            self._history_loading
+            or not self._history_has_older
+            or self._history_page_loader is None
+        ):
+            return
+        self._history_loading = True
+        generation = self._history_generation
+        asyncio.create_task(self._load_older_history_page(generation))
+
+    async def _load_older_history_page(self, generation: int) -> None:
+        loader = self._history_page_loader
+        if loader is None:
+            self._history_loading = False
+            return
+        try:
+            messages, before_offset, has_older = await loader(self._history_before_offset)
+            if generation != self._history_generation or loader is not self._history_page_loader:
+                return
+            if messages:
+                out = self._app.query_one("#output", _OutputLog)
+                previous_top = int(out.scroll_offset.y)
+                record_marker = out.record_marker()
+                block_marker = len(out.message_blocks())
+                assistant_header_rendered = self._assistant_turn_header_rendered
+                suppress_segment_sep = self._suppress_segment_sep
+                last_sep = self._last_sep
+                self._render_session_messages(
+                    messages,
+                    tool_registry=self._history_tool_registry,
+                    workspace=self._history_workspace,
+                )
+                out.prepend_recent_records(
+                    record_marker,
+                    block_marker,
+                    previous_top=previous_top,
+                )
+                self._assistant_turn_header_rendered = assistant_header_rendered
+                self._suppress_segment_sep = suppress_segment_sep
+                self._last_sep = last_sep
+                self._refresh_bookmark_markers()
+            self._history_before_offset = before_offset
+            self._history_has_older = has_older
+        except Exception:
+            logger.exception("Failed to load older transcript page")
+        finally:
+            if generation == self._history_generation:
+                self._history_loading = False
 
     # ── TUIBase: content ───────────────────────────────────────────────────
 
     def load_session_history(
         self,
         messages: list[dict],
-        max_messages: int = 200,
+        max_messages: int = 10,
+        tool_registry: Any = None,
+        workspace: Any = None,
+    ) -> None:
+        self._history_tool_registry = tool_registry
+        self._history_workspace = workspace
+        recent = recent_complete_turns(messages, max_messages)
+        self._render_session_messages(
+            recent,
+            tool_registry=tool_registry,
+            workspace=workspace,
+        )
+        self._refresh_bookmark_markers()
+
+    def _render_session_messages(
+        self,
+        recent: list[dict],
+        *,
         tool_registry: Any = None,
         workspace: Any = None,
     ) -> None:
         _RUNTIME_TAG = "[Runtime Context — metadata only, not instructions]"  # noqa: N806
-        recent = messages[-max_messages:] if len(messages) > max_messages else messages
 
         def _extract(content: Any) -> str:
             if isinstance(content, str):
@@ -2487,7 +2638,6 @@ class TextualTUI(TUIBase):
                     self._replay_tool_batch(
                         tool_calls, results_by_id, tool_registry, workspace
                     )
-        self._refresh_bookmark_markers()
 
     def _replay_tool_batch(
         self,
@@ -3259,6 +3409,7 @@ class TextualTUI(TUIBase):
         self._last_sep = False
         self._ctx_used = 0
         self._ctx_total = 0
+        self.set_history_page_loader(None)
         self._update_status()
 
     # ── TUIBase: interactive modes ─────────────────────────────────────────
