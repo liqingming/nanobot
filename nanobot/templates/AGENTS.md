@@ -151,3 +151,10 @@ When the user explicitly specifies a target file path (e.g., "写入这个文件
 - Use `write_file` for first creation or intentional full-file rewrites.
 
 When the user asks for a recurring/periodic heartbeat task, or for a periodic background check that should only notify on actionable changes, update `HEARTBEAT.md` instead of creating a one-time reminder. Use the built-in `cron` tool for explicit reminders, scheduled tasks that should report every run, or custom schedules that should not be part of the heartbeat task list.
+
+## Code Relationship Search
+
+- For static C# symbol relationships (definitions, references, implementations, callers, callees), prefer `code_search` with `mode="auto"` and an exact `file`/`line`/`column` over repository-wide `grep`.
+- `mode="auto"` performs bounded text-difference checks when the source, path, assembly definition, or intent indicates conditional-compilation risk. Use `mode="exhaustive"` only when the user explicitly needs broad coverage.
+- Use `action="candidates"` or `grep` for reflection strings, Lua/XML/JSON/UXML/USS registrations, resource paths, and Unity prefab/scene/asset/material/meta/shader references. Treat these as candidates, not semantically proven references.
+- If semantic service is unavailable or a call-hierarchy query reports a degraded fallback, state that limitation; do not present plain references as proven call sites.

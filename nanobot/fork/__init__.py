@@ -21,6 +21,7 @@ populate it as files migrate from the core tree.
 # ``register_fork_tool(...)`` call at the bottom of the file.
 from nanobot.fork.agent.tools import (  # noqa: F401
     ask_user,
+    code_search,
     memory_search,
     skill,
     todo,

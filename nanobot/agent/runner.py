@@ -1236,11 +1236,11 @@ class AgentRunner:
         else:
             coro = self.provider.chat_with_retry(**kwargs)
 
-        # Streaming requests already have provider-level idle timeouts
-        # (NANOBOT_STREAM_IDLE_TIMEOUT_S). Do not also apply the outer wall-clock
-        # LLM timeout here, or healthy long reasoning streams can be killed just
-        # because total elapsed time exceeded NANOBOT_LLM_TIMEOUT_S.
-        outer_timeout_s = None if (wants_streaming or wants_progress_streaming) else timeout_s
+        # Provider-level stream idle timeouts only detect a complete lack of events.
+        # A broken SSE connection may keep emitting protocol events without ever completing,
+        # so apply the finite wall-clock cap to streaming requests as well. Sustained goals
+        # can still opt out explicitly by passing llm_timeout_s=0.
+        outer_timeout_s = timeout_s
         self._log_event(
             spec,
             "runner.model.request",

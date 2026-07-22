@@ -402,6 +402,15 @@ def _lazy_default(module_path: str, class_name: str) -> Any:
     return getattr(module, class_name)()
 
 
+class CodeIntelligenceConfig(Base):
+    """Optional stdio LSP backend used by the semantic code_search tool."""
+
+    enabled: bool = False
+    command: list[str] = Field(default_factory=list)
+    startup_timeout_seconds: float = Field(default=60, gt=0, le=600)
+    request_timeout_seconds: float = Field(default=20, gt=0, le=300)
+
+
 class ToolsConfig(Base):
     """Tools configuration.
 
@@ -418,6 +427,7 @@ class ToolsConfig(Base):
     image_generation: ImageGenerationToolConfig = Field(
         default_factory=lambda: _lazy_default("nanobot.agent.tools.image_generation", "ImageGenerationToolConfig"),
     )
+    code_intelligence: CodeIntelligenceConfig = Field(default_factory=CodeIntelligenceConfig)
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
     webui_allow_local_service_access: bool = Field(
         default=True,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import os
 import time
 import uuid
@@ -1584,6 +1585,15 @@ class AgentLoop:
             print(f"正在完成 {len(self._background_tasks)} 个后台任务（记忆整理等），请稍候…")
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
+        code_search_tool = self.tools.get("code_search")
+        close_code_search = getattr(code_search_tool, "aclose", None)
+        if callable(close_code_search):
+            try:
+                result = close_code_search()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug("code_search cleanup error", exc_info=True)
         from nanobot.agent.tools.exec_session import DEFAULT_EXEC_SESSION_MANAGER
         await DEFAULT_EXEC_SESSION_MANAGER.shutdown()
         from nanobot.agent.tools.managed_process import shutdown_managed_tasks

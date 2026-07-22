@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -188,7 +188,7 @@ async def test_runner_times_out_hung_llm_request():
 
 
 @pytest.mark.asyncio
-async def test_runner_does_not_apply_outer_wall_timeout_to_streaming_requests():
+async def test_runner_allows_healthy_streaming_within_wall_timeout():
     from nanobot.agent.hook import AgentHook, AgentHookContext
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
@@ -215,23 +215,55 @@ async def test_runner_does_not_apply_outer_wall_timeout_to_streaming_requests():
             streamed.append(delta)
 
     runner = AgentRunner(provider)
-    wait_for = AsyncMock(side_effect=AssertionError("streaming path must not use wait_for"))
-    with patch("nanobot.agent.runner.asyncio.wait_for", wait_for):
-        result = await runner.run(AgentRunSpec(
-            initial_messages=[{"role": "user", "content": "think for a while"}],
-            tools=tools,
-            model="test-model",
-            max_iterations=1,
-            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-            hook=StreamingHook(),
-            llm_timeout_s=0.01,
-        ))
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "think for a while"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        hook=StreamingHook(),
+        llm_timeout_s=1,
+    ))
 
     assert result.stop_reason == "completed"
     assert result.final_content == "still alive"
     assert streamed == ["still ", "alive"]
     provider.chat_with_retry.assert_not_awaited()
-    wait_for.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runner_times_out_hung_streaming_request():
+    from nanobot.agent.hook import AgentHook
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock(spec=LLMProvider)
+
+    async def chat_stream_with_retry(**kwargs):
+        await asyncio.sleep(3600)
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+    runner = AgentRunner(provider)
+    started = time.monotonic()
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        hook=StreamingHook(),
+        llm_timeout_s=0.05,
+    ))
+
+    assert (time.monotonic() - started) < 1.0
+    assert result.stop_reason == "error"
+    assert "timed out after 0.05s" in (result.final_content or "").lower()
 
 
 @pytest.mark.asyncio

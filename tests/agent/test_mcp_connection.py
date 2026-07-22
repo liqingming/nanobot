@@ -492,3 +492,23 @@ async def test_concurrent_mcp_reconnect_reuses_fresh_session(
     assert outputs == ["fresh:alpha", "fresh:beta"]
     assert connect_count == 2
     assert closed == ["remote"]
+
+
+@pytest.mark.asyncio
+async def test_close_mcp_also_closes_code_search_tool(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from nanobot.agent.loop import AgentLoop
+
+    loop = object.__new__(AgentLoop)
+    loop._background_tasks = []
+    loop._mcp_stacks = {}
+    loop.tools = MagicMock()
+    code_search = MagicMock()
+    code_search.aclose = AsyncMock()
+    loop.tools.get.return_value = code_search
+
+    await loop.close_mcp()
+
+    loop.tools.get.assert_called_once_with("code_search")
+    code_search.aclose.assert_awaited_once()
