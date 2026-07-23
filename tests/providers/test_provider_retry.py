@@ -890,3 +890,118 @@ async def test_chat_stream_with_retry_normalizes_explicit_none_max_tokens() -> N
     assert response.content == "ok"
     assert provider.last_kwargs["max_tokens"] == 4096
     assert provider.last_kwargs["temperature"] == 0.7
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_with_retry_recovers_transient_server_error_after_content(
+    monkeypatch,
+) -> None:
+    first = LLMResponse(
+        content="Codex response failed with server_error",
+        finish_reason="error",
+        error_kind="server",
+        error_type="server_error",
+        error_code="server_error",
+        error_should_retry=True,
+    )
+    first._test_stream_delta = "partial"  # type: ignore[attr-defined]
+    second = LLMResponse(content="full retry response")
+    second._test_stream_delta = "full retry response"  # type: ignore[attr-defined]
+    provider = ScriptedProvider([first, second])
+    deltas: list[str] = []
+    recoveries: list[str] = []
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    async def _on_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    async def _on_stream_recover() -> None:
+        recoveries.append("recover")
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=_on_delta,
+        on_stream_recover=_on_stream_recover,
+    )
+
+    assert response.content == "full retry response"
+    assert response.finish_reason == "stop"
+    assert provider.calls == 2
+    assert deltas == ["partial", "full retry response"]
+    assert recoveries == ["recover"]
+    assert delays == [1]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_with_retry_does_not_recover_non_transient_error_after_content(
+    monkeypatch,
+) -> None:
+    first = LLMResponse(
+        content="invalid request",
+        finish_reason="error",
+        error_kind="request",
+        error_should_retry=False,
+    )
+    first._test_stream_delta = "partial"  # type: ignore[attr-defined]
+    provider = ScriptedProvider([first, LLMResponse(content="unexpected retry")])
+    recoveries: list[str] = []
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    async def _on_stream_recover() -> None:
+        recoveries.append("recover")
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    async def _on_delta(_delta: str) -> None:
+        return None
+
+    response = await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=_on_delta,
+        on_stream_recover=_on_stream_recover,
+    )
+
+    assert response.content == "invalid request"
+    assert provider.calls == 1
+    assert recoveries == []
+    assert delays == []
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_with_retry_skips_transient_retry_after_content_without_recovery(
+    monkeypatch,
+) -> None:
+    first = LLMResponse(
+        content="Codex response failed with server_error",
+        finish_reason="error",
+        error_kind="server",
+        error_should_retry=True,
+    )
+    first._test_stream_delta = "partial"  # type: ignore[attr-defined]
+    provider = ScriptedProvider([first, LLMResponse(content="unexpected retry")])
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    async def _on_delta(_delta: str) -> None:
+        return None
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=_on_delta,
+    )
+
+    assert response.content == "Codex response failed with server_error"
+    assert provider.calls == 1
+    assert delays == []

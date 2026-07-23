@@ -1020,23 +1020,23 @@ class LLMProvider(ABC):
             last_response = response
             if should_retry_guard is not None and not should_retry_guard():
                 is_timeout = (response.error_kind or "").lower() == "timeout"
-                if is_timeout:
-                    if on_stream_recover:
-                        logger.warning(
-                            "LLM stream stalled after content was emitted; "
-                            "starting a new stream segment and retrying"
-                        )
-                        await on_stream_recover()
-                    else:
-                        logger.warning(
-                            "LLM stream stalled after content was emitted; "
-                            "suppressing delta callbacks and retrying"
-                        )
-                        kw.setdefault("on_content_delta", None)
-                        kw["on_content_delta"] = None
-                        kw["on_thinking_delta"] = None
-                        kw["on_tool_call_delta"] = None
-                        should_retry_guard = None
+                is_transient = self._is_transient_response(response)
+                if on_stream_recover and is_transient:
+                    logger.warning(
+                        "LLM stream failed with a transient error after content was emitted; "
+                        "starting a new stream segment and retrying"
+                    )
+                    await on_stream_recover()
+                elif is_timeout:
+                    logger.warning(
+                        "LLM stream stalled after content was emitted; "
+                        "suppressing delta callbacks and retrying"
+                    )
+                    kw.setdefault("on_content_delta", None)
+                    kw["on_content_delta"] = None
+                    kw["on_thinking_delta"] = None
+                    kw["on_tool_call_delta"] = None
+                    should_retry_guard = None
                 else:
                     logger.warning(
                         "LLM stream failed after content was emitted; skipping retry"
