@@ -1469,3 +1469,157 @@ async def test_empty_enter_jumps_output_to_bottom_without_submitting() -> None:
         assert output.is_at_bottom()
         assert submitted == []
         assert tui._app.query_one("#input").value == ""
+
+
+@pytest.mark.asyncio
+async def test_ctrl_arrows_navigate_only_loaded_user_messages_without_editing_input() -> None:
+    tui = TextualTUI(render_markdown=False)
+    messages: list[dict] = []
+    for index in range(1, 5):
+        messages.extend([
+            {
+                "role": "user",
+                "content": f"user message {index}",
+                "timestamp": f"2026-07-23T10:0{index}:00",
+                "_transcript_id": f"user-{index}",
+            },
+            {
+                "role": "assistant",
+                "content": (f"assistant response {index} " * 12).strip(),
+                "timestamp": f"2026-07-23T10:0{index}:01",
+                "_transcript_id": f"assistant-{index}",
+            },
+        ])
+
+    async with tui._app.run_test(size=(60, 14)) as pilot:
+        tui._app.clear_output()
+        tui.load_session_history(messages)
+        tui._app.set_input_value("draft stays here")
+        output = tui._app.query_one("#output")
+        output.scroll_end(animate=False, immediate=True, force=True)
+        await pilot.pause()
+
+        assert [message_id for message_id, _line in output.user_message_targets()] == [
+            "user-1", "user-2", "user-3", "user-4",
+        ]
+
+        # At the first loaded message, previous is a no-op rather than wrapping.
+        output.scroll_to(y=0, animate=False, immediate=True, force=True)
+        output.reset_user_navigation()
+        await pilot.press("ctrl+up")
+        await pilot.pause()
+        assert output._user_navigation_id is None
+
+        output.scroll_end(animate=False, immediate=True, force=True)
+        await pilot.press("ctrl+up")
+        await pilot.pause()
+        assert output._user_navigation_id == "user-4"
+        first_position = output.scroll_offset.y
+
+        await pilot.press("ctrl+up")
+        await pilot.pause()
+        assert output._user_navigation_id == "user-3"
+        assert output.scroll_offset.y < first_position
+
+        await pilot.press("ctrl+down")
+        await pilot.pause()
+        assert output._user_navigation_id == "user-4"
+
+        # The last boundary does not wrap, and navigation never edits input text.
+        await pilot.press("ctrl+down")
+        await pilot.pause()
+        assert output._user_navigation_id == "user-4"
+        assert tui._app.query_one("#input").value == "draft stays here"
+
+
+@pytest.mark.asyncio
+async def test_user_message_navigation_stops_at_first_message_and_survives_reflow() -> None:
+    tui = TextualTUI(render_markdown=False)
+    messages = [
+        {
+            "role": role,
+            "content": (f"{role} {index} 中文长内容 " * 8).strip(),
+            "timestamp": f"2026-07-23T11:0{index}:00",
+            "_transcript_id": f"{role}-{index}",
+        }
+        for index in range(1, 4)
+        for role in ("user", "assistant")
+    ]
+
+    async with tui._app.run_test(size=(80, 14)) as pilot:
+        tui._app.clear_output()
+        tui.load_session_history(messages)
+        output = tui._app.query_one("#output")
+        output.scroll_end(animate=False, immediate=True, force=True)
+        await pilot.pause()
+
+        for _ in range(5):
+            await pilot.press("ctrl+up")
+            await pilot.pause()
+        assert output._user_navigation_id == "user-1"
+
+        await pilot.resize_terminal(48, 14)
+        await pilot.pause()
+        targets = dict(output.user_message_targets())
+        assert output._user_navigation_id == "user-1"
+        assert output.scroll_offset.y <= targets["user-1"]
+
+        await pilot.press("ctrl+down")
+        await pilot.pause()
+        assert output._user_navigation_id == "user-2"
+
+
+@pytest.mark.asyncio
+async def test_user_message_navigation_includes_prepended_history_page() -> None:
+    tui = TextualTUI(render_markdown=False)
+    recent = [
+        {
+            "role": "user",
+            "content": "recent user",
+            "timestamp": "2026-07-23T12:02:00",
+            "_transcript_id": "user-recent",
+        },
+        {
+            "role": "assistant",
+            "content": "recent assistant " * 30,
+            "timestamp": "2026-07-23T12:02:01",
+            "_transcript_id": "assistant-recent",
+        },
+    ]
+    older = [
+        {
+            "role": "user",
+            "content": "older user",
+            "timestamp": "2026-07-23T12:01:00",
+            "_transcript_id": "user-older",
+        },
+        {
+            "role": "assistant",
+            "content": "older assistant",
+            "timestamp": "2026-07-23T12:01:01",
+            "_transcript_id": "assistant-older",
+        },
+    ]
+
+    async def load_older(_before_offset):
+        return older, None, False
+
+    async with tui._app.run_test(size=(60, 12)) as pilot:
+        tui._app.clear_output()
+        tui.load_session_history(recent)
+        tui.set_history_page_loader(load_older, before_offset=2, has_older=True)
+        output = tui._app.query_one("#output")
+        output.scroll_to(y=0, animate=False, immediate=True, force=True)
+        tui._request_older_history()
+        await pilot.pause()
+        await pilot.pause()
+
+        assert [message_id for message_id, _line in output.user_message_targets()] == [
+            "user-older", "user-recent",
+        ]
+        output.scroll_end(animate=False, immediate=True, force=True)
+        output.reset_user_navigation()
+        await pilot.press("ctrl+up")
+        await pilot.press("ctrl+up")
+        await pilot.pause()
+        assert output._user_navigation_id == "user-older"

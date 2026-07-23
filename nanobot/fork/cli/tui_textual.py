@@ -174,6 +174,7 @@ if _TEXTUAL_AVAILABLE:
             self._bookmark_highlight: tuple[int, int] | None = None
             self._bookmark_entries: list[dict[str, Any]] = []
             self._bookmark_lines: set[int] = set()
+            self._user_navigation_id: str | None = None
             self._record_writes = True
             self._render_width = 0
             self._reflow_scheduled = False
@@ -388,6 +389,7 @@ if _TEXTUAL_AVAILABLE:
                 self._message_blocks.clear()
                 self._active_message_block = None
                 self._bookmark_highlight = None
+                self._user_navigation_id = None
             return super().clear()
 
         def on_resize(self, event: Any) -> None:
@@ -757,6 +759,55 @@ if _TEXTUAL_AVAILABLE:
 
         def message_blocks(self) -> list[dict[str, Any]]:
             return list(self._message_blocks)
+
+        def reset_user_navigation(self) -> None:
+            self._user_navigation_id = None
+
+        def user_message_targets(self) -> list[tuple[str, int]]:
+            """Return loaded user messages in display order with current start lines."""
+            targets: list[tuple[str, int]] = []
+            for block in self._message_blocks:
+                if block.get("role") != "user":
+                    continue
+                message_id = str(block.get("id", ""))
+                line = self.message_start_line(message_id)
+                if message_id and line is not None:
+                    targets.append((message_id, line))
+            return targets
+
+        def jump_user_message(self, direction: int) -> int | None:
+            """Jump to the previous/next loaded user message without wrapping."""
+            targets = self.user_message_targets()
+            if not targets or direction == 0:
+                return None
+            ids = [message_id for message_id, _line in targets]
+            if self._user_navigation_id in ids:
+                current = ids.index(self._user_navigation_id)
+                target_index = current - 1 if direction < 0 else current + 1
+            else:
+                viewport_top = int(self.scroll_offset.y)
+                if direction < 0:
+                    candidates = [
+                        index for index, (_message_id, line) in enumerate(targets)
+                        if line < viewport_top
+                    ]
+                    if not candidates:
+                        return None
+                    target_index = candidates[-1]
+                else:
+                    candidates = [
+                        index for index, (_message_id, line) in enumerate(targets)
+                        if line > viewport_top
+                    ]
+                    if not candidates:
+                        return None
+                    target_index = candidates[0]
+            if not 0 <= target_index < len(targets):
+                return None
+            message_id, line = targets[target_index]
+            self._user_navigation_id = message_id
+            self.scroll_to(y=line, animate=False, immediate=True, force=True)
+            return line
 
         def message_start_line(self, message_id: str) -> int | None:
             for block in self._message_blocks:
@@ -1400,6 +1451,8 @@ if _TEXTUAL_AVAILABLE:
             Binding("escape", "escape_app", show=False, priority=True),
             Binding("pageup", "page_up", show=False),
             Binding("pagedown", "page_down", show=False),
+            Binding("ctrl+up", "previous_user_message", show=False, priority=True),
+            Binding("ctrl+down", "next_user_message", show=False, priority=True),
             Binding("ctrl+b", "toggle_bookmark", show=False, priority=True),
             Binding("f6", "previous_bookmark", show=False, priority=True),
         ]
@@ -1547,6 +1600,7 @@ if _TEXTUAL_AVAILABLE:
             out.write("")
             out.write("[bold]快捷键[/bold]")
             out.write("  [cyan]PageUp / PageDown[/cyan]   滚动历史记录")
+            out.write("  [cyan]Ctrl+↑ / Ctrl+↓[/cyan]    跳转上一条/下一条用户消息")
             out.write("  [cyan]↑ / ↓[/cyan]              切换输入历史")
             out.write("  [cyan]ESC[/cyan]                取消当前请求")
             out.write("  [cyan]Ctrl+B[/cyan]             添加/删除当前位置书签")
@@ -1684,17 +1738,30 @@ if _TEXTUAL_AVAILABLE:
 
         def action_page_up(self) -> None:
             out = self.query_one("#output", _OutputLog)
+            out.reset_user_navigation()
             out.scroll_relative(y=-10, animate=False)
             out.call_later(out._notify_top_if_needed)
 
         def action_page_down(self) -> None:
-            self.query_one("#output", _OutputLog).scroll_relative(y=10)
+            out = self.query_one("#output", _OutputLog)
+            out.reset_user_navigation()
+            out.scroll_relative(y=10)
+
+        def action_previous_user_message(self) -> None:
+            self.query_one("#output", _OutputLog).jump_user_message(-1)
+
+        def action_next_user_message(self) -> None:
+            self.query_one("#output", _OutputLog).jump_user_message(1)
 
         def on_mouse_scroll_up(self) -> None:
-            self.query_one("#output", _OutputLog).scroll_relative(y=-3)
+            out = self.query_one("#output", _OutputLog)
+            out.reset_user_navigation()
+            out.scroll_relative(y=-3)
 
         def on_mouse_scroll_down(self) -> None:
-            self.query_one("#output", _OutputLog).scroll_relative(y=3)
+            out = self.query_one("#output", _OutputLog)
+            out.reset_user_navigation()
+            out.scroll_relative(y=3)
 
         # ── spinner ────────────────────────────────────────────────────────
 
@@ -2677,6 +2744,10 @@ class TextualTUI(TUIBase):
 
     def add_user_echo(self, text: str, *, message_id: str | None = None) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self._app.query_one("#output", _OutputLog).reset_user_navigation()
+        except Exception:
+            pass
         self._append_sep()
         self._write_user(text, ts, message_id=message_id)
 
