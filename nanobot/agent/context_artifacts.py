@@ -345,6 +345,8 @@ def render_active_context(
     *,
     workspace: Path | None = None,
     legacy_summary: str | None = None,
+    todos: list[dict[str, Any]] | None = None,
+    resume_request: bool = False,
 ) -> str:
     contract = task_contract_from_metadata(metadata, workspace=workspace)
     state = ContextState.from_metadata(metadata)
@@ -353,7 +355,19 @@ def render_active_context(
         if item.state in {"accepted", "active", "blocked", "waiting_user"}
     ][-_MAX_DECISIONS:]
     summary = _clean_text(legacy_summary, 5000)
-    if contract is None and not active_decisions and not summary:
+    unresolved_todos = [
+        item for item in (todos or [])
+        if isinstance(item, dict) and item.get("status") in {"pending", "in_progress"}
+    ]
+    completed_goal = parse_goal_state(goal_state_raw(metadata)) if resume_request else None
+    if not isinstance(completed_goal, dict) or completed_goal.get("status") != "completed":
+        completed_goal = None
+    if (
+        contract is None
+        and not active_decisions
+        and not summary
+        and not resume_request
+    ):
         return ""
     lines = [_ACTIVE_CONTEXT_OPEN, f"schema: {_SCHEMA_VERSION}"]
     if workspace:
@@ -372,6 +386,28 @@ def render_active_context(
             f"(source={item.source}, confidence={item.confidence})"
             for item in active_decisions
         )
+    if resume_request:
+        lines.append("resume.request: ambiguous")
+        if completed_goal:
+            lines.append("resume.last_goal.status: completed")
+            objective = _clean_text(completed_goal.get("objective"), 2000)
+            recap = _clean_text(completed_goal.get("recap"), 2000)
+            if objective:
+                lines.extend(["resume.last_goal.objective:", objective])
+            if recap:
+                lines.extend(["resume.last_goal.recap:", recap])
+        if unresolved_todos:
+            lines.append("resume.unresolved_todos:")
+            lines.extend(
+                f"- [{item.get('status')}] {_clean_text(item.get('content'), 500)}"
+                for item in unresolved_todos
+            )
+        if contract is None:
+            lines.append(
+                "resume.guard: no active sustained goal; use only the structured unresolved "
+                "items above, otherwise ask the user to choose; do not infer a new objective "
+                "from prose history or search failure."
+            )
     if summary:
         lines.extend(["legacy_continuation:", summary])
     lines.append(_ACTIVE_CONTEXT_CLOSE)

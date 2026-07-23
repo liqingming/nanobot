@@ -404,6 +404,7 @@ class ContextBuilder:
         sender_id: str | None = None,
         session_summary: str | None = None,
         session_metadata: Mapping[str, Any] | None = None,
+        resume_request: bool = False,
         current_runtime_lines: Sequence[str] | None = None,
         workspace: Path | None = None,
         runtime_state: Any | None = None,
@@ -419,6 +420,8 @@ class ContextBuilder:
             session_metadata,
             workspace=root,
             legacy_summary=session_summary,
+            todos=todos,
+            resume_request=resume_request,
         )
         extra = [] if active_context else [*goal_state_runtime_lines(session_metadata)]
         if runtime_state is not None and inbound_message is not None:

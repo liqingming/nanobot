@@ -20,6 +20,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import RuntimeEventBus
 from nanobot.session.goal_state import GOAL_STATE_KEY
 from nanobot.session.manager import SessionManager
+from nanobot.session.resume_state import AMBIGUOUS_RESUME_META_KEY
 from nanobot.session.webui_turns import WebuiTurnCoordinator
 
 
@@ -241,3 +242,78 @@ async def test_await_user_input_marks_active_goal_without_completing_it(tmp_path
     assert blob["status"] == "active"
     assert blob["awaiting_user_input"] is True
     assert blob["awaiting_user_input_reason"] == "Reply start phase one"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_resume_cannot_start_guessed_goal_after_completed_goal(tmp_path):
+    sm = SessionManager(tmp_path)
+    lt, cg = _tools(sm)
+    await lt.execute(goal="Build the overview")
+    await cg.execute(recap="Overview completed")
+
+    lt.set_context(RequestContext(
+        channel="websocket",
+        chat_id="c1",
+        session_key="websocket:c1",
+        metadata={AMBIGUOUS_RESUME_META_KEY: True},
+    ))
+    out = await lt.execute(goal="Guess that BinaryAddressableProvider is next")
+
+    assert "ambiguous resume request" in out
+    assert sm.get_or_create("websocket:c1").metadata[GOAL_STATE_KEY]["status"] == "completed"
+    assert "BinaryAddressableProvider" not in str(
+        sm.get_or_create("websocket:c1").metadata[GOAL_STATE_KEY]
+    )
+
+
+@pytest.mark.asyncio
+async def test_named_new_goal_is_allowed_after_completed_goal(tmp_path):
+    sm = SessionManager(tmp_path)
+    lt, cg = _tools(sm)
+    await lt.execute(goal="Old goal")
+    await cg.execute(recap="Done")
+
+    out = await lt.execute(goal="Explicitly requested new goal")
+
+    assert "Goal recorded" in out
+    assert sm.get_or_create("websocket:c1").metadata[GOAL_STATE_KEY]["objective"] == (
+        "Explicitly requested new goal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_goal_rejects_unresolved_todos(tmp_path):
+    sm = SessionManager(tmp_path)
+    lt, cg = _tools(sm)
+    await lt.execute(goal="Finish all tracked work")
+    session = sm.get_or_create("websocket:c1")
+    session.todos = [{"content": "Write final diagram", "status": "in_progress"}]
+    sm.save(session)
+
+    out = await cg.execute(recap="Done")
+
+    assert "todos remain unresolved" in out
+    assert sm.get_or_create("websocket:c1").metadata[GOAL_STATE_KEY]["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_resume_guard_survives_search_failure(tmp_path):
+    sm = SessionManager(tmp_path)
+    lt, cg = _tools(sm)
+    await lt.execute(goal="Completed source study")
+    await cg.execute(recap="Study complete")
+
+    # A failed history lookup must not authorize a guessed replacement goal;
+    # the guard is attached to the inbound request context, not search output.
+    lt.set_context(RequestContext(
+        channel="websocket",
+        chat_id="c1",
+        session_key="websocket:c1",
+        metadata={AMBIGUOUS_RESUME_META_KEY: True, "history_search_result": "not found"},
+    ))
+    out = await lt.execute(goal="Guessed next study topic")
+
+    assert "Do not call long_task" in out
+    assert sm.get_or_create("websocket:c1").metadata[GOAL_STATE_KEY]["objective"] == (
+        "Completed source study"
+    )

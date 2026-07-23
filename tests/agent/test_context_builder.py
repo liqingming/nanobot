@@ -632,3 +632,28 @@ def test_build_system_prompt_uses_request_workspace_claude_skills(tmp_path):
 
     assert "request_skill" in prompt
     assert "Request workspace skill" in prompt
+
+
+def test_build_messages_injects_resume_guard_and_unresolved_todos(tmp_path) -> None:
+    builder = _builder(tmp_path)
+    messages = builder.build_messages(
+        [],
+        "继续中断任务",
+        channel="cli",
+        chat_id="resume",
+        session_metadata={
+            GOAL_STATE_KEY: {
+                "status": "completed",
+                "objective": "Previous completed objective",
+                "recap": "Completed with one documented follow-up.",
+            }
+        },
+        todos=[{"content": "Finish documented follow-up", "status": "pending"}],
+        resume_request=True,
+    )
+
+    user_msg = str(messages[-1]["content"])
+    system_msg = str(messages[0]["content"])
+    assert "resume.last_goal.status: completed" in user_msg
+    assert "Finish documented follow-up" in user_msg
+    assert "# Active Todos" in system_msg

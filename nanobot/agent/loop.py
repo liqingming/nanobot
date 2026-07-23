@@ -87,6 +87,10 @@ from nanobot.session.manager import (
     SessionManager,
     replay_max_messages_for_context,
 )
+from nanobot.session.resume_state import (
+    AMBIGUOUS_RESUME_META_KEY,
+    is_ambiguous_resume_request,
+)
 from nanobot.triggers.local_turns import LocalTriggerTurnCoordinator
 from nanobot.utils.document import extract_documents, reference_non_image_attachments
 from nanobot.utils.helpers import image_placeholder_text
@@ -656,12 +660,13 @@ class AgentLoop:
             chat_id,
             unified_session=self._unified_session,
         )
+        request_metadata = dict(metadata or {})
         request_ctx = RequestContext(
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
             session_key=effective_key,
-            metadata=dict(metadata or {}),
+            metadata=request_metadata,
         )
 
         for name in self.tools.tool_names:
@@ -769,6 +774,8 @@ class AgentLoop:
             sender_id=msg.sender_id,
             session_summary=pending_summary,
             session_metadata=session.metadata,
+            todos=session.todos,
+            resume_request=is_ambiguous_resume_request(msg.content),
             learning_ctx=learning_ctx,
             workspace=scope.project_path,
             runtime_state=self,
@@ -1761,6 +1768,10 @@ class AgentLoop:
         if is_subagent and self._persist_subagent_followup(session, msg):
             logger.debug("Subagent result persisted for session {}", key)
             self.sessions.save(session)
+        if is_ambiguous_resume_request(msg.content):
+            msg.metadata[AMBIGUOUS_RESUME_META_KEY] = True
+        else:
+            msg.metadata.pop(AMBIGUOUS_RESUME_META_KEY, None)
         self._set_tool_context(
             channel, chat_id, msg.metadata.get("message_id"),
             msg.metadata, session_key=key,
@@ -1783,6 +1794,8 @@ class AgentLoop:
             sender_id=msg.sender_id,
             session_summary=pending,
             session_metadata=session.metadata,
+            todos=session.todos,
+            resume_request=is_ambiguous_resume_request(msg.content),
             workspace=workspace_scope.project_path,
             runtime_state=self,
             inbound_message=msg,
@@ -2037,6 +2050,10 @@ class AgentLoop:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
         if not turn_continuation.internal_continuation_inbound(msg.metadata):
             clear_goal_waiting_for_user(ctx.session.metadata)
+        if is_ambiguous_resume_request(msg.content):
+            msg.metadata[AMBIGUOUS_RESUME_META_KEY] = True
+        else:
+            msg.metadata.pop(AMBIGUOUS_RESUME_META_KEY, None)
         await self._runtime_events().session_turn_started(msg, ctx.session_key)
         self.workspace_scopes.persist_message_scope(ctx.session, msg)
 

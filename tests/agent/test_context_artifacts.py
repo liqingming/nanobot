@@ -169,3 +169,42 @@ def test_tool_digest_is_deterministic_and_contains_recovery_reference() -> None:
     assert first.target == "pytest -q"
     assert evidence.locator.endswith("call-1.txt")
     assert evidence.evidence_id in first.prompt_text()
+
+
+def test_ambiguous_resume_context_prioritizes_structured_unresolved_state() -> None:
+    metadata = {
+        GOAL_STATE_KEY: {
+            "status": "completed",
+            "objective": "Document the build pipeline.",
+            "recap": "Diagram written, but four source-name corrections remain.",
+        },
+    }
+    todos = [
+        {"content": "Correct four inaccurate class names", "status": "in_progress"},
+        {"content": "Re-run documentation checks", "status": "pending"},
+        {"content": "Already inspected entry points", "status": "completed"},
+    ]
+
+    rendered = render_active_context(
+        metadata,
+        legacy_summary="Next safe action: correct the four inaccurate labels.",
+        todos=todos,
+        resume_request=True,
+    )
+
+    assert "resume.request: ambiguous" in rendered
+    assert "resume.last_goal.status: completed" in rendered
+    assert "Document the build pipeline." in rendered
+    assert "Correct four inaccurate class names" in rendered
+    assert "Re-run documentation checks" in rendered
+    assert "Already inspected entry points" not in rendered
+    assert "Next safe action: correct the four inaccurate labels." in rendered
+    assert "do not infer a new objective" in rendered
+
+
+def test_ambiguous_resume_without_recoverable_state_still_renders_guard() -> None:
+    rendered = render_active_context({}, resume_request=True)
+
+    assert "resume.request: ambiguous" in rendered
+    assert "no active sustained goal" in rendered
+    assert "ask the user to choose" in rendered

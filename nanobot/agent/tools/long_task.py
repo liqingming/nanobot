@@ -31,6 +31,7 @@ from nanobot.session.goal_state import (
     goal_state_raw,
     parse_goal_state,
 )
+from nanobot.session.resume_state import AMBIGUOUS_RESUME_META_KEY
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
@@ -155,6 +156,14 @@ class LongTaskTool(Tool, _GoalToolsMixin):
                 "Error: long_task requires an active chat session (missing routing context)."
             )
         prior = parse_goal_state(goal_state_raw(sess.metadata))
+        request_ctx = self._request_ctx.get()
+        if request_ctx and request_ctx.metadata.get(AMBIGUOUS_RESUME_META_KEY):
+            return ToolResult.error(
+                "Error: this user message is an ambiguous resume request and no active goal "
+                "authorizes creating a guessed replacement. Continue only a structured unresolved "
+                "todo/continuation item; if none is unambiguous, ask the user which task to resume. "
+                "Do not call long_task until the user names or confirms the objective."
+            )
         if isinstance(prior, dict) and prior.get("status") == "active":
             return ToolResult.error(
                 "Error: a sustained goal is already active. "
@@ -235,6 +244,16 @@ class CompleteGoalTool(Tool, _GoalToolsMixin):
         prior = parse_goal_state(goal_state_raw(sess.metadata))
         if not isinstance(prior, dict) or prior.get("status") != "active":
             return "No active goal to complete."
+        unresolved_todos = [
+            item for item in sess.todos
+            if item.get("status") in {"pending", "in_progress"}
+        ]
+        if unresolved_todos:
+            labels = "; ".join(str(item.get("content") or "").strip() for item in unresolved_todos[:5])
+            return ToolResult.error(
+                "Error: cannot complete the active goal while session todos remain unresolved: "
+                f"{labels}. Complete or explicitly clear/update them first."
+            )
 
         ended = _iso_now()
         recap_text = (recap or "").strip()

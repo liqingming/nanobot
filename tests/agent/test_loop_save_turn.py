@@ -1799,3 +1799,33 @@ async def test_cancel_session_turn_removes_matching_message_from_inbound_bus(
     assert loop.bus.inbound_size == 1
     assert await loop.bus.consume_inbound() is retained
     assert ("cli:target", "request-1") not in loop._cancelled_turn_requests
+
+
+def test_build_initial_messages_uses_persisted_todos_for_ambiguous_resume(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("cli:resume")
+    session.metadata[GOAL_STATE_KEY] = {
+        "status": "completed",
+        "objective": "Completed overview",
+        "recap": "One correction remains",
+    }
+    session.todos = [{"content": "Correct the remaining label", "status": "pending"}]
+    msg = InboundMessage(
+        channel="cli",
+        sender_id="user",
+        chat_id="resume",
+        content="继续中断任务",
+    )
+
+    messages = loop._build_initial_messages(
+        msg,
+        session,
+        history=[],
+        pending_summary="Next safe action: correct the remaining label.",
+    )
+
+    assert "# Active Todos" in str(messages[0]["content"])
+    user_context = str(messages[-1]["content"])
+    assert "resume.last_goal.status: completed" in user_context
+    assert "Correct the remaining label" in user_context
+    assert "do not infer a new objective" in user_context
