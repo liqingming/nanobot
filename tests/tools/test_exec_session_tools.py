@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import sys
 import time
+from unittest.mock import AsyncMock, patch
 
 from nanobot.agent.tools.exec_session import (
     ExecSessionManager,
@@ -410,3 +411,23 @@ def test_list_exec_sessions_reports_empty_state():
     result = asyncio.run(ListExecSessionsTool(manager=ExecSessionManager()).execute())
 
     assert result == "No active exec sessions."
+
+
+def test_exec_session_spawn_reuses_exec_tool_spawn_with_pipe_stdin(tmp_path):
+    async def run() -> None:
+        manager = ExecSessionManager()
+        fake_process = AsyncMock()
+        with patch.object(ExecTool, "_spawn", new=AsyncMock(return_value=fake_process)) as spawn:
+            result = await manager._spawn("command", str(tmp_path), {}, None, False)
+
+        assert result is fake_process
+        spawn.assert_awaited_once_with(
+            "command",
+            str(tmp_path),
+            {},
+            None,
+            False,
+            stdin=asyncio.subprocess.PIPE,
+        )
+
+    asyncio.run(run())

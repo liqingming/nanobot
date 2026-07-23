@@ -7,6 +7,7 @@ import locale
 import os
 import re
 import shutil
+import subprocess
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
@@ -618,6 +619,7 @@ class ExecTool(Tool):
                     stderr=asyncio.subprocess.PIPE,
                     cwd=cwd,
                     env=cmd_env,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             command = ExecTool._normalize_powershell_command(command)
             command = f"{command}\nif ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}"
@@ -628,6 +630,10 @@ class ExecTool(Tool):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=env,
+                # Keep tool subprocesses detached from nanobot's console title.
+                # Windows Terminal otherwise lets commands temporarily replace
+                # the tab title that the TUI uses for the current topic name.
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
         shell_program = shell_program or shutil.which("bash") or "/bin/bash"
         args = [shell_program]

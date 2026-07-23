@@ -7,6 +7,7 @@ platform-specific binaries (all subprocess calls are mocked).
 
 import asyncio
 import shutil
+import subprocess
 import sys
 from unittest.mock import AsyncMock, patch
 
@@ -136,6 +137,7 @@ class TestSpawnWindows:
 
         kwargs = mock_exec.call_args[1]
         assert kwargs["stdin"] == asyncio.subprocess.DEVNULL
+        assert kwargs["creationflags"] == subprocess.CREATE_NO_WINDOW
 
     @pytest.mark.asyncio
     async def test_single_line_passes_cwd_and_env(self):
@@ -196,6 +198,7 @@ class TestSpawnWindows:
             "COMSPEC": r"C:\Windows\system32\cmd.exe",
             "PATH": "",
         }
+        assert kwargs["creationflags"] == subprocess.CREATE_NO_WINDOW
 
     @pytest.mark.asyncio
     async def test_powershell_preserves_last_native_exit_code(self):
