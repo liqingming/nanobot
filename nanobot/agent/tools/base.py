@@ -192,6 +192,15 @@ class Tool(ABC):
         """Whether this tool can run alongside other concurrency-safe tools."""
         return self.read_only and not self.exclusive
 
+    def is_concurrency_safe_call(self, params: Any) -> bool:
+        """Return whether this concrete invocation may run concurrently."""
+        return self.concurrency_safe
+
+    @property
+    def execution_timeout_s(self) -> float | None:
+        """Optional absolute execution guard; tools may implement softer checkpoints first."""
+        return None
+
     @property
     def exclusive(self) -> bool:
         """Whether this tool should run alone even if concurrency is enabled."""

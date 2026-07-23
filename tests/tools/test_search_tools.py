@@ -579,3 +579,109 @@ async def test_search_tools_use_bounded_default_result_limit(tmp_path: Path) -> 
     assert len([line for line in grep_result.splitlines() if line.endswith(".txt")]) == 100
     assert "pagination: limit=100" in find_result
     assert "pagination: limit=100" in grep_result
+
+
+@pytest.mark.asyncio
+async def test_find_files_query_modes_and_all_mode_hint(tmp_path: Path) -> None:
+    (tmp_path / "thzxiu8m.xml").write_text("x", encoding="utf-8")
+    (tmp_path / "au3n6j.xml").write_text("x", encoding="utf-8")
+    tool = FindFilesTool(workspace=tmp_path, allowed_dir=tmp_path)
+
+    all_result = await tool.execute(path=".", query="thzxiu8m.xml au3n6j.xml")
+    any_result = await tool.execute(
+        path=".", query="thzxiu8m.xml au3n6j.xml", query_mode="any"
+    )
+    phrase_result = await tool.execute(path=".", query="thzxiu8m", query_mode="phrase")
+
+    assert "No files found" in all_result
+    assert "query_mode='all'" in all_result
+    assert "query_mode='any'" in all_result
+    assert any_result.splitlines() == ["au3n6j.xml", "thzxiu8m.xml"]
+    assert phrase_result == "thzxiu8m.xml"
+
+
+@pytest.mark.asyncio
+async def test_grep_broad_parent_scope_requires_model_confirmation(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "a.txt").write_text("needle", encoding="utf-8")
+    tool = GrepTool(workspace=workspace, allowed_dir=tmp_path)
+
+    checkpoint = await tool.execute(pattern="needle", path=str(tmp_path), glob="**/*.txt")
+    confirmed = await tool.execute(
+        pattern="needle",
+        path=str(tmp_path),
+        glob="**/*.txt",
+        confirm_broad_search=True,
+    )
+
+    assert "Broad search confirmation required" in checkpoint
+    assert "confirm_broad_search=true" in checkpoint
+    assert confirmed == "a.txt"
+
+
+@pytest.mark.asyncio
+async def test_grep_budget_checkpoint_can_continue_with_scan_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for idx in range(5):
+        (tmp_path / f"f{idx}.txt").write_text(
+            "needle" if idx == 4 else "nope", encoding="utf-8"
+        )
+    monkeypatch.setattr(GrepTool, "_SCAN_BUDGET_FILES", 2)
+    tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
+
+    first = await tool.execute(pattern="needle", path=".")
+    second = await tool.execute(
+        pattern="needle", path=".", scan_cursor=2, confirm_broad_search=True
+    )
+    third = await tool.execute(
+        pattern="needle", path=".", scan_cursor=4, confirm_broad_search=True
+    )
+
+    assert "Search budget checkpoint" in first
+    assert "scan_cursor=2" in first
+    assert "Search budget checkpoint" in second
+    assert "scan_cursor=4" in second
+    assert "f4.txt" in third
+
+
+@pytest.mark.asyncio
+async def test_directory_search_calls_are_not_concurrency_safe(tmp_path: Path) -> None:
+    file_path = tmp_path / "a.txt"
+    file_path.write_text("needle", encoding="utf-8")
+    tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
+
+    assert tool.is_concurrency_safe_call({"path": str(file_path)}) is True
+    assert tool.is_concurrency_safe_call({"path": "."}) is False
+
+
+@pytest.mark.asyncio
+async def test_grep_path_sort_stops_after_requested_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for idx in range(10):
+        (tmp_path / f"f{idx}.txt").write_text("needle", encoding="utf-8")
+    reads: list[str] = []
+    original = Path.read_bytes
+
+    def tracked_read(path: Path) -> bytes:
+        reads.append(path.name)
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", tracked_read)
+    tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
+
+    result = await tool.execute(
+        pattern="needle",
+        path=".",
+        output_mode="files_with_matches",
+        sort="path",
+        head_limit=2,
+    )
+
+    assert result.splitlines()[:2] == ["f0.txt", "f1.txt"]
+    assert "pagination" in result
+    assert reads == ["f0.txt", "f1.txt", "f2.txt"]

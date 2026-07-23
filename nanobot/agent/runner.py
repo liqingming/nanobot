@@ -15,6 +15,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import time
 from contextlib import suppress
 from copy import deepcopy
@@ -1550,6 +1551,7 @@ class AgentRunner:
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         hook = hook or AgentHook()
         context = context or AgentHookContext(iteration=0, messages=[])
+        deferred_searches = self._deferred_broad_searches(tool_calls)
         batches = self._partition_tool_batches(spec, tool_calls)
         self._log_event(
             spec,
@@ -1562,7 +1564,9 @@ class AgentRunner:
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
                 batch_results = await asyncio.gather(*(
-                    self._run_tool(
+                    self._deferred_search_result(spec, tool_call, deferred_searches[tool_call.id])
+                    if tool_call.id in deferred_searches
+                    else self._run_tool(
                         spec,
                         tool_call,
                         external_lookup_counts,
@@ -1576,14 +1580,19 @@ class AgentRunner:
             else:
                 batch_results = []
                 for tool_call in batch:
-                    result = await self._run_tool(
-                        spec,
-                        tool_call,
-                        external_lookup_counts,
-                        workspace_violation_counts,
-                        hook,
-                        context,
-                    )
+                    if tool_call.id in deferred_searches:
+                        result = await self._deferred_search_result(
+                            spec, tool_call, deferred_searches[tool_call.id]
+                        )
+                    else:
+                        result = await self._run_tool(
+                            spec,
+                            tool_call,
+                            external_lookup_counts,
+                            workspace_violation_counts,
+                            hook,
+                            context,
+                        )
                     tool_results.append(result)
                     batch_results.append(result)
 
@@ -1672,11 +1681,34 @@ class AgentRunner:
                 arguments=params,
             )
             if tool is not None:
-                result = await tool.execute(**params)
+                execution = tool.execute(**params)
+                timeout_s = tool.execution_timeout_s
+                if timeout_s is not None:
+                    result = await asyncio.wait_for(execution, timeout=timeout_s)
+                else:
+                    result = await execution
             else:
                 result = await spec.tools.execute(tool_call.name, params)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            timeout_s = getattr(tool, "execution_timeout_s", None)
+            payload = (
+                "[Tool execution checkpoint — model decision]\n"
+                f"The {tool_call.name} call exceeded its absolute {timeout_s:g}s guard. "
+                "Decide whether the operation is still justified: stop, narrow/change approach, "
+                "or retry explicitly. Search tools normally return a scan_cursor before this guard; "
+                "if no cursor was returned, do not blindly repeat the identical broad call."
+            )
+            self._log_event(
+                spec,
+                "runner.tool.timeout_checkpoint",
+                tool=tool_call.name,
+                call_id=tool_call.id,
+                timeout_s=timeout_s,
+            )
+            await hook.on_execute_tool_error(context, tool_call, tool, params, payload)
+            return payload, {"name": tool_call.name, "status": "checkpoint", "detail": payload[:120]}, None
         except BaseException as exc:
             self._log_event(
                 spec,
@@ -1873,6 +1905,59 @@ class AgentRunner:
             return
         messages.append(build_assistant_message(_PERSISTED_MODEL_ERROR_PLACEHOLDER))
 
+    @staticmethod
+    def _search_terms(tool_call: ToolCallRequest) -> set[str]:
+        if not isinstance(tool_call.arguments, dict):
+            return set()
+        raw = tool_call.arguments.get("pattern") or tool_call.arguments.get("query") or ""
+        return {term.lower() for term in re.findall(r"[\w.-]{4,}", str(raw))}
+
+    @classmethod
+    def _deferred_broad_searches(cls, tool_calls: list[ToolCallRequest]) -> dict[str, str]:
+        """Defer same-turn fallback searches until the model sees the narrower result."""
+        deferred: dict[str, str] = {}
+        prior: list[ToolCallRequest] = []
+        for call in tool_calls:
+            if call.name not in {"grep", "find_files"} or not isinstance(call.arguments, dict):
+                prior.append(call)
+                continue
+            path = Path(str(call.arguments.get("path", "."))).resolve(strict=False)
+            terms = cls._search_terms(call)
+            for narrow in prior:
+                if narrow.name not in {"grep", "find_files"} or not isinstance(narrow.arguments, dict):
+                    continue
+                narrow_path = Path(str(narrow.arguments.get("path", "."))).resolve(strict=False)
+                if path == narrow_path or path not in narrow_path.parents:
+                    continue
+                narrow_terms = cls._search_terms(narrow)
+                if terms and narrow_terms and not terms.intersection(narrow_terms):
+                    continue
+                deferred[call.id] = (
+                    "[Broader fallback search deferred — review narrow result first]\n"
+                    f"A narrower overlapping search in '{narrow.arguments.get('path', '.')}' was requested "
+                    f"in the same model response. The broader search in '{call.arguments.get('path', '.')}' "
+                    "was not executed. Review the narrow result, then request the broader scope in a new "
+                    "model step only if it remains necessary."
+                )
+                break
+            prior.append(call)
+        return deferred
+
+    async def _deferred_search_result(
+        self,
+        spec: AgentRunSpec,
+        tool_call: ToolCallRequest,
+        payload: str,
+    ) -> tuple[Any, dict[str, str], BaseException | None]:
+        self._log_event(
+            spec,
+            "runner.tool.deferred",
+            tool=tool_call.name,
+            call_id=tool_call.id,
+            reason="broader overlapping search",
+        )
+        return payload, {"name": tool_call.name, "status": "deferred", "detail": payload[:120]}, None
+
     def _partition_tool_batches(
         self,
         spec: AgentRunSpec,
@@ -1886,7 +1971,11 @@ class AgentRunner:
         for tool_call in tool_calls:
             get_tool = getattr(spec.tools, "get", None)
             tool = get_tool(tool_call.name) if callable(get_tool) else None
-            can_batch = bool(tool and tool.concurrency_safe)
+            can_batch = bool(
+                tool
+                and tool.concurrency_safe
+                and tool.is_concurrency_safe_call(tool_call.arguments)
+            )
             if can_batch:
                 current.append(tool_call)
                 continue

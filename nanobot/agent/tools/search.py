@@ -6,6 +6,7 @@ import asyncio
 import fnmatch
 import os
 import re
+import time
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, TypeVar
@@ -93,15 +94,84 @@ def _matches_type(name: str, file_type: str | None) -> bool:
     return any(fnmatch.fnmatch(name.lower(), pattern.lower()) for pattern in patterns)
 
 
-def _matches_query(rel_path: str, query: str | None) -> bool:
+def _matches_query(rel_path: str, query: str | None, mode: str = "all") -> bool:
     if not query:
         return True
     haystack = rel_path.lower()
-    terms = [part for part in query.lower().split() if part]
+    normalized = query.lower().strip()
+    terms = [part for part in normalized.split() if part]
+    if mode == "phrase":
+        return normalized in haystack
+    if mode == "any":
+        return any(term in haystack for term in terms)
     return all(term in haystack for term in terms)
 
 
 class _SearchTool(_FsTool):
+    """Shared bounded tree-walk behavior for search tools."""
+
+    _SCAN_BUDGET_SECONDS = 30.0
+    _SCAN_BUDGET_FILES = 20_000
+    _SCAN_BUDGET_BYTES = 512 * 1024 * 1024
+
+    @property
+    def execution_timeout_s(self) -> float | None:
+        # The internal 30s checkpoint normally wins; this guard covers a stuck filesystem call.
+        return 45.0
+
+    def is_concurrency_safe_call(self, params: Any) -> bool:
+        path = str(params.get("path", ".")) if isinstance(params, dict) else "."
+        try:
+            return self._resolve(path or ".").is_file()
+        except Exception:
+            return False
+
+    def _is_broad_unfiltered(self, target: Path, *, glob: str | None, file_type: str | None) -> bool:
+        if target.is_file():
+            return False
+        workspace = self._display_workspace()
+        if workspace is None:
+            return False
+        with suppress(OSError, RuntimeError, ValueError):
+            resolved_target = target.resolve(strict=False)
+            resolved_workspace = workspace.resolve(strict=False)
+            # Searching above the workspace is always an explicit scope expansion. At the
+            # workspace root, only reject an effectively unfiltered recursive wildcard;
+            # ordinary project-root grep/find calls remain ergonomic and are budgeted.
+            if resolved_target in resolved_workspace.parents:
+                return True
+            broad_glob = _normalize_pattern(glob or "") in {"*", "**", "**/*"}
+            return resolved_target == resolved_workspace and broad_glob and not file_type
+        return False
+
+    @staticmethod
+    def _checkpoint_note(
+        *,
+        scanned: int,
+        scanned_bytes: int,
+        elapsed: float,
+        next_cursor: int,
+        reason: str,
+    ) -> str:
+        return (
+            "[Search budget checkpoint — review before continuing]\n"
+            f"Paused after this segment scanned {scanned} files "
+            f"({scanned_bytes} bytes) in {elapsed:.1f}s; reason: {reason}.\n"
+            "Decide whether this search is still justified. You may stop, narrow path/glob/type, "
+            "or continue the same search by setting "
+            f"scan_cursor={next_cursor} and confirm_broad_search=true. "
+            "Continuation receives a fresh bounded segment; do not remove filters when retrying."
+        )
+
+    @staticmethod
+    def _broad_confirmation(path: str) -> str:
+        return (
+            "[Broad search confirmation required — model decision]\n"
+            f"The requested directory '{path or '.'}' is the workspace root (or its parent) and "
+            "has no glob/type filter. Decide whether this scope is necessary. Prefer narrowing the "
+            "path or adding glob/type; if the full scan is genuinely required, repeat the call with "
+            "confirm_broad_search=true. The confirmed search will still pause at bounded checkpoints."
+        )
     _IGNORE_DIRS = set(ListDirTool._IGNORE_DIRS)
 
     @staticmethod
@@ -182,8 +252,13 @@ class FindFilesTool(_SearchTool):
                     "type": "string",
                     "description": (
                         "Optional case-insensitive path fragment search. "
-                        "Whitespace-separated terms must all be present."
+                        "Whitespace-separated terms follow query_mode (default: all)."
                     ),
+                },
+                "query_mode": {
+                    "type": "string",
+                    "enum": ["all", "any", "phrase"],
+                    "description": "How query terms match: all terms, any term, or the exact phrase.",
                 },
                 "glob": {
                     "type": "string",
@@ -214,6 +289,15 @@ class FindFilesTool(_SearchTool):
                     "minimum": 0,
                     "maximum": 100000,
                 },
+                "scan_cursor": {
+                    "type": "integer",
+                    "description": "Opaque file-walk cursor from a prior search budget checkpoint.",
+                    "minimum": 0,
+                },
+                "confirm_broad_search": {
+                    "type": "boolean",
+                    "description": "Confirm after the tool asks the model to justify a broad search.",
+                },
             },
         }
 
@@ -235,12 +319,15 @@ class FindFilesTool(_SearchTool):
         self,
         path: str = ".",
         query: str | None = None,
+        query_mode: str = "all",
         glob: str | None = None,
         type: str | None = None,
         include_dirs: bool = False,
         sort: str = "path",
         head_limit: int | None = None,
         offset: int = 0,
+        scan_cursor: int = 0,
+        confirm_broad_search: bool = False,
         **kwargs: Any,
     ) -> str:
         try:
@@ -254,6 +341,12 @@ class FindFilesTool(_SearchTool):
 
             if sort not in {"path", "modified"}:
                 return ToolResult.error("Error: sort must be 'path' or 'modified'")
+            if query_mode not in {"all", "any", "phrase"}:
+                return ToolResult.error("Error: query_mode must be 'all', 'any', or 'phrase'")
+            if scan_cursor < 0:
+                return ToolResult.error("Error: scan_cursor must be >= 0")
+            if self._is_broad_unfiltered(target, glob=glob, file_type=type) and not confirm_broad_search:
+                return self._broad_confirmation(path)
 
             limit = (
                 _DEFAULT_FILE_HEAD_LIMIT
@@ -262,10 +355,28 @@ class FindFilesTool(_SearchTool):
             )
             root = target if target.is_dir() else target.parent
             matches: list[tuple[str, float]] = []
+            started = time.monotonic()
+            scanned = 0
+            scanned_bytes = 0
+            checkpoint: str | None = None
 
             for idx, candidate in enumerate(self._iter_paths(target, include_dirs=include_dirs), start=1):
+                if idx <= scan_cursor:
+                    continue
                 if idx % 128 == 0:
                     await asyncio.sleep(0)
+                elapsed = time.monotonic() - started
+                if scanned >= self._SCAN_BUDGET_FILES or elapsed >= self._SCAN_BUDGET_SECONDS:
+                    reason = "file budget" if scanned >= self._SCAN_BUDGET_FILES else "time budget"
+                    checkpoint = self._checkpoint_note(
+                        scanned=scanned,
+                        scanned_bytes=scanned_bytes,
+                        elapsed=elapsed,
+                        next_cursor=idx - 1,
+                        reason=reason,
+                    )
+                    break
+                scanned += 1
                 if candidate.is_dir() and not include_dirs:
                     continue
                 rel_path = candidate.relative_to(root).as_posix()
@@ -278,10 +389,13 @@ class FindFilesTool(_SearchTool):
                     continue
                 if candidate.is_dir() and type:
                     continue
-                if not _matches_query(display_path, query):
+                if not _matches_query(display_path, query, query_mode):
                     continue
                 try:
-                    mtime = candidate.stat().st_mtime
+                    stat = candidate.stat()
+                    mtime = stat.st_mtime
+                    if candidate.is_file():
+                        scanned_bytes += stat.st_size
                 except OSError:
                     mtime = 0.0
                 suffix = "/" if candidate.is_dir() else ""
@@ -295,12 +409,19 @@ class FindFilesTool(_SearchTool):
             paths = [item[0] for item in matches]
             paged, truncated = _paginate(paths, limit, offset)
             if not paged:
-                return "No files found"
-
-            result = "\n".join(paged)
+                result = "No files found"
+                if query and query_mode == "all" and len(query.split()) > 1:
+                    result += (
+                        "\n\nNote: query_mode='all' requires one path to contain every whitespace-separated "
+                        "term. If the terms are alternatives, retry with query_mode='any' or separate calls."
+                    )
+            else:
+                result = "\n".join(paged)
             note = _pagination_note(limit, offset, truncated)
             if note:
                 result += "\n\n" + note
+            if checkpoint:
+                result += "\n\n" + checkpoint
             return result
         except PermissionError as e:
             return ToolResult.error(f"Error: {e}")
@@ -373,6 +494,14 @@ class GrepTool(_SearchTool):
                         "Default: files_with_matches"
                     ),
                 },
+                "sort": {
+                    "type": "string",
+                    "enum": ["modified", "path"],
+                    "description": (
+                        "File result order (default modified). With files_with_matches and sort=path, "
+                        "the scan can stop once the requested page is full."
+                    ),
+                },
                 "context_before": {
                     "type": "integer",
                     "description": "Number of lines of context before each match",
@@ -417,6 +546,15 @@ class GrepTool(_SearchTool):
                     "minimum": 0,
                     "maximum": 100000,
                 },
+                "scan_cursor": {
+                    "type": "integer",
+                    "description": "Opaque file-walk cursor from a prior search budget checkpoint.",
+                    "minimum": 0,
+                },
+                "confirm_broad_search": {
+                    "type": "boolean",
+                    "description": "Confirm after the tool asks the model to justify a broad search.",
+                },
             },
             "required": ["pattern"],
         }
@@ -446,12 +584,15 @@ class GrepTool(_SearchTool):
         case_insensitive: bool = False,
         fixed_strings: bool = False,
         output_mode: str = "files_with_matches",
+        sort: str = "modified",
         context_before: int = 0,
         context_after: int = 0,
         max_matches: int | None = None,
         max_results: int | None = None,
         head_limit: int | None = None,
         offset: int = 0,
+        scan_cursor: int = 0,
+        confirm_broad_search: bool = False,
         **kwargs: Any,
     ) -> str:
         try:
@@ -462,6 +603,12 @@ class GrepTool(_SearchTool):
                 return ToolResult.error(f"Error: Path not found: {path}")
             if not (target.is_dir() or target.is_file()):
                 return ToolResult.error(f"Error: Unsupported path: {path}")
+            if scan_cursor < 0:
+                return ToolResult.error("Error: scan_cursor must be >= 0")
+            if sort not in {"modified", "path"}:
+                return ToolResult.error("Error: sort must be 'modified' or 'path'")
+            if self._is_broad_unfiltered(target, glob=glob, file_type=type) and not confirm_broad_search:
+                return self._broad_confirmation(path)
 
             flags = re.IGNORECASE if case_insensitive else 0
             try:
@@ -489,10 +636,37 @@ class GrepTool(_SearchTool):
             counts: dict[str, int] = {}
             file_mtimes: dict[str, float] = {}
             root = target if target.is_dir() else target.parent
+            started = time.monotonic()
+            scanned = 0
+            scanned_bytes = 0
+            checkpoint: str | None = None
 
-            for idx, file_path in enumerate(self._iter_files(target), start=1):
-                if idx % 32 == 0:
+            for walk_idx, file_path in enumerate(self._iter_files(target), start=1):
+                if walk_idx <= scan_cursor:
+                    continue
+                if walk_idx % 32 == 0:
                     await asyncio.sleep(0)
+                elapsed = time.monotonic() - started
+                if (
+                    scanned >= self._SCAN_BUDGET_FILES
+                    or scanned_bytes >= self._SCAN_BUDGET_BYTES
+                    or elapsed >= self._SCAN_BUDGET_SECONDS
+                ):
+                    if scanned >= self._SCAN_BUDGET_FILES:
+                        reason = "file budget"
+                    elif scanned_bytes >= self._SCAN_BUDGET_BYTES:
+                        reason = "byte budget"
+                    else:
+                        reason = "time budget"
+                    checkpoint = self._checkpoint_note(
+                        scanned=scanned,
+                        scanned_bytes=scanned_bytes,
+                        elapsed=elapsed,
+                        next_cursor=walk_idx - 1,
+                        reason=reason,
+                    )
+                    break
+                scanned += 1
                 rel_path = file_path.relative_to(root).as_posix()
                 if glob and not _match_glob(rel_path, file_path.name, glob):
                     continue
@@ -500,6 +674,7 @@ class GrepTool(_SearchTool):
                     continue
 
                 raw = file_path.read_bytes()
+                scanned_bytes += len(raw)
                 if len(raw) > self._MAX_FILE_BYTES:
                     skipped_large += 1
                     continue
@@ -556,6 +731,14 @@ class GrepTool(_SearchTool):
                     if display_path not in matching_files:
                         matching_files.append(display_path)
                         file_mtimes[display_path] = mtime
+                if (
+                    output_mode == "files_with_matches"
+                    and sort == "path"
+                    and limit is not None
+                    and len(matching_files) >= offset + limit + 1
+                ):
+                    truncated = True
+                    break
                 if output_mode in {"count", "files_with_matches"} and file_had_match:
                     continue
                 if truncated or size_truncated:
@@ -567,7 +750,11 @@ class GrepTool(_SearchTool):
                 else:
                     ordered_files = sorted(
                         matching_files,
-                        key=lambda name: (-file_mtimes.get(name, 0.0), name),
+                        key=(
+                            (lambda name: name)
+                            if sort == "path"
+                            else (lambda name: (-file_mtimes.get(name, 0.0), name))
+                        ),
                     )
                     paged, truncated = _paginate(ordered_files, limit, offset)
                     result = "\n".join(paged)
@@ -613,6 +800,8 @@ class GrepTool(_SearchTool):
                 )
             if notes:
                 result += "\n\n" + "\n".join(notes)
+            if checkpoint:
+                result += "\n\n" + checkpoint
             return result
         except PermissionError as e:
             return ToolResult.error(f"Error: {e}")

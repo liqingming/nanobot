@@ -63,6 +63,32 @@ class _DelayTool(Tool):
         return self._name
 
 
+class _TimeoutTool(Tool):
+    @property
+    def name(self) -> str:
+        return "timeout_tool"
+
+    @property
+    def description(self) -> str:
+        return "timeout tool"
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}, "required": []}
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def execution_timeout_s(self) -> float | None:
+        return 0.01
+
+    async def execute(self, **kwargs):
+        await asyncio.sleep(1)
+        return "late"
+
+
 class _LegacyErrorPluginTool(Tool):
     @property
     def name(self) -> str:
@@ -465,3 +491,52 @@ async def test_runner_blocks_repeated_external_fetches():
         if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_3"
     ][0]
     assert "repeated external lookup blocked" in blocked_tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_tool_absolute_timeout_returns_model_checkpoint_instead_of_fatal_error() -> None:
+    registry = ToolRegistry()
+    registry.register(_TimeoutTool())
+    provider = MagicMock()
+    runner = AgentRunner(provider)
+    spec = AgentRunSpec(
+        initial_messages=[],
+        model="m",
+        tools=registry,
+        max_iterations=1,
+        max_tool_result_chars=10_000,
+    )
+    call = ToolCallRequest(id="slow", name="timeout_tool", arguments={})
+
+    results, events, fatal = await runner._execute_tools(spec, [call], {}, {})
+
+    assert fatal is None
+    assert "Tool execution checkpoint" in results[0]
+    assert "Decide whether" in results[0]
+    assert events[0]["status"] == "checkpoint"
+
+
+def test_overlapping_broader_search_is_deferred_to_next_model_step() -> None:
+    calls = [
+        ToolCallRequest(
+            id="narrow",
+            name="grep",
+            arguments={"pattern": "ReplaceRefDialog|thzxiu8m", "path": "repo/feature"},
+        ),
+        ToolCallRequest(
+            id="broad",
+            name="grep",
+            arguments={"pattern": "ReplaceRefDialog", "path": "repo"},
+        ),
+        ToolCallRequest(
+            id="other",
+            name="grep",
+            arguments={"pattern": "unrelated", "path": "repo"},
+        ),
+    ]
+
+    deferred = AgentRunner._deferred_broad_searches(calls)
+
+    assert "broad" in deferred
+    assert "review narrow result first" in deferred["broad"].lower()
+    assert "other" not in deferred
