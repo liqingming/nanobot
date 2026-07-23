@@ -112,6 +112,7 @@ class AgentRunSpec:
     injection_callback: Any | None = None
     llm_timeout_s: float | None = None
     event_logger: Callable[[str, dict[str, Any]], None] | None = None
+    turn_id: str | None = None
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
     finalize_on_max_iterations: bool = True
@@ -143,7 +144,10 @@ class AgentRunner:
         if spec.event_logger is None:
             return
         try:
-            spec.event_logger(event, fields)
+            payload = dict(fields)
+            if spec.turn_id is not None:
+                payload.setdefault("turn_id", spec.turn_id)
+            spec.event_logger(event, payload)
         except Exception:
             return
 
@@ -1556,17 +1560,33 @@ class AgentRunner:
         self._log_event(
             spec,
             "runner.tools.start",
+            iteration=context.iteration,
             count=len(tool_calls),
             batches=[len(batch) for batch in batches],
             tools=[tc.name for tc in tool_calls],
         )
-        tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
-        for batch in batches:
-            if spec.concurrent_tools and len(batch) > 1:
-                batch_results = await asyncio.gather(*(
-                    self._deferred_search_result(spec, tool_call, deferred_searches[tool_call.id])
-                    if tool_call.id in deferred_searches
-                    else self._run_tool(
+        tool_positions = {tool_call.id: index for index, tool_call in enumerate(tool_calls)}
+
+        async def _execute_one(
+            tool_call: ToolCallRequest,
+        ) -> tuple[Any, dict[str, str], BaseException | None]:
+            started_at = time.monotonic()
+            self._log_event(
+                spec,
+                "runner.tool.audit.start",
+                iteration=context.iteration,
+                position=tool_positions[tool_call.id],
+                tool=tool_call.name,
+                call_id=tool_call.id,
+                arguments=tool_call.arguments,
+            )
+            try:
+                if tool_call.id in deferred_searches:
+                    outcome = await self._deferred_search_result(
+                        spec, tool_call, deferred_searches[tool_call.id]
+                    )
+                else:
+                    outcome = await self._run_tool(
                         spec,
                         tool_call,
                         external_lookup_counts,
@@ -1574,25 +1594,61 @@ class AgentRunner:
                         hook,
                         context,
                     )
-                    for tool_call in batch
+            except asyncio.CancelledError:
+                self._log_event(
+                    spec,
+                    "runner.tool.audit.end",
+                    iteration=context.iteration,
+                    position=tool_positions[tool_call.id],
+                    tool=tool_call.name,
+                    call_id=tool_call.id,
+                    status="cancelled",
+                    duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+                )
+                raise
+            except BaseException as exc:
+                self._log_event(
+                    spec,
+                    "runner.tool.audit.end",
+                    iteration=context.iteration,
+                    position=tool_positions[tool_call.id],
+                    tool=tool_call.name,
+                    call_id=tool_call.id,
+                    status="exception",
+                    duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                raise
+            result, event, error = outcome
+            result_text = "" if result is None else str(result)
+            self._log_event(
+                spec,
+                "runner.tool.audit.end",
+                iteration=context.iteration,
+                position=tool_positions[tool_call.id],
+                tool=tool_call.name,
+                call_id=tool_call.id,
+                status=str(event.get("status") or ("error" if error else "ok")),
+                duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+                result_chars=len(result_text),
+                result_preview=result_text,
+                error_type=type(error).__name__ if error is not None else None,
+                error=str(error) if error is not None else None,
+            )
+            return outcome
+
+        tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
+        for batch in batches:
+            if spec.concurrent_tools and len(batch) > 1:
+                batch_results = await asyncio.gather(*(
+                    _execute_one(tool_call) for tool_call in batch
                 ))
                 tool_results.extend(batch_results)
             else:
                 batch_results = []
                 for tool_call in batch:
-                    if tool_call.id in deferred_searches:
-                        result = await self._deferred_search_result(
-                            spec, tool_call, deferred_searches[tool_call.id]
-                        )
-                    else:
-                        result = await self._run_tool(
-                            spec,
-                            tool_call,
-                            external_lookup_counts,
-                            workspace_violation_counts,
-                            hook,
-                            context,
-                        )
+                    result = await _execute_one(tool_call)
                     tool_results.append(result)
                     batch_results.append(result)
 

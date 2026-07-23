@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 _MAX_FIELD_CHARS = 2000
 
 
@@ -31,7 +30,14 @@ def compact_value(value: Any, *, max_chars: int = _MAX_FIELD_CHARS) -> Any:
 
 
 
-_FULL_TEXT_FIELDS = frozenset({"final_error", "error_content", "error_detail", "traceback"})
+_FULL_TEXT_FIELDS = frozenset({
+    "arguments",
+    "error_content",
+    "error_detail",
+    "final_error",
+    "result_preview",
+    "traceback",
+})
 
 
 def compact_log_fields(fields: dict[str, Any]) -> dict[str, Any]:

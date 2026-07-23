@@ -49,3 +49,29 @@ def test_append_session_runtime_log_keeps_error_fields_longer(tmp_path: Path) ->
     record = json.loads(log_path.read_text(encoding="utf-8").strip())
     assert record["final_error"] == error_text
     assert len(record["final_error"]) > 2000
+
+
+def test_runtime_log_preserves_audit_payload_but_not_unbounded(tmp_path: Path) -> None:
+    log_path = tmp_path / "sessions" / "cli_topic" / "runtime.log"
+    arguments = {"command": "x" * 5000, "working_dir": "C:/project"}
+    result = "r" * 25000
+
+    append_session_runtime_log(
+        log_path,
+        "runner.tool.audit.end",
+        turn_id="cli:topic:turn-1",
+        iteration=187,
+        call_id="call_187",
+        arguments=arguments,
+        result_chars=len(result),
+        result_preview=result,
+    )
+
+    record = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert record["turn_id"] == "cli:topic:turn-1"
+    assert record["iteration"] == 187
+    assert record["call_id"] == "call_187"
+    assert len(record["arguments"]["command"]) == 5000
+    assert record["result_chars"] == 25000
+    assert record["result_preview"].endswith("...[truncated]")
+    assert len(record["result_preview"]) < len(result)

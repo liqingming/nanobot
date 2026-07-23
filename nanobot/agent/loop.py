@@ -1026,6 +1026,7 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         hook_factories: list[AgentTurnHookFactory] | None = None,
         tools: ToolRegistry | None = None,
+        turn_id: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -1108,6 +1109,7 @@ class AgentLoop:
             return items
 
         active_session_key = session.key if session else session_key
+        runtime_turn_id = turn_id or f"{active_session_key or 'ephemeral'}:{time.time_ns()}"
         runtime_log_path = (
             self.sessions.get_session_runtime_log_path(active_session_key)
             if active_session_key else None
@@ -1134,6 +1136,7 @@ class AgentLoop:
             chat_id=chat_id,
             initial_messages=len(initial_messages),
             max_iterations=effective_max_iterations,
+            turn_id=runtime_turn_id,
         )
         effective_scope = self.workspace_scopes.for_turn(
             channel=channel,
@@ -1254,6 +1257,7 @@ class AgentLoop:
                     message_metadata=metadata,
                 ),
                 event_logger=_event_logger,
+                turn_id=runtime_turn_id,
                 context_delta_callback=_context_delta,
             ))
         finally:
@@ -1293,6 +1297,7 @@ class AgentLoop:
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
         run_end_fields: dict[str, Any] = {
+            "turn_id": runtime_turn_id,
             "session_key": active_session_key,
             "stop_reason": result.stop_reason,
             "tools_used": result.tools_used,
@@ -2195,6 +2200,7 @@ class AgentLoop:
                 hooks=ctx.hooks,
                 hook_factories=ctx.hook_factories,
                 tools=ctx.tools,
+                turn_id=ctx.turn_id,
             )
             usage_snap = dict(self._last_usage)
             events_snap = list(self._last_tool_events)

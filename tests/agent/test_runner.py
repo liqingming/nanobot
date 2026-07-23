@@ -566,3 +566,195 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
     args = mgr._announce_result.await_args.args
     assert args[3] == "Task completed but no final response was generated."
     assert args[5] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_runner_runtime_audit_reconstructs_each_tool_iteration():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    responses = [
+        LLMResponse(
+            content="step one",
+            tool_calls=[ToolCallRequest(
+                id="call_read",
+                name="read_file",
+                arguments={"path": "a.py", "offset": 1},
+            )],
+        ),
+        LLMResponse(
+            content="step two",
+            tool_calls=[ToolCallRequest(
+                id="call_grep",
+                name="grep",
+                arguments={"path": ".", "pattern": "target"},
+            )],
+        ),
+        LLMResponse(content="done", tool_calls=[]),
+    ]
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=responses)
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(side_effect=["file body", "matching line"])
+    events: list[tuple[str, dict]] = []
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "inspect"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=5,
+        max_tool_result_chars=16000,
+        event_logger=lambda event, fields: events.append((event, fields)),
+        turn_id="cli:topic:turn-1",
+    ))
+
+    starts = [fields for event, fields in events if event == "runner.tool.audit.start"]
+    ends = [fields for event, fields in events if event == "runner.tool.audit.end"]
+    assert result.final_content == "done"
+    assert [(row["iteration"], row["call_id"], row["tool"]) for row in starts] == [
+        (0, "call_read", "read_file"),
+        (1, "call_grep", "grep"),
+    ]
+    assert [row["arguments"] for row in starts] == [
+        {"path": "a.py", "offset": 1},
+        {"path": ".", "pattern": "target"},
+    ]
+    assert [(row["iteration"], row["call_id"], row["status"]) for row in ends] == [
+        (0, "call_read", "ok"),
+        (1, "call_grep", "ok"),
+    ]
+    assert [row["result_chars"] for row in ends] == [9, 13]
+    assert [row["result_preview"] for row in ends] == ["file body", "matching line"]
+    assert all(row["duration_ms"] >= 0 for row in ends)
+    assert all(fields["turn_id"] == "cli:topic:turn-1" for _event, fields in events)
+
+
+@pytest.mark.asyncio
+async def test_runner_runtime_audit_records_tool_error_outcome():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="working",
+        tool_calls=[ToolCallRequest(id="call_bad", name="read_file", arguments={"path": "x"})],
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(side_effect=RuntimeError("boom"))
+    events: list[tuple[str, dict]] = []
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "inspect"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=16000,
+        event_logger=lambda event, fields: events.append((event, fields)),
+        fail_on_tool_error=True,
+    ))
+
+    end = [fields for event, fields in events if event == "runner.tool.audit.end"][-1]
+    assert result.stop_reason == "tool_error"
+    assert end["iteration"] == 0
+    assert end["call_id"] == "call_bad"
+    assert end["status"] == "error"
+    assert end["error_type"] == "RuntimeError"
+    assert end["error"] == "boom"
+    assert "boom" in end["result_preview"]
+
+
+@pytest.mark.asyncio
+async def test_runner_runtime_audit_keeps_full_varying_long_loop_trace():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    call_count = 0
+
+    async def chat_with_retry(**_kwargs):
+        nonlocal call_count
+        if call_count == 12:
+            return LLMResponse(content="done", tool_calls=[])
+        call_count += 1
+        return LLMResponse(
+            content="working",
+            tool_calls=[ToolCallRequest(
+                id=f"call_{call_count}",
+                name="read_file",
+                arguments={"path": "large.py", "offset": call_count * 100},
+            )],
+        )
+
+    provider = MagicMock()
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(side_effect=[f"chunk {index}" for index in range(1, 13)])
+    events: list[tuple[str, dict]] = []
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "inspect all chunks"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=20,
+        max_tool_result_chars=16000,
+        event_logger=lambda event, fields: events.append((event, fields)),
+        turn_id="cli:topic:long-turn",
+    ))
+
+    starts = [fields for event, fields in events if event == "runner.tool.audit.start"]
+    ends = [fields for event, fields in events if event == "runner.tool.audit.end"]
+    assert result.final_content == "done"
+    assert len(starts) == len(ends) == 12
+    assert [row["iteration"] for row in starts] == list(range(12))
+    assert [row["call_id"] for row in starts] == [f"call_{index}" for index in range(1, 13)]
+    assert [row["arguments"]["offset"] for row in starts] == [
+        index * 100 for index in range(1, 13)
+    ]
+    assert [row["result_preview"] for row in ends] == [
+        f"chunk {index}" for index in range(1, 13)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_runtime_audit_closes_cancelled_tool_span():
+    import asyncio
+
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+
+    async def execute_tool(_name, _arguments):
+        tool_started.set()
+        await release_tool.wait()
+        return "unreachable"
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="working",
+        tool_calls=[ToolCallRequest(id="call_wait", name="exec", arguments={"command": "wait"})],
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = execute_tool
+    events: list[tuple[str, dict]] = []
+    task = asyncio.create_task(AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "wait"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=16000,
+        event_logger=lambda event, fields: events.append((event, fields)),
+        turn_id="cli:topic:cancelled-turn",
+    )))
+
+    await tool_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    end = [fields for event, fields in events if event == "runner.tool.audit.end"][-1]
+    assert end["turn_id"] == "cli:topic:cancelled-turn"
+    assert end["iteration"] == 0
+    assert end["call_id"] == "call_wait"
+    assert end["status"] == "cancelled"
+    assert end["duration_ms"] >= 0

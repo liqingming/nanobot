@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -419,3 +420,62 @@ def test_newly_completed_goal_fallback_does_not_reuse_stale_recap() -> None:
         metadata,
         completed_at_before="2026-07-20T11:40:06Z",
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_loop_runtime_log_correlates_complete_tool_trace_by_turn_id(tmp_path):
+    loop = _make_loop(tmp_path)
+    runtime_log = tmp_path / "runtime.log"
+    loop.sessions.get_session_runtime_log_path.return_value = runtime_log
+    loop.provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="working",
+            tool_calls=[ToolCallRequest(
+                id="call_read",
+                name="read_file",
+                arguments={
+                    "path": "a.py",
+                    "offset": 10,
+                    "limit": 20,
+                    "pages": "",
+                    "force": False,
+                },
+            )],
+        ),
+        LLMResponse(content="done", tool_calls=[]),
+    ])
+    audit_tools = MagicMock()
+    audit_tools.get_definitions.return_value = []
+    audit_tools.prepare_call.return_value = (None, {}, None)
+    audit_tools.execute = AsyncMock(return_value="file body")
+
+    final_content, _, _, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "inspect"}],
+        session_key="cli:topic",
+        turn_id="cli:topic:turn-42",
+        tools=audit_tools,
+    )
+
+    records = [
+        json.loads(line)
+        for line in runtime_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    runner_records = [row for row in records if row["event"].startswith("runner.")]
+    audit_start = next(row for row in records if row["event"] == "runner.tool.audit.start")
+    audit_end = next(row for row in records if row["event"] == "runner.tool.audit.end")
+    assert final_content == "done"
+    assert runner_records
+    assert {row["turn_id"] for row in runner_records} == {"cli:topic:turn-42"}
+    assert audit_start["iteration"] == 0
+    assert audit_start["call_id"] == "call_read"
+    assert audit_start["arguments"] == {
+        "path": "a.py",
+        "offset": 10,
+        "limit": 20,
+        "pages": "",
+        "force": False,
+    }
+    assert audit_end["iteration"] == 0
+    assert audit_end["status"] == "ok"
+    assert audit_end["result_preview"] == "file body"
