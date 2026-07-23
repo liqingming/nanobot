@@ -113,6 +113,7 @@ class TestSpawnUnix:
 
         kwargs = mock_exec.call_args[1]
         assert kwargs["stdin"] == asyncio.subprocess.DEVNULL
+        assert kwargs["start_new_session"] is True
 
 
 class TestSpawnWindows:
@@ -739,3 +740,92 @@ class TestWindowsRealExec:
         result = await ExecTool(timeout=10).execute(command="cmd /c exit 7")
 
         assert "Exit code: 7" in result
+
+
+class TestProcessTreeCleanup:
+
+    @pytest.mark.asyncio
+    async def test_one_shot_timeout_terminates_process_tree(self):
+        process = AsyncMock()
+        process.communicate.side_effect = asyncio.TimeoutError
+        process.returncode = None
+
+        with (
+            patch.object(ExecTool, "_spawn", new=AsyncMock(return_value=process)),
+            patch.object(ExecTool, "_guard_command", return_value=None),
+            patch(
+                "nanobot.agent.tools.shell.terminate_process_tree",
+                new=AsyncMock(),
+            ) as terminate,
+        ):
+            result = await ExecTool(timeout=1).execute(command="slow command")
+
+        assert "Command timed out after 1 seconds" in result
+        terminate.assert_awaited_once_with(process)
+
+    @pytest.mark.asyncio
+    async def test_one_shot_cancellation_terminates_process_tree(self):
+        started = asyncio.Event()
+        blocker = asyncio.Event()
+        process = AsyncMock()
+        process.returncode = None
+
+        async def communicate():
+            started.set()
+            await blocker.wait()
+            return b"", b""
+
+        process.communicate.side_effect = communicate
+        with (
+            patch.object(ExecTool, "_spawn", new=AsyncMock(return_value=process)),
+            patch.object(ExecTool, "_guard_command", return_value=None),
+            patch(
+                "nanobot.agent.tools.shell.terminate_process_tree",
+                new=AsyncMock(),
+            ) as terminate,
+        ):
+            task = asyncio.create_task(ExecTool(timeout=30).execute(command="slow command"))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        terminate.assert_awaited_once_with(process)
+
+
+class TestPlatformProcessTreeTermination:
+
+    @pytest.mark.asyncio
+    async def test_windows_uses_hidden_taskkill_for_whole_tree(self):
+        from nanobot.agent.tools import process_tree
+
+        killer = AsyncMock()
+        killer.wait.return_value = 0
+        with (
+            patch.object(process_tree, "_IS_WINDOWS", True),
+            patch(
+                "nanobot.agent.tools.process_tree.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=killer),
+            ) as spawn,
+        ):
+            await process_tree._terminate_windows_tree(1234)
+
+        spawn.assert_awaited_once_with(
+            "taskkill",
+            "/PID",
+            "1234",
+            "/T",
+            "/F",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    def test_posix_kills_isolated_process_group(self):
+        from nanobot.agent.tools import process_tree
+
+        with patch("nanobot.agent.tools.process_tree.os.killpg", create=True) as killpg:
+            process_tree._terminate_posix_tree(1234)
+
+        killpg.assert_called_once_with(1234, process_tree._KILL_SIGNAL)

@@ -431,3 +431,169 @@ def test_exec_session_spawn_reuses_exec_tool_spawn_with_pipe_stdin(tmp_path):
         )
 
     asyncio.run(run())
+
+
+def test_exec_session_kill_terminates_process_tree_before_closing_stdin():
+    async def run() -> None:
+        from nanobot.agent.tools.exec_session import _ExecSession
+
+        process = AsyncMock()
+        process.returncode = None
+        process.stdout = None
+        process.stderr = None
+        events: list[str] = []
+
+        async def terminate(_process):
+            events.append("tree")
+
+        session = _ExecSession(
+            session_id="session",
+            process=process,
+            command="command",
+            cwd=".",
+            timeout=30,
+        )
+        with patch(
+            "nanobot.agent.tools.process_tree.terminate_process_tree",
+            new=AsyncMock(side_effect=terminate),
+        ) as terminate_tree:
+            session._close_stdin = AsyncMock(side_effect=lambda: events.append("stdin"))
+            session._drain_reader_tasks = AsyncMock()
+            session._close_process_transport = AsyncMock()
+            await session.kill()
+
+        terminate_tree.assert_awaited_once_with(process)
+        assert events == ["tree", "stdin"]
+
+    asyncio.run(run())
+
+
+def test_exec_session_start_cancellation_kills_and_removes_session(tmp_path):
+    async def run() -> None:
+        manager = ExecSessionManager()
+        process = AsyncMock()
+        process.returncode = None
+        process.stdout = None
+        process.stderr = None
+        started = asyncio.Event()
+        blocker = asyncio.Event()
+
+        async def wait():
+            started.set()
+            await blocker.wait()
+
+        process.wait.side_effect = wait
+        with (
+            patch.object(manager, "_spawn", new=AsyncMock(return_value=process)),
+            patch(
+                "nanobot.agent.tools.exec_session._ExecSession.kill",
+                new=AsyncMock(),
+            ) as kill,
+        ):
+            task = asyncio.create_task(
+                manager.start(
+                    command="command",
+                    cwd=str(tmp_path),
+                    env={},
+                    timeout=30,
+                    shell_program=None,
+                    login=False,
+                    yield_time_ms=30_000,
+                    max_output_chars=10_000,
+                )
+            )
+            await started.wait()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        kill.assert_awaited_once()
+        assert manager._sessions == {}
+
+    asyncio.run(run())
+
+
+def test_exec_session_write_cancellation_kills_and_removes_session(tmp_path):
+    async def run() -> None:
+        manager = ExecSessionManager()
+        process = AsyncMock()
+        process.returncode = None
+        process.stdout = None
+        process.stderr = None
+        process.stdin = None
+        started = asyncio.Event()
+        blocker = asyncio.Event()
+
+        async def poll(*args, **kwargs):
+            started.set()
+            await blocker.wait()
+
+        with patch.object(manager, "_spawn", new=AsyncMock(return_value=process)):
+            session_id, _ = await manager.start(
+                command="command",
+                cwd=str(tmp_path),
+                env={},
+                timeout=30,
+                shell_program=None,
+                login=False,
+                yield_time_ms=0,
+                max_output_chars=10_000,
+            )
+        session = manager._sessions[session_id]
+        session.poll = AsyncMock(side_effect=poll)
+        session.kill = AsyncMock()
+
+        task = asyncio.create_task(
+            manager.write(
+                session_id=session_id,
+                chars=None,
+                close_stdin=False,
+                terminate=False,
+                yield_time_ms=30_000,
+                max_output_chars=10_000,
+            )
+        )
+        await started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        session.kill.assert_awaited_once()
+        assert manager._sessions == {}
+
+    asyncio.run(run())
+
+
+def test_exec_session_deadline_terminates_process_tree():
+    async def run() -> None:
+        from nanobot.agent.tools.exec_session import _ExecSession
+
+        process = AsyncMock()
+        process.returncode = None
+        process.stdout = None
+        process.stderr = None
+        process._transport = None
+        session = _ExecSession(
+            session_id="session",
+            process=process,
+            command="command",
+            cwd=".",
+            timeout=30,
+        )
+        session.deadline = 0
+
+        async def kill():
+            process.returncode = 1
+
+        session.kill = AsyncMock(side_effect=kill)
+        poll = await session.poll(0, 10_000)
+
+        session.kill.assert_awaited_once()
+        assert poll.timed_out is True
+        assert poll.done is True
+
+    asyncio.run(run())

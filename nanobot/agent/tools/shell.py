@@ -9,7 +9,6 @@ import re
 import shutil
 import subprocess
 import sys
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -28,6 +27,7 @@ from nanobot.agent.tools.exec_session import (
     clamp_session_int,
     format_session_poll,
 )
+from nanobot.agent.tools.process_tree import terminate_process_tree
 from nanobot.agent.tools.sandbox import wrap_command
 from nanobot.agent.tools.schema import (
     BooleanSchema,
@@ -648,6 +648,9 @@ class ExecTool(Tool):
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             env=env,
+            # Give every tool command an isolated process group so timeout or
+            # cancellation can terminate the whole shell descendant tree.
+            start_new_session=True,
         )
 
     @staticmethod
@@ -723,17 +726,8 @@ class ExecTool(Tool):
 
     @staticmethod
     async def _kill_process(process: asyncio.subprocess.Process) -> None:
-        """Kill a subprocess and reap it to prevent zombies."""
-        process.kill()
-        try:
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-        finally:
-            if not _IS_WINDOWS:
-                try:
-                    os.waitpid(process.pid, os.WNOHANG)
-                except (ProcessLookupError, ChildProcessError) as e:
-                    logger.debug("Process already reaped or not found: {}", e)
+        """Kill a subprocess tree and reap the direct child."""
+        await terminate_process_tree(process)
 
     def _build_env(self) -> dict[str, str]:
         """Build a minimal environment for subprocess execution.

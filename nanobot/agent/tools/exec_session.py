@@ -162,12 +162,13 @@ class _ExecSession:
         )
 
     async def kill(self) -> None:
-        await self._close_stdin()
+        from nanobot.agent.tools.process_tree import terminate_process_tree
+
+        # Terminate descendants before closing stdin. EOF can make the direct
+        # shell exit first and orphan its children before taskkill sees them.
         if self.process.returncode is None:
-            with suppress(ProcessLookupError):
-                self.process.kill()
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+            await terminate_process_tree(self.process)
+        await self._close_stdin()
         await self._drain_reader_tasks()
         await self._close_process_transport()
 
@@ -241,7 +242,13 @@ class ExecSessionManager:
             )
             self._sessions[session_id] = session
 
-        poll = await session.poll(yield_time_ms, max_output_chars)
+        try:
+            poll = await session.poll(yield_time_ms, max_output_chars)
+        except asyncio.CancelledError:
+            async with self._lock:
+                self._sessions.pop(session_id, None)
+            await session.kill()
+            raise
         if poll.done:
             async with self._lock:
                 self._sessions.pop(session_id, None)
@@ -270,24 +277,30 @@ class ExecSessionManager:
         ):
             raise KeyError(session_id)
 
-        if chars:
-            error = await session.write(chars)
-            if error:
-                raise RuntimeError(error)
-        stdin_closed = False
-        if close_stdin:
-            error = await session.close_stdin()
-            if error:
-                raise RuntimeError(error)
-            stdin_closed = True
-        if terminate:
+        try:
+            if chars:
+                error = await session.write(chars)
+                if error:
+                    raise RuntimeError(error)
+            stdin_closed = False
+            if close_stdin:
+                error = await session.close_stdin()
+                if error:
+                    raise RuntimeError(error)
+                stdin_closed = True
+            if terminate:
+                await session.kill()
+            poll = await session.poll(
+                yield_time_ms,
+                max_output_chars,
+                terminated=terminate,
+                stdin_closed=stdin_closed,
+            )
+        except asyncio.CancelledError:
+            async with self._lock:
+                self._sessions.pop(session_id, None)
             await session.kill()
-        poll = await session.poll(
-            yield_time_ms,
-            max_output_chars,
-            terminated=terminate,
-            stdin_closed=stdin_closed,
-        )
+            raise
         if poll.done:
             async with self._lock:
                 self._sessions.pop(session_id, None)
