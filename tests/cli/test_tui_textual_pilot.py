@@ -1623,3 +1623,63 @@ async def test_user_message_navigation_includes_prepended_history_page() -> None
         await pilot.press("ctrl+up")
         await pilot.pause()
         assert output._user_navigation_id == "user-older"
+
+
+@pytest.mark.asyncio
+async def test_welcome_page_lists_bound_shortcuts_and_common_commands(tmp_path):
+    tui = TextualTUI(history_file=tmp_path / "history")
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        output = app.query_one("#output")
+        welcome = _output_log_text(output)
+
+    for shortcut in (
+        "PageUp / PageDown",
+        "Ctrl+↑ / Ctrl+↓",
+        "↑ / ↓",
+        "ESC",
+        "Ctrl+B",
+        "F6",
+        "Ctrl+C / Ctrl+D",
+        "鼠标拖选",
+    ):
+        assert shortcut in welcome
+
+    for command in (
+        "/rename",
+        "/resume",
+        "/clear",
+        "/todos",
+        "/continue",
+        "/bookmarks",
+        "/bookmarks-clear",
+        "/model",
+        "/status",
+        "/system-prompt",
+        "/skin",
+        "/exit",
+    ):
+        assert command in welcome
+
+    for unavailable_command in (
+        "/new",
+        "/topics",
+        "/clear-bookmarks",
+        "/preset",
+        "/ctx",
+        "/copy",
+    ):
+        assert unavailable_command not in welcome
+    assert "Ctrl+C / Ctrl+D" in welcome
+    assert "复制选区或退出" in welcome
+    assert "选择要复制的文本" in welcome
+    assert "自动复制到剪贴板" not in welcome
+    assert "/skin [参数]" in welcome
+    assert "无参数：打开背景图选择列表" in welcome
+    assert "list：列出背景图；next / prev：上一张 / 下一张" in welcome
+    assert "random：随机切换；编号 / 文件名：切换到指定背景图" in welcome
+    assert "输入 / 可查看完整命令列表" in welcome
+    assert "Ctrl+Shift+B" not in welcome
+    assert "Alt+B" not in welcome
+    assert "Ctrl+Alt+B" not in welcome
