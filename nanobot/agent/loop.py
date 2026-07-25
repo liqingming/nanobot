@@ -1550,7 +1550,39 @@ class AgentLoop:
                     completed_channel = msg.channel
                     completed_chat_id = msg.chat_id
                     if response is not None:
-                        await self.bus.publish_outbound(response)
+                        response_metadata = dict(response.metadata or {})
+                        delivery_fields = {
+                            "session_key": session_key,
+                            "channel": response.channel,
+                            "chat_id": response.chat_id,
+                            "turn_request_id": self._turn_request_id(msg),
+                            "transcript_id": response_metadata.get("_transcript_id"),
+                            "content_chars": len(response.content or ""),
+                            "streamed": bool(response_metadata.get("_streamed")),
+                            "no_content": bool(response_metadata.get("_no_content")),
+                        }
+                        runtime_log_path = self.sessions.get_session_runtime_log_path(session_key)
+                        append_session_runtime_log(
+                            runtime_log_path,
+                            "outbound.final.publish.start",
+                            **delivery_fields,
+                        )
+                        try:
+                            await self.bus.publish_outbound(response)
+                        except Exception as exc:
+                            append_session_runtime_log(
+                                runtime_log_path,
+                                "outbound.final.publish.exception",
+                                **delivery_fields,
+                                **exception_fields(exc),
+                            )
+                            raise
+                        append_session_runtime_log(
+                            runtime_log_path,
+                            "outbound.final.publish.done",
+                            **delivery_fields,
+                            outbound_queue_size=self.bus.outbound_size,
+                        )
                         if self._should_auto_recover_model_error(msg, response):
                             self._schedule_background(
                                 self._publish_auto_recovery_message(msg, response, session_key)
@@ -2313,6 +2345,11 @@ class AgentLoop:
             ctx.on_stream,
             turn_latency_ms=ctx.turn_latency_ms,
         )
+        if ctx.outbound is not None:
+            ctx.outbound.metadata.setdefault("_turn_request_id", self._turn_request_id(ctx.msg))
+            assistant_transcript_id = ctx.msg.metadata.get("_assistant_transcript_id")
+            if isinstance(assistant_transcript_id, str) and assistant_transcript_id:
+                ctx.outbound.metadata.setdefault("_transcript_id", assistant_transcript_id)
         if ctx.ephemeral and ctx.outbound is not None:
             ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason
         return "ok"

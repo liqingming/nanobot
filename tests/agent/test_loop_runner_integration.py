@@ -479,3 +479,57 @@ async def test_loop_runtime_log_correlates_complete_tool_trace_by_turn_id(tmp_pa
     assert audit_end["iteration"] == 0
     assert audit_end["status"] == "ok"
     assert audit_end["result_preview"] == "file body"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_logs_final_outbound_publish_and_correlation(tmp_path):
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    response = LLMResponse(content="final answer", finish_reason="stop", tool_calls=[], usage={})
+    provider.chat_with_retry = AsyncMock(return_value=response)
+    provider.chat_stream_with_retry = AsyncMock(return_value=response)
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    await loop._dispatch(InboundMessage(
+        channel="cli",
+        sender_id="user",
+        chat_id="delivery-log",
+        content="do the task",
+        metadata={
+            "_wants_stream": True,
+            "_turn_request_id": "request-42",
+            "_assistant_transcript_id": "assistant-42",
+        },
+    ))
+    if loop._background_tasks:
+        await asyncio.gather(*list(loop._background_tasks), return_exceptions=True)
+
+    outbound = None
+    while bus.outbound_size:
+        candidate = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        if candidate.metadata.get("_streamed"):
+            outbound = candidate
+    assert outbound is not None
+    assert outbound.metadata["_turn_request_id"] == "request-42"
+    assert isinstance(outbound.metadata.get("_transcript_id"), str)
+
+    log_path = loop.sessions.get_session_runtime_log_path("cli:delivery-log")
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    publish_events = [
+        event for event in events if event["event"].startswith("outbound.final.publish.")
+    ]
+    assert [event["event"] for event in publish_events] == [
+        "outbound.final.publish.start",
+        "outbound.final.publish.done",
+    ]
+    assert publish_events[0]["turn_request_id"] == "request-42"
+    assert publish_events[0]["transcript_id"] == outbound.metadata["_transcript_id"]
+    assert publish_events[0]["content_chars"] == len("final answer")
+    assert all("content" not in event and "final_preview" not in event for event in publish_events)

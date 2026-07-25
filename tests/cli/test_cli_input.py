@@ -1,10 +1,11 @@
+import json
 from contextlib import nullcontext
 from io import StringIO
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from rich.console import Console
 from prompt_toolkit.formatted_text import HTML
+from rich.console import Console
 
 from nanobot.cli import commands
 from nanobot.cli import stream as stream_mod
@@ -400,3 +401,69 @@ def test_render_interactive_ansi_force_terminal_follows_isatty():
     with patch.object(sys.stdout, "isatty", return_value=False):
         commands._render_interactive_ansi(render_fn)
         assert captured["console"]._force_terminal is False
+
+
+def test_render_cli_response_logs_start_and_done_without_content(tmp_path):
+    from nanobot.bus.events import OutboundMessage
+
+    tui = MagicMock()
+    msg = OutboundMessage(
+        channel="cli",
+        chat_id="topic-1",
+        content="secret final answer",
+        metadata={
+            "_turn_request_id": "request-1",
+            "_transcript_id": "transcript-1",
+            "_streamed": True,
+        },
+    )
+    log_path = tmp_path / "runtime.log"
+
+    commands._render_cli_response(
+        tui,
+        msg,
+        msg.content,
+        runtime_log_path=log_path,
+        delivery_kind="streamed_final",
+    )
+
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["event"] for event in events] == [
+        "cli.response.render.start",
+        "cli.response.render.done",
+    ]
+    assert events[0]["turn_request_id"] == "request-1"
+    assert events[0]["transcript_id"] == "transcript-1"
+    assert events[0]["rendered_chars"] == len(msg.content)
+    assert "secret final answer" not in log_path.read_text(encoding="utf-8")
+    tui.add_response.assert_called_once_with(
+        msg.content,
+        dict(msg.metadata),
+        message_id="transcript-1",
+    )
+
+
+def test_render_cli_response_logs_exception_and_reraises(tmp_path):
+    from nanobot.bus.events import OutboundMessage
+
+    tui = MagicMock()
+    tui.add_response.side_effect = RuntimeError("terminal write failed")
+    msg = OutboundMessage(channel="cli", chat_id="topic-1", content="answer")
+    log_path = tmp_path / "runtime.log"
+
+    with pytest.raises(RuntimeError, match="terminal write failed"):
+        commands._render_cli_response(
+            tui,
+            msg,
+            msg.content,
+            runtime_log_path=log_path,
+            delivery_kind="non_streaming_final",
+        )
+
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["event"] for event in events] == [
+        "cli.response.render.start",
+        "cli.response.render.exception",
+    ]
+    assert events[-1]["exception_type"] == "RuntimeError"
+    assert events[-1]["exception"] == "terminal write failed"

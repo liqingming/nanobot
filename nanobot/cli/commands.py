@@ -57,7 +57,6 @@ from prompt_toolkit.key_binding import KeyBindings  # noqa: E402
 from prompt_toolkit.keys import Keys  # noqa: E402
 from prompt_toolkit.patch_stdout import patch_stdout  # noqa: E402
 from rich.console import Console  # noqa: E402
-from rich.markdown import Markdown  # noqa: E402
 from rich.markup import escape  # noqa: E402
 from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
@@ -66,6 +65,7 @@ from nanobot import __logo__, __version__  # noqa: E402
 from nanobot import optional_features as feature_support  # noqa: E402
 from nanobot.agent.hooks import create_file_edit_activity_hook  # noqa: E402
 from nanobot.agent.loop import AgentLoop  # noqa: E402
+from nanobot.bus.events import OutboundMessage  # noqa: E402
 from nanobot.bus.outbound_events import (  # noqa: E402
     ProgressEvent,
     RetryWaitEvent,
@@ -78,7 +78,11 @@ from nanobot.cli.gateway import create_gateway_app  # noqa: E402
 from nanobot.cli.markdown import terminal_markdown  # noqa: E402
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner  # noqa: E402
 from nanobot.command.builtin import BUILTIN_COMMAND_SPECS  # noqa: E402
-from nanobot.config.paths import get_workspace_cache_dir, get_workspace_path, is_default_workspace  # noqa: E402
+from nanobot.config.paths import (  # noqa: E402
+    get_workspace_cache_dir,
+    get_workspace_path,
+    is_default_workspace,
+)
 from nanobot.config.schema import Config  # noqa: E402
 from nanobot.utils.evaluator import evaluate_response  # noqa: E402
 from nanobot.utils.helpers import safe_filename, sync_workspace_templates  # noqa: E402
@@ -88,7 +92,55 @@ from nanobot.utils.restart import (  # noqa: E402
     format_restart_completed_message,
     should_show_cli_restart_notice,
 )
+from nanobot.utils.session_runtime_log import (  # noqa: E402
+    append_session_runtime_log,
+    exception_fields,
+)
 from nanobot.webui.sidebar_state import read_webui_sidebar_state  # noqa: E402
+
+
+def _cli_response_delivery_fields(msg: OutboundMessage, *, delivery_kind: str) -> dict[str, Any]:
+    """Return privacy-safe correlation fields for CLI response delivery logs."""
+    metadata = dict(msg.metadata or {})
+    return {
+        "channel": msg.channel,
+        "chat_id": msg.chat_id,
+        "turn_request_id": metadata.get("_turn_request_id"),
+        "transcript_id": metadata.get("_transcript_id"),
+        "delivery_kind": delivery_kind,
+        "content_chars": len(msg.content or ""),
+        "streamed": bool(metadata.get("_streamed")),
+        "no_content": bool(metadata.get("_no_content")),
+    }
+
+
+def _render_cli_response(
+    tui: Any,
+    msg: OutboundMessage,
+    content: str,
+    *,
+    runtime_log_path: Path,
+    delivery_kind: str,
+) -> None:
+    """Render one final CLI response with durable start/done/exception diagnostics."""
+    fields = _cli_response_delivery_fields(msg, delivery_kind=delivery_kind)
+    fields["rendered_chars"] = len(content)
+    append_session_runtime_log(runtime_log_path, "cli.response.render.start", **fields)
+    try:
+        tui.add_response(
+            content,
+            dict(msg.metadata or {}),
+            message_id=(msg.metadata or {}).get("_transcript_id"),
+        )
+    except Exception as exc:
+        append_session_runtime_log(
+            runtime_log_path,
+            "cli.response.render.exception",
+            **fields,
+            **exception_fields(exc),
+        )
+        raise
+    append_session_runtime_log(runtime_log_path, "cli.response.render.done", **fields)
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -2269,9 +2321,9 @@ def agent(
         from nanobot.fork.cli.tui_factory import create_tui
 
         if ":" in session_id:
-            cli_channel, cli_chat_id = session_id.split(":", 1)
+            cli_channel, _cli_chat_id = session_id.split(":", 1)
         else:
-            cli_channel, cli_chat_id = "cli", session_id
+            cli_channel, _cli_chat_id = "cli", session_id
 
         history_file = str(get_cli_history_path())
 
@@ -2849,6 +2901,9 @@ def agent(
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
                         event = outbound_event_from_message(msg)
+                        runtime_log_path = agent_loop.sessions.get_session_runtime_log_path(
+                            f"{cli_channel}:{msg.chat_id}"
+                        )
 
                         if isinstance(event, StreamDeltaEvent) or msg.metadata.get("_stream_delta"):
                             if not _turn_cancelled[0]:
@@ -2863,7 +2918,19 @@ def agent(
                             continue
 
                         if isinstance(event, StreamedResponseEvent) or msg.metadata.get("_streamed"):
+                            delivery_fields = _cli_response_delivery_fields(
+                                msg, delivery_kind="streamed_final"
+                            )
+                            append_session_runtime_log(
+                                runtime_log_path, "cli.response.received", **delivery_fields
+                            )
                             if _turn_cancelled[0]:
+                                append_session_runtime_log(
+                                    runtime_log_path,
+                                    "cli.response.render.skipped",
+                                    **delivery_fields,
+                                    reason="turn_cancelled",
+                                )
                                 _turn_cancelled[0] = False
                                 continue
                             streamed = tui.pop_stream()
@@ -2874,10 +2941,20 @@ def agent(
                                 final = streamed or msg.content or ""
                             content = "\n\n".join(p for p in [intermediate, final] if p.strip())
                             if content.strip():
-                                tui.add_response(
+                                _render_cli_response(
+                                    tui,
+                                    msg,
                                     content,
-                                    dict(msg.metadata or {}),
-                                    message_id=(msg.metadata or {}).get("_transcript_id"),
+                                    runtime_log_path=runtime_log_path,
+                                    delivery_kind="streamed_final",
+                                )
+                            else:
+                                append_session_runtime_log(
+                                    runtime_log_path,
+                                    "cli.response.render.skipped",
+                                    **delivery_fields,
+                                    reason="empty_rendered_content",
+                                    rendered_chars=len(content),
                                 )
                             await _turn_complete()
                             continue
@@ -2964,27 +3041,51 @@ def agent(
                             continue
 
                         if msg.metadata.get("_error"):
+                            delivery_fields = _cli_response_delivery_fields(
+                                msg, delivery_kind="error_final"
+                            )
+                            append_session_runtime_log(
+                                runtime_log_path, "cli.response.received", **delivery_fields
+                            )
                             try:
                                 tui.pop_stream()
                                 tui.flush_accumulator()
                             except Exception:
                                 pass
                             content = msg.content or "nanobot task failed. See this topic's runtime.log for details."
-                            tui.add_response(
+                            _render_cli_response(
+                                tui,
+                                msg,
                                 content,
-                                dict(msg.metadata or {}),
-                                message_id=(msg.metadata or {}).get("_transcript_id"),
+                                runtime_log_path=runtime_log_path,
+                                delivery_kind="error_final",
                             )
                             if is_processing:
                                 await _turn_complete()
                             continue
 
                         # Non-streaming response (or unsolicited push from cron etc.)
+                        delivery_fields = _cli_response_delivery_fields(
+                            msg, delivery_kind="non_streaming_final"
+                        )
+                        append_session_runtime_log(
+                            runtime_log_path, "cli.response.received", **delivery_fields
+                        )
                         if msg.content:
-                            tui.add_response(
+                            _render_cli_response(
+                                tui,
+                                msg,
                                 msg.content,
-                                dict(msg.metadata or {}),
-                                message_id=(msg.metadata or {}).get("_transcript_id"),
+                                runtime_log_path=runtime_log_path,
+                                delivery_kind="non_streaming_final",
+                            )
+                        else:
+                            append_session_runtime_log(
+                                runtime_log_path,
+                                "cli.response.render.skipped",
+                                **delivery_fields,
+                                reason="empty_message_content",
+                                rendered_chars=0,
                             )
                         if is_processing:
                             await _turn_complete()
@@ -3520,7 +3621,7 @@ def cache_migrate(
         raise typer.Exit(1)
 
     shutil.move(str(old_cache), str(new_cache))
-    console.print(f"[green]✓ Cache migrated[/green]")
+    console.print("[green]✓ Cache migrated[/green]")
     console.print(f"  [dim]{old_cache}[/dim]")
     console.print(f"  [dim]→ {new_cache}[/dim]")
 
