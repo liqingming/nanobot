@@ -46,7 +46,13 @@ class LoadSkillTool(Tool):
             self._loader.workspace,
             builtin_skills_dir=self._loader.builtin_skills,
             disabled_skills=self._loader.disabled_skills,
-            extra_skill_roots=project_skill_roots(scope.project_path),
+            extra_skill_roots=[
+                *[
+                    entry for entry in self._loader.extra_skill_roots
+                    if entry[0].startswith("configured-")
+                ],
+                *project_skill_roots(scope.project_path),
+            ],
         )
 
     @property

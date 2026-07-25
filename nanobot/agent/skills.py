@@ -28,6 +28,11 @@ _STRIP_SKILL_FRONTMATTER = re.compile(
 )
 
 
+def configured_skill_roots(paths: Sequence[str | Path]) -> list[tuple[str, Path]]:
+    """Convert configured Skill root paths into stable, ordered loader entries."""
+    return [(f"configured-{index}", Path(path)) for index, path in enumerate(paths, start=1)]
+
+
 def project_skill_roots(workspace: Path) -> list[tuple[str, Path]]:
     claude_dir = workspace / ".claude"
     if claude_dir.is_dir():

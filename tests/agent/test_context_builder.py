@@ -78,6 +78,36 @@ class TestSkillsRoots:
         }]
         assert all(entry["source"] != "claude" for entry in entries)
 
+    def test_configured_skill_roots_persist_for_request_workspace(self, tmp_path):
+        default_workspace = tmp_path / "default-project"
+        request_workspace = tmp_path / "request-project"
+        data_dir = tmp_path / "data"
+        shared_root = tmp_path / "shared-skills"
+        shared_skill = _write_skill(shared_root, "shared_skill", "Configured shared skill")
+        request_skill = _write_skill(
+            request_workspace / ".claude" / "skills",
+            "request_skill",
+            "Request-local skill",
+        )
+        default_workspace.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
+
+        builder = ContextBuilder(
+            workspace=default_workspace,
+            data_dir=data_dir,
+            skill_roots=[str(shared_root)],
+        )
+        loader = builder._skills_for_workspace(request_workspace)
+        entries = loader.list_skills(filter_unavailable=False)
+
+        assert {entry["name"] for entry in entries} >= {"shared_skill", "request_skill"}
+        assert next(entry for entry in entries if entry["name"] == "shared_skill") == {
+            "name": "shared_skill",
+            "path": str(shared_skill),
+            "source": "configured-1",
+        }
+        assert next(entry for entry in entries if entry["name"] == "request_skill")["path"] == str(request_skill)
+
 
 # ---------------------------------------------------------------------------
 # _build_runtime_context (static)

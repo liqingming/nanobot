@@ -54,6 +54,7 @@ def load_config(config_path: Path | None = None) -> Config:
                 data = json.load(f)
             data = _migrate_config(data)
             config = Config.model_validate(data)
+            _resolve_config_paths(config, path.parent)
         except (json.JSONDecodeError, ValueError, pydantic.ValidationError) as e:
             raise ValueError(f"Failed to load config from {path}: {e}") from e
 
@@ -195,3 +196,40 @@ def _migrate_config(data: dict) -> dict:
             tools.pop("mySet", None)
 
     return data
+
+
+def _resolve_config_paths(config: Config, config_dir: Path) -> None:
+    """Resolve config-relative Skill roots and executable search paths."""
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for raw in config.agents.defaults.skill_roots:
+        value = str(raw).strip()
+        if not value:
+            raise ValueError("agents.defaults.skillRoots entries must not be empty")
+        normalized = str(_resolve_config_path(value, config_dir))
+        key = normalized.casefold() if os.name == "nt" else normalized
+        if key not in seen:
+            seen.add(key)
+            resolved.append(normalized)
+    config.agents.defaults.skill_roots = resolved
+
+    exec_config = config.tools.exec
+    exec_config.path_prepend = _resolve_config_search_path(exec_config.path_prepend, config_dir)
+    exec_config.path_append = _resolve_config_search_path(exec_config.path_append, config_dir)
+
+
+def _resolve_config_path(value: str, config_dir: Path) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = config_dir / path
+    return path.resolve(strict=False)
+
+
+def _resolve_config_search_path(value: str, config_dir: Path) -> str:
+    if not value or "${" in value:
+        return value
+    return os.pathsep.join(
+        str(_resolve_config_path(part.strip(), config_dir))
+        for part in value.split(os.pathsep)
+        if part.strip()
+    )

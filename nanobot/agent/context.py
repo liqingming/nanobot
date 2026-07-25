@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 
 from nanobot.agent.context_artifacts import render_active_context, select_memory_view
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.skills import SkillsLoader, project_skill_roots
+from nanobot.agent.skills import SkillsLoader, configured_skill_roots, project_skill_roots
 from nanobot.agent.tools import mcp as mcp_tools
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.apps.cli import utils as cli_app_utils
@@ -83,6 +83,7 @@ class ContextBuilder:
         workspace: Path,
         timezone: str | None = None,
         disabled_skills: list[str] | None = None,
+        skill_roots: list[str] | None = None,
         *,
         data_dir: Path | None = None,
         topic_memory_factory: Any = None,
@@ -91,10 +92,11 @@ class ContextBuilder:
         self.data_dir = data_dir if data_dir is not None else workspace
         self.timezone = timezone
         self.memory = MemoryStore(self.data_dir)
+        self.configured_skill_roots = configured_skill_roots(skill_roots or [])
         self.skills = SkillsLoader(
             self.data_dir,
             disabled_skills=set(disabled_skills) if disabled_skills else None,
-            extra_skill_roots=project_skill_roots(self.workspace),
+            extra_skill_roots=[*self.configured_skill_roots, *project_skill_roots(self.workspace)],
         )
         self._topic_memory_factory = topic_memory_factory
 
@@ -109,7 +111,7 @@ class ContextBuilder:
         return SkillsLoader(
             self.data_dir,
             disabled_skills=self.skills.disabled_skills,
-            extra_skill_roots=project_skill_roots(workspace),
+            extra_skill_roots=[*self.configured_skill_roots, *project_skill_roots(workspace)],
         )
 
     def build_system_prompt(

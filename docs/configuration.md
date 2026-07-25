@@ -1953,8 +1953,8 @@ For API keys, tokens, and other secrets, see [Environment Variables for Secrets]
 | `tools.exec.sandbox` | `""` | Sandbox backend for shell commands. Set to `"bwrap"` to wrap exec calls in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox — the process can only see the workspace (read-write) and media directory (read-only); config files and API keys are hidden. Automatically enables workspace restriction for file tools. **Linux only** — requires `bwrap` installed (`apt install bubblewrap`; pre-installed in the Docker image). Not available on macOS or Windows (bwrap depends on Linux kernel namespaces). |
 | `tools.exec.enable` | `true` | When `false`, the shell `exec` tool is not registered at all. Use this to completely disable shell command execution. |
 | `tools.exec.timeout` | `60` | Default hard timeout in seconds for shell commands. Config values may exceed the per-call tool cap; set `0` to disable the hard timeout for trusted long-running commands. |
-| `tools.exec.pathPrepend` | `""` | Extra directories to prepend to `PATH` when running shell commands. Use this when configured tools should win executable lookup precedence, such as a Python virtual environment's `bin` or `Scripts` directory. |
-| `tools.exec.pathAppend` | `""` | Extra directories to append to `PATH` when running shell commands (e.g. `/usr/sbin` for `ufw`). |
+| `tools.exec.pathPrepend` | `""` | Extra directories to prepend to `PATH` when running shell commands. Relative entries resolve from the active JSON config file directory. Use this when configured tools should win executable lookup precedence, such as a Python virtual environment's `bin` or `Scripts` directory. |
+| `tools.exec.pathAppend` | `""` | Extra directories to append to `PATH` when running shell commands (e.g. `/usr/sbin` for `ufw`). Relative entries resolve from the active JSON config file directory. |
 | `tools.webuiAllowRemotePackageInstall` | `false` | When `false`, the WebUI can install missing optional packages only from a browser opened on the same machine as nanobot. Set to `true` only when a trusted remote admin is allowed to install Python packages into this nanobot environment. |
 | `tools.ssrfWhitelist` | `[]` | CIDR ranges exempted from the shared SSRF guard used by web fetches and HTTP/SSE MCP connections. Prefer exact host CIDRs such as `192.168.1.50/32`; broad ranges increase SSRF exposure. |
 | `channels.*.allowFrom` | omitted | Access control per channel. Omit to use pairing-only mode; set `["*"]` to allow everyone; or list specific user IDs. See [Pairing](#pairing) for details. |
@@ -2204,6 +2204,26 @@ Disabled skills are excluded from the main agent's skill summary, from always-on
 | Option | Default | Description |
 |--------|---------|-------------|
 | `agents.defaults.disabledSkills` | `[]` | List of skill directory names to exclude from loading. Applies to both built-in skills and workspace skills. |
+
+## Additional Skill Roots
+
+Use `agents.defaults.skillRoots` to load shared skills that live outside the workspace and Nanobot data directory:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "skillRoots": ["../../shared/skills", "D:/company/nanobot-skills"]
+    }
+  }
+}
+```
+
+Each root must contain one directory per skill, with a `SKILL.md` inside it: `<root>/<skill-name>/SKILL.md`. Relative paths are resolved from the directory containing the active Nanobot JSON config file; absolute paths and `~` are also supported. Configured roots remain available when an API request selects a different workspace and are inherited by subagents. Earlier roots take precedence when multiple roots contain the same skill name, followed by request-workspace `.claude/skills`, the Nanobot data-directory `skills`, and bundled skills.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `agents.defaults.skillRoots` | `[]` | Additional directories containing `<skill-name>/SKILL.md`; relative paths resolve from the config file directory. |
 
 ## Tool Hint Max Length
 

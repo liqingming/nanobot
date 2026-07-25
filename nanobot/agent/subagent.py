@@ -89,6 +89,7 @@ class SubagentManager:
         tools_config: ToolsConfig | None = None,
         restrict_to_workspace: bool = False,
         disabled_skills: list[str] | None = None,
+        skill_roots: list[str] | None = None,
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
         fail_on_tool_error: bool | None = None,
@@ -103,6 +104,7 @@ class SubagentManager:
         self.max_tool_result_chars = max_tool_result_chars
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
+        self.skill_roots = list(skill_roots or [])
         self.max_iterations = (
             max_iterations
             if max_iterations is not None
@@ -367,14 +369,17 @@ class SubagentManager:
     def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder
-        from nanobot.agent.skills import SkillsLoader, project_skill_roots
+        from nanobot.agent.skills import SkillsLoader, configured_skill_roots, project_skill_roots
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
         root = workspace or self.workspace
         skills_summary = SkillsLoader(
             root,
             disabled_skills=self.disabled_skills,
-            extra_skill_roots=project_skill_roots(self.workspace),
+            extra_skill_roots=[
+                *configured_skill_roots(self.skill_roots),
+                *project_skill_roots(root),
+            ],
         ).build_skills_summary()
         return render_template(
             "agent/subagent_system.md",
