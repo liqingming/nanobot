@@ -1956,7 +1956,31 @@ For API keys, tokens, and other secrets, see [Environment Variables for Secrets]
 | `tools.exec.pathPrepend` | `""` | Extra directories to prepend to `PATH` when running shell commands. Relative entries resolve from the active JSON config file directory. Use this when configured tools should win executable lookup precedence, such as a Python virtual environment's `bin` or `Scripts` directory. |
 | `tools.exec.pathAppend` | `""` | Extra directories to append to `PATH` when running shell commands (e.g. `/usr/sbin` for `ufw`). Relative entries resolve from the active JSON config file directory. |
 | `tools.webuiAllowRemotePackageInstall` | `false` | When `false`, the WebUI can install missing optional packages only from a browser opened on the same machine as nanobot. Set to `true` only when a trusted remote admin is allowed to install Python packages into this nanobot environment. |
-| `tools.ssrfWhitelist` | `[]` | CIDR ranges exempted from the shared SSRF guard used by web fetches and HTTP/SSE MCP connections. Prefer exact host CIDRs such as `192.168.1.50/32`; broad ranges increase SSRF exposure. |
+| `tools.allowPrivateNetworkAccess` | `false` | When `true`, the shared SSRF guard permits every normally blocked private/internal range for web fetches, shell commands containing HTTP(S) URLs, and HTTP/SSE MCP connections. This includes loopback, RFC 1918, carrier-grade NAT/Tailscale, IPv6 unique-local/link-local, and cloud metadata addresses. This fully disables the private-network boundary; enable it only for trusted users and workloads. |
+| `tools.ssrfWhitelist` | `[]` | CIDR ranges exempted from the shared SSRF guard. Use this for narrower exceptions or ranges not covered by `allowPrivateNetworkAccess`. Prefer exact host CIDRs such as `192.168.1.50/32`; broad ranges increase SSRF exposure. |
+
+To allow all standard private-network resources without listing every address:
+
+```json
+{
+  "tools": {
+    "allowPrivateNetworkAccess": true
+  }
+}
+```
+
+To allow only one trusted intranet host instead, leave the broad switch disabled and add its exact address as a `/32` (IPv4) or `/128` (IPv6) entry:
+
+```json
+{
+  "tools": {
+    "allowPrivateNetworkAccess": false,
+    "ssrfWhitelist": ["172.20.10.90/32"]
+  }
+}
+```
+
+Whitelist exemptions apply regardless of port. Redirect targets and resolved DNS addresses are still validated. Configuration is loaded at process startup, so restart the relevant nanobot CLI, gateway, or serve process after changing it.
 | `channels.*.allowFrom` | omitted | Access control per channel. Omit to use pairing-only mode; set `["*"]` to allow everyone; or list specific user IDs. See [Pairing](#pairing) for details. |
 
 **Docker security**: The official Docker image runs as a non-root user (`nanobot`, UID 1000) with bubblewrap pre-installed. When using `docker-compose.yml`, the container drops all Linux capabilities except `SYS_ADMIN` (required for bwrap's namespace isolation).

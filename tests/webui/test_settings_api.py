@@ -378,6 +378,7 @@ def test_settings_payload_includes_network_safety_fields(
     config_path = tmp_path / "config.json"
     config = Config()
     config.tools.webui_allow_local_service_access = False
+    config.tools.allow_private_network_access = True
     config.tools.ssrf_whitelist = ["100.64.0.0/10"]
     save_config(config, config_path)
     monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
@@ -388,7 +389,8 @@ def test_settings_payload_includes_network_safety_fields(
     assert payload["advanced"]["webui_allow_local_service_access"] is False
     assert payload["advanced"]["allow_local_preview_access"] is False
     assert payload["advanced"]["webui_default_access_mode"] == "default"
-    assert payload["advanced"]["private_service_protection_enabled"] is True
+    assert payload["advanced"]["private_service_protection_enabled"] is False
+    assert payload["advanced"]["private_network_access_enabled"] is True
     assert payload["advanced"]["ssrf_whitelist_count"] == 1
 
 

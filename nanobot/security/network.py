@@ -15,7 +15,7 @@ import httpx
 _BLOCKED_NETWORKS = [
     ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("100.64.0.0/10"),   # carrier-grade NAT
+    ipaddress.ip_network("100.64.0.0/10"),   # carrier-grade NAT / Tailscale
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),   # link-local / cloud metadata
     ipaddress.ip_network("172.16.0.0/12"),
@@ -27,6 +27,13 @@ _BLOCKED_NETWORKS = [
 
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
 _allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+_allow_private_network_access = False
+
+
+def configure_private_network_access(enabled: bool) -> None:
+    """Allow all normally blocked private/internal network ranges when enabled."""
+    global _allow_private_network_access
+    _allow_private_network_access = bool(enabled)
 
 
 def configure_ssrf_whitelist(cidrs: list[str]) -> None:
@@ -57,6 +64,8 @@ def _normalize_addr(
 def _is_private(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     normalized = _normalize_addr(addr)
     if _allowed_networks and any(normalized in net for net in _allowed_networks):
+        return False
+    if _allow_private_network_access:
         return False
     return any(normalized in net for net in _BLOCKED_NETWORKS)
 

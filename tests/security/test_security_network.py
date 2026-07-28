@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from nanobot.security.network import (
+    configure_private_network_access,
     configure_ssrf_whitelist,
     contains_internal_url,
     env_proxy_applies_to_url,
@@ -303,3 +304,58 @@ def test_whitelist_allows_ipv6_mapped_cgnat():
             assert ok, f"Whitelisted IPv6-mapped CGNAT should be allowed, got: {err}"
     finally:
         configure_ssrf_whitelist([])
+
+
+def test_exact_rfc1918_whitelist_allows_only_configured_host() -> None:
+    configure_ssrf_whitelist(["172.20.10.90/32"])
+    try:
+        allowed, reason = validate_url_target("http://172.20.10.90:3200/ai-agent-access.html")
+        assert allowed is True
+        assert reason == ""
+        assert contains_internal_url(
+            "Invoke-WebRequest http://172.20.10.90:3200/ai-agent-access.html"
+        ) is False
+
+        blocked, reason = validate_url_target("http://172.20.10.91:3200/")
+        assert blocked is False
+        assert "private/internal" in reason
+        assert contains_internal_url("curl http://172.20.10.91:3200/") is True
+    finally:
+        configure_ssrf_whitelist([])
+
+
+def test_private_network_switch_allows_all_internal_ranges_for_web_and_exec() -> None:
+    configure_private_network_access(True)
+    try:
+        for host, ip in [
+            ("special.local", "0.0.0.1"),
+            ("rfc1918-a.local", "10.20.30.40"),
+            ("tailscale.local", "100.100.1.1"),
+            ("loopback.local", "127.0.0.1"),
+            ("metadata.local", "169.254.169.254"),
+            ("rfc1918-b.local", "172.20.10.90"),
+            ("rfc1918-c.local", "192.168.50.10"),
+            ("loopback-v6.local", "::1"),
+            ("ula.local", "fd00::1234"),
+            ("link-local-v6.local", "fe80::1"),
+        ]:
+            resolver = _fake_resolve_v6 if ":" in ip else _fake_resolve
+            with patch("nanobot.security.network.socket.getaddrinfo", resolver(host, [ip])):
+                allowed, reason = validate_url_target(f"http://{host}/resource")
+                assert allowed, reason
+                assert not contains_internal_url(f"curl http://{host}/resource")
+    finally:
+        configure_private_network_access(False)
+
+
+def test_private_network_switch_can_be_disabled_again() -> None:
+    configure_private_network_access(True)
+    configure_private_network_access(False)
+
+    with patch(
+        "nanobot.security.network.socket.getaddrinfo",
+        _fake_resolve("intranet.local", ["172.20.10.90"]),
+    ):
+        allowed, _ = validate_url_target("http://intranet.local/resource")
+
+    assert not allowed

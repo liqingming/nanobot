@@ -58,14 +58,18 @@ def load_config(config_path: Path | None = None) -> Config:
         except (json.JSONDecodeError, ValueError, pydantic.ValidationError) as e:
             raise ValueError(f"Failed to load config from {path}: {e}") from e
 
-    _apply_ssrf_whitelist(config)
+    _apply_network_access_policy(config)
     return config
 
 
-def _apply_ssrf_whitelist(config: Config) -> None:
-    """Apply SSRF whitelist from config to the network security module."""
-    from nanobot.security.network import configure_ssrf_whitelist
+def _apply_network_access_policy(config: Config) -> None:
+    """Apply private-network access and SSRF exceptions to the shared guard."""
+    from nanobot.security.network import (
+        configure_private_network_access,
+        configure_ssrf_whitelist,
+    )
 
+    configure_private_network_access(config.tools.allow_private_network_access)
     configure_ssrf_whitelist(config.tools.ssrf_whitelist)
 
 

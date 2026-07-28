@@ -244,6 +244,34 @@ def test_new_my_tool_keys_take_precedence_over_legacy(tmp_path) -> None:
     assert config.tools.my.allow_set is True
 
 
+def test_load_config_applies_and_resets_private_network_access(tmp_path) -> None:
+    enabled = tmp_path / "enabled.json"
+    enabled.write_text(
+        json.dumps({"tools": {"allowPrivateNetworkAccess": True}}),
+        encoding="utf-8",
+    )
+    defaulted = tmp_path / "private-defaulted.json"
+    defaulted.write_text(json.dumps({}), encoding="utf-8")
+
+    config = load_config(enabled)
+    assert config.tools.allow_private_network_access is True
+    with patch(
+        "nanobot.security.network.socket.getaddrinfo",
+        _fake_resolve("intranet.local", ["172.20.10.90"]),
+    ):
+        ok, err = validate_url_target("http://intranet.local/api")
+        assert ok, err
+
+    config = load_config(defaulted)
+    assert config.tools.allow_private_network_access is False
+    with patch(
+        "nanobot.security.network.socket.getaddrinfo",
+        _fake_resolve("intranet.local", ["172.20.10.90"]),
+    ):
+        ok, _ = validate_url_target("http://intranet.local/api")
+        assert not ok
+
+
 def test_load_config_resets_ssrf_whitelist_when_next_config_is_empty(tmp_path) -> None:
     whitelisted = tmp_path / "whitelisted.json"
     whitelisted.write_text(
