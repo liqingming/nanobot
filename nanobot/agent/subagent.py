@@ -93,6 +93,7 @@ class SubagentManager:
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
         fail_on_tool_error: bool | None = None,
+        data_dir: Path | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
     ):
         defaults = AgentDefaults()
@@ -102,6 +103,7 @@ class SubagentManager:
         self.model = model or provider.get_default_model()
         self.tools_config = tools_config or ToolsConfig()
         self.max_tool_result_chars = max_tool_result_chars
+        self.data_dir = data_dir
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
         self.skill_roots = list(skill_roots or [])
@@ -268,6 +270,7 @@ class SubagentManager:
                     checkpoint_callback=_on_checkpoint,
                     session_key=sess_key,
                     workspace=root,
+                    data_dir=self.data_dir,
                     llm_timeout_s=llm_timeout,
                 ))
             finally:
