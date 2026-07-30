@@ -663,6 +663,7 @@ class AgentRunner:
                     tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
+                    response_items=response.response_items,
                 )
                 messages.append(assistant_message)
                 transition_started_at = time.monotonic()
@@ -904,6 +905,7 @@ class AgentRunner:
                         clean,
                         reasoning_content=response.reasoning_content,
                         thinking_blocks=response.thinking_blocks,
+                        response_items=response.response_items,
                     ))
                     messages.append(build_length_recovery_message())
                     await hook.after_iteration(context)
@@ -915,6 +917,7 @@ class AgentRunner:
                     clean,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
+                    response_items=response.response_items,
                 )
 
             # Check real mid-turn injections before signaling stream end. A
@@ -979,6 +982,7 @@ class AgentRunner:
                 clean,
                 reasoning_content=response.reasoning_content,
                 thinking_blocks=response.thinking_blocks,
+                response_items=response.response_items,
             ))
             await self._emit_checkpoint(
                 spec,
@@ -1085,6 +1089,11 @@ class AgentRunner:
             kwargs["max_tokens"] = spec.max_tokens
         if spec.reasoning_effort is not None:
             kwargs["reasoning_effort"] = spec.reasoning_effort
+        if getattr(self.provider, "supports_request_context", False) is True:
+            kwargs["request_context"] = {
+                "session_key": spec.session_key or "default",
+                "turn_id": spec.turn_id,
+            }
         return kwargs
 
     @staticmethod
@@ -1502,6 +1511,7 @@ class AgentRunner:
             tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
             reasoning_content=response.reasoning_content,
             thinking_blocks=response.thinking_blocks,
+            response_items=response.response_items,
         )
         completion_tokens = estimate_message_tokens(assistant_message)
         total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)

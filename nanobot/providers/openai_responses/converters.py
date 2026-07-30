@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 
@@ -32,6 +33,14 @@ def convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str
             continue
 
         if role == "assistant":
+            response_items = msg.get("response_items")
+            if isinstance(response_items, list) and response_items:
+                replay_items = [
+                    copy.deepcopy(item) for item in response_items if isinstance(item, dict)
+                ]
+                if replay_items:
+                    input_items.extend(replay_items)
+                    continue
             if isinstance(content, str) and content:
                 message_id = _unique_item_id(f"msg_{idx}", used_item_ids)
                 input_items.append({

@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 import secrets
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,7 @@ from nanobot.providers.base import (
     resolve_stream_idle_timeout_s,
 )
 from nanobot.providers.openai_responses import (
-    consume_sse_with_reasoning,
+    consume_sse_with_response_items,
     convert_messages,
     convert_tools,
 )
@@ -33,6 +34,7 @@ DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
 CODEX_FIRST_EVENT_TIMEOUT_ENV = "NANOBOT_CODEX_FIRST_EVENT_TIMEOUT_S"
 DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_S = 180.0
+CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
 _DIAGNOSTIC_HMAC_KEY = secrets.token_bytes(32)
 
 
@@ -40,6 +42,7 @@ class OpenAICodexProvider(LLMProvider):
     """Use Codex OAuth to call the Responses API."""
 
     supports_progress_deltas = True
+    supports_request_context = True
 
     def __init__(
         self,
@@ -49,6 +52,8 @@ class OpenAICodexProvider(LLMProvider):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
         self.proxy = proxy or None
+        self._window_id = str(uuid.uuid4())
+        self._turn_states: dict[tuple[str, str], str] = {}
         self._context_window, self._effective_input_window = (
             _load_codex_model_context(default_model)
         )
@@ -73,6 +78,15 @@ class OpenAICodexProvider(LLMProvider):
         return super().input_token_budget(
             context_window_tokens, max_completion_tokens, safety_buffer
         )
+    def _remember_turn_state(self, key: tuple[str, str], value: str) -> None:
+        """Keep recent Codex sticky-routing state bounded and isolated by turn."""
+        self._turn_states.pop(key, None)
+        self._turn_states[key] = value
+        while len(self._turn_states) > 256:
+            oldest = next(iter(self._turn_states))
+            self._turn_states.pop(oldest, None)
+
+
 
     async def _call_codex(
         self,
@@ -81,35 +95,53 @@ class OpenAICodexProvider(LLMProvider):
         model: str | None,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
+        request_context: dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Shared request logic for both chat() and chat_stream()."""
         model = model or self.default_model
-        system_prompt, input_items = convert_messages(messages)
-
-        body: dict[str, Any] = {
-            "model": _strip_model_prefix(model),
-            "store": False,
-            "stream": True,
-            "instructions": system_prompt,
-            "input": input_items,
-            "text": {"verbosity": "medium"},
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": _prompt_cache_key(messages[:2]),
-            "tool_choice": tool_choice or "auto",
-            "parallel_tool_calls": True,
-        }
-        reasoning_options = _build_reasoning_options(reasoning_effort)
-        if reasoning_options:
-            body["reasoning"] = reasoning_options
-        if tools:
-            body["tools"] = convert_tools(tools)
+        model_info = _load_codex_model_info(model)
+        use_responses_lite = model_info.get("use_responses_lite") is True
+        body = _build_request_body(
+            messages,
+            tools,
+            model,
+            reasoning_effort,
+            tool_choice,
+            model_info=model_info,
+        )
 
         try:
-            token = await asyncio.to_thread(call_with_optional_proxy, get_codex_token, proxy=self.proxy)
-            headers = _build_headers(token.account_id, token.access)
+            token = await asyncio.to_thread(
+                call_with_optional_proxy, get_codex_token, proxy=self.proxy
+            )
+            request_metadata = _build_codex_request_metadata(
+                token.account_id,
+                request_context,
+                window_id=self._window_id,
+            )
+            body["client_metadata"] = request_metadata["client_metadata"]
+            if request_context is not None:
+                body["prompt_cache_key"] = request_metadata["session_id"]
+
+            turn_state_key = _codex_turn_state_key(request_metadata)
+            turn_state = self._turn_states.get(turn_state_key) if turn_state_key else None
+            raw_headers = _build_headers(
+                token.account_id,
+                token.access,
+                use_responses_lite=use_responses_lite,
+                request_metadata=request_metadata,
+                turn_state=turn_state,
+            )
+            headers = _CodexRequestHeaders(
+                raw_headers,
+                on_turn_state=(
+                    (lambda value: self._remember_turn_state(turn_state_key, value))
+                    if turn_state_key else None
+                ),
+            )
 
             try:
                 request_result = await _request_codex(
@@ -125,6 +157,7 @@ class OpenAICodexProvider(LLMProvider):
                     finish_reason,
                     usage,
                     reasoning_content,
+                    response_items,
                     diagnostics,
                 ) = _unpack_codex_result(request_result)
             except Exception as e:
@@ -144,6 +177,7 @@ class OpenAICodexProvider(LLMProvider):
                     finish_reason,
                     usage,
                     reasoning_content,
+                    response_items,
                     diagnostics,
                 ) = _unpack_codex_result(request_result)
             return LLMResponse(
@@ -152,6 +186,7 @@ class OpenAICodexProvider(LLMProvider):
                 finish_reason=finish_reason,
                 usage=usage,
                 reasoning_content=reasoning_content,
+                response_items=response_items,
                 provider_diagnostics=diagnostics,
             )
         except Exception as e:
@@ -176,8 +211,16 @@ class OpenAICodexProvider(LLMProvider):
         model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        request_context: dict[str, Any] | None = None,
     ) -> LLMResponse:
-        return await self._call_codex(messages, tools, model, reasoning_effort, tool_choice)
+        return await self._call_codex(
+            messages,
+            tools,
+            model,
+            reasoning_effort,
+            tool_choice,
+            request_context=request_context,
+        )
 
     async def chat_stream(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
@@ -185,6 +228,7 @@ class OpenAICodexProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        request_context: dict[str, Any] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
@@ -194,9 +238,10 @@ class OpenAICodexProvider(LLMProvider):
             model,
             reasoning_effort,
             tool_choice,
-            on_content_delta,
-            on_thinking_delta,
-            on_tool_call_delta,
+            request_context=request_context,
+            on_content_delta=on_content_delta,
+            on_thinking_delta=on_thinking_delta,
+            on_tool_call_delta=on_tool_call_delta,
         )
 
     def get_default_model(self) -> str:
@@ -241,27 +286,105 @@ def _strip_model_prefix(model: str) -> str:
 
 def _load_codex_model_context(model: str) -> tuple[int | None, int | None]:
     """Read the current Codex route limits from the CLI model catalog."""
-    root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    row = _load_codex_model_info(model)
     try:
-        data = json.loads((root / "models_cache.json").read_text(encoding="utf-8"))
-        slug = _strip_model_prefix(model)
-        row = next(
-            item
-            for item in data.get("models", [])
-            if isinstance(item, dict) and item.get("slug") == slug
-        )
         hard = int(row.get("context_window") or row.get("max_context_window") or 0)
         percent = int(row.get("effective_context_window_percent") or 100)
         if hard <= 0:
             return None, None
         effective = max(1, hard * min(100, max(1, percent)) // 100)
         return hard, effective
-    except (OSError, ValueError, TypeError, StopIteration, json.JSONDecodeError):
+    except (ValueError, TypeError):
         return None, None
 
 
-def _build_reasoning_options(reasoning_effort: str | None) -> dict[str, str] | None:
+def _load_codex_model_info(model: str) -> dict[str, Any]:
+    """Read one model's current capabilities from the Codex CLI catalog."""
+    root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    try:
+        data = json.loads((root / "models_cache.json").read_text(encoding="utf-8"))
+        slug = _strip_model_prefix(model)
+        return next(
+            item
+            for item in data.get("models", [])
+            if isinstance(item, dict) and item.get("slug") == slug
+        )
+    except (OSError, ValueError, TypeError, StopIteration, json.JSONDecodeError):
+        return {}
+
+
+def _build_request_body(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    model: str,
+    reasoning_effort: str | None,
+    tool_choice: str | dict[str, Any] | None,
+    *,
+    model_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the legacy or Responses Lite request selected by model capabilities."""
+    model_info = model_info if model_info is not None else _load_codex_model_info(model)
+    use_responses_lite = model_info.get("use_responses_lite") is True
+    system_prompt, conversation_items = convert_messages(messages)
+    converted_tools = convert_tools(tools or [])
+
+    if use_responses_lite:
+        input_items: list[dict[str, Any]] = [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": converted_tools,
+            }
+        ]
+        if system_prompt:
+            input_items.append({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            })
+        input_items.extend(conversation_items)
+    else:
+        input_items = conversation_items
+
+    verbosity = "medium"
+    if use_responses_lite:
+        default_verbosity = model_info.get("default_verbosity")
+        verbosity = default_verbosity if isinstance(default_verbosity, str) else "low"
+
+    body: dict[str, Any] = {
+        "model": _strip_model_prefix(model),
+        "store": False,
+        "stream": True,
+        "instructions": "" if use_responses_lite else system_prompt,
+        "input": input_items,
+        "text": {"verbosity": verbosity},
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": _prompt_cache_key(messages[:2]),
+        "tool_choice": tool_choice or "auto",
+        "parallel_tool_calls": not use_responses_lite,
+    }
+    reasoning_options = _build_reasoning_options(
+        reasoning_effort,
+        use_responses_lite=use_responses_lite,
+    )
+    if reasoning_options:
+        body["reasoning"] = reasoning_options
+    if converted_tools and not use_responses_lite:
+        body["tools"] = converted_tools
+    return body
+
+
+def _build_reasoning_options(
+    reasoning_effort: str | None,
+    *,
+    use_responses_lite: bool = False,
+) -> dict[str, str] | None:
     """Opt in to visible summaries without changing provider-default effort."""
+    if use_responses_lite:
+        options = {"context": "all_turns"}
+        if reasoning_effort:
+            options["effort"] = reasoning_effort
+        return options
     if reasoning_effort and reasoning_effort.lower() == "none":
         return {"effort": "none"}
     options = {"summary": "auto"}
@@ -270,8 +393,100 @@ def _build_reasoning_options(reasoning_effort: str | None) -> dict[str, str] | N
     return options
 
 
-def _build_headers(account_id: str, token: str) -> dict[str, str]:
+def _stable_codex_id(kind: str, *parts: str) -> str:
+    """Return a non-sensitive stable UUID for Codex routing metadata."""
+    seed = "\x1f".join(("nanobot", "codex", kind, *parts))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+
+
+def _build_codex_request_metadata(
+    account_id: str,
+    request_context: dict[str, Any] | None,
+    *,
+    window_id: str,
+) -> dict[str, Any]:
+    """Build the canonical Codex session/thread/client metadata snapshot."""
+    context = request_context or {}
+    session_key = str(context.get("session_key") or "default")
+    raw_turn_id = context.get("turn_id")
+    raw_turn_id = str(raw_turn_id) if raw_turn_id else None
+
+    installation_id = _stable_codex_id("installation", account_id)
+    session_id = _stable_codex_id("session", account_id, session_key)
+    thread_id = _stable_codex_id("thread", account_id, session_key)
+    turn_id = (
+        _stable_codex_id("turn", account_id, session_key, raw_turn_id)
+        if raw_turn_id else None
+    )
+
+    client_metadata: dict[str, str] = {
+        "x-codex-installation-id": installation_id,
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "x-codex-window-id": window_id,
+    }
+    turn_metadata_json: str | None = None
+    if turn_id:
+        turn_metadata_json = json.dumps(
+            {
+                "installation_id": installation_id,
+                "session_id": session_id,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "window_id": window_id,
+                "request_kind": "turn",
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        client_metadata["turn_id"] = turn_id
+        client_metadata["x-codex-turn-metadata"] = turn_metadata_json
+
     return {
+        "installation_id": installation_id,
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "window_id": window_id,
+        "turn_metadata_json": turn_metadata_json,
+        "client_metadata": client_metadata,
+    }
+
+
+def _codex_turn_state_key(metadata: dict[str, Any]) -> tuple[str, str] | None:
+    session_id = metadata.get("session_id")
+    turn_id = metadata.get("turn_id")
+    if isinstance(session_id, str) and isinstance(turn_id, str):
+        return session_id, turn_id
+    return None
+
+
+class _CodexRequestHeaders(dict[str, str]):
+    """Request headers that persist a response turn-state before SSE parsing."""
+
+    def __init__(
+        self,
+        values: dict[str, str],
+        *,
+        on_turn_state: Callable[[str], None] | None = None,
+    ) -> None:
+        super().__init__(values)
+        self._on_turn_state = on_turn_state
+
+    def capture_turn_state(self, value: str | None) -> None:
+        if value and self._on_turn_state:
+            self._on_turn_state(value)
+
+
+def _build_headers(
+    account_id: str,
+    token: str,
+    *,
+    use_responses_lite: bool = False,
+    request_metadata: dict[str, Any] | None = None,
+    turn_state: str | None = None,
+) -> dict[str, str]:
+    headers = {
         "Authorization": f"Bearer {token}",
         "chatgpt-account-id": account_id,
         "OpenAI-Beta": "responses=experimental",
@@ -280,6 +495,22 @@ def _build_headers(account_id: str, token: str) -> dict[str, str]:
         "accept": "text/event-stream",
         "content-type": "application/json",
     }
+    if use_responses_lite:
+        headers["x-openai-internal-codex-responses-lite"] = "true"
+    if request_metadata:
+        headers.update({
+            "session-id": str(request_metadata["session_id"]),
+            "thread-id": str(request_metadata["thread_id"]),
+            "x-client-request-id": str(request_metadata["thread_id"]),
+            "x-codex-installation-id": str(request_metadata["installation_id"]),
+            "x-codex-window-id": str(request_metadata["window_id"]),
+        })
+        turn_metadata_json = request_metadata.get("turn_metadata_json")
+        if isinstance(turn_metadata_json, str):
+            headers["x-codex-turn-metadata"] = turn_metadata_json
+    if turn_state:
+        headers[CODEX_TURN_STATE_HEADER] = turn_state
+    return headers
 
 
 def _format_codex_exception(exc: BaseException) -> str:
@@ -323,6 +554,7 @@ async def _request_codex(
     str,
     dict[str, int],
     str | None,
+    list[dict[str, Any]],
     dict[str, Any],
 ]:
     idle_timeout_s = resolve_stream_idle_timeout_s()
@@ -341,6 +573,8 @@ async def _request_codex(
         client_kwargs["trust_env"] = False
     async with httpx.AsyncClient(**client_kwargs) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
+            if isinstance(headers, _CodexRequestHeaders):
+                headers.capture_turn_state(response.headers.get(CODEX_TURN_STATE_HEADER))
             if response.status_code != 200:
                 text = await response.aread()
                 raw = text.decode("utf-8", "ignore")
@@ -355,7 +589,7 @@ async def _request_codex(
                     should_retry=_should_retry_status(response.status_code, error_type, error_code, raw),
                 )
             diagnostics = _CodexSSEDiagnostics()
-            result = await consume_sse_with_reasoning(
+            result = await consume_sse_with_response_items(
                 response,
                 on_content_delta=on_content_delta,
                 on_tool_call_delta=on_tool_call_delta,
@@ -364,26 +598,46 @@ async def _request_codex(
                 first_line_timeout_s=first_event_timeout_s,
                 idle_timeout_s=idle_timeout_s,
             )
-            content, tool_calls, finish_reason, usage, reasoning_content = result
+            content, tool_calls, finish_reason, usage, reasoning_content, response_items = result
             return (
                 content,
                 tool_calls,
                 finish_reason,
                 usage,
                 reasoning_content,
+                response_items,
                 diagnostics.finish(content),
             )
 
 
 def _unpack_codex_result(
     result: tuple[Any, ...],
-) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None, dict[str, Any] | None]:
+) -> tuple[
+    str,
+    list[ToolCallRequest],
+    str,
+    dict[str, int],
+    str | None,
+    list[dict[str, Any]] | None,
+    dict[str, Any] | None,
+]:
     """Accept legacy five-item test/provider adapters while adding diagnostics."""
     if len(result) == 5:
         content, tool_calls, finish_reason, usage, reasoning_content = result
-        return content, tool_calls, finish_reason, usage, reasoning_content, None
-    content, tool_calls, finish_reason, usage, reasoning_content, diagnostics = result
-    return content, tool_calls, finish_reason, usage, reasoning_content, diagnostics
+        return content, tool_calls, finish_reason, usage, reasoning_content, None, None
+    if len(result) == 6:
+        content, tool_calls, finish_reason, usage, reasoning_content, diagnostics = result
+        return content, tool_calls, finish_reason, usage, reasoning_content, None, diagnostics
+    content, tool_calls, finish_reason, usage, reasoning_content, response_items, diagnostics = result
+    return (
+        content,
+        tool_calls,
+        finish_reason,
+        usage,
+        reasoning_content,
+        response_items,
+        diagnostics,
+    )
 
 
 def _diagnostic_fingerprint(value: str) -> str:

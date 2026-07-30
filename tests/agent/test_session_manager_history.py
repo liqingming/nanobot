@@ -247,6 +247,10 @@ def test_get_history_preserves_reasoning_content():
         "content": "done",
         "reasoning_content": "hidden chain of thought",
         "thinking_blocks": [{"type": "thinking", "thinking": "hidden chain of thought", "signature": "sig"}],
+        "response_items": [{
+            "type": "reasoning", "id": "rs_1",
+            "encrypted_content": "opaque-token", "summary": [],
+        }],
     })
 
     history = session.get_history(max_messages=500)
@@ -261,6 +265,10 @@ def test_get_history_preserves_reasoning_content():
                 "type": "thinking",
                 "thinking": "hidden chain of thought",
                 "signature": "sig",
+            }],
+            "response_items": [{
+                "type": "reasoning", "id": "rs_1",
+                "encrypted_content": "opaque-token", "summary": [],
             }],
         },
     ]

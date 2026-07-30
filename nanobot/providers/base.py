@@ -164,6 +164,9 @@ class LLMResponse:
     retry_after: float | None = None  # Provider supplied retry wait in seconds.
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1, MiMo etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
+    # Opaque Responses API output items required for stateless continuation.
+    # Persisted on assistant messages and replayed only by Responses providers.
+    response_items: list[dict[str, Any]] | None = None
     # Structured error metadata used by retry policy when finish_reason == "error".
     error_status_code: int | None = None
     error_kind: str | None = None  # e.g. "timeout", "connection"
@@ -240,6 +243,7 @@ class LLMProvider(ABC):
     """Base class for LLM providers."""
 
     supports_progress_deltas = False
+    supports_request_context = False
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _PERSISTENT_MAX_DELAY = 60
@@ -464,6 +468,7 @@ class LLMProvider(ABC):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        request_context: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.
@@ -763,6 +768,7 @@ class LLMProvider(ABC):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        request_context: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Stream a chat completion, calling *on_content_delta* for each text chunk.
 
@@ -777,11 +783,14 @@ class LLMProvider(ABC):
         streaming should override this method.
         """
         _ = on_thinking_delta, on_tool_call_delta
-        response = await self.chat(
+        chat_kwargs: dict[str, Any] = dict(
             messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
         )
+        if request_context is not None:
+            chat_kwargs["request_context"] = request_context
+        response = await self.chat(**chat_kwargs)
         if on_content_delta and response.content:
             await on_content_delta(response.content)
         return response
@@ -804,6 +813,7 @@ class LLMProvider(ABC):
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
+        request_context: dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
@@ -843,6 +853,8 @@ class LLMProvider(ABC):
             on_thinking_delta=on_thinking_delta,
             on_tool_call_delta=on_tool_call_delta,
         )
+        if request_context is not None:
+            kw["request_context"] = request_context
         if on_stream_recover and getattr(self, "supports_stream_recover_callback", False):
             kw["on_stream_recover"] = _recover_stream
         return await self._run_with_retry(
@@ -865,6 +877,7 @@ class LLMProvider(ABC):
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
+        request_context: dict[str, Any] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
         on_retry_event: Callable[[dict[str, Any]], None] | None = None,
@@ -890,6 +903,8 @@ class LLMProvider(ABC):
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
         )
+        if request_context is not None:
+            kw["request_context"] = request_context
         return await self._run_with_retry(
             self._safe_chat,
             kw,

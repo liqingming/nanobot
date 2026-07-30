@@ -76,6 +76,7 @@ class FallbackProvider(LLMProvider):
     """
 
     supports_stream_recover_callback = True
+    supports_request_context = True
 
     def __init__(
         self,
@@ -118,6 +119,21 @@ class FallbackProvider(LLMProvider):
     def supports_progress_deltas(self) -> bool:
         return bool(getattr(self._primary, "supports_progress_deltas", False))
 
+    @staticmethod
+    def _provider_kwargs(
+        provider: LLMProvider,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Pass request context only to providers that explicitly support it."""
+        if (
+            "request_context" not in kwargs
+            or getattr(provider, "supports_request_context", False) is True
+        ):
+            return kwargs
+        filtered = dict(kwargs)
+        filtered.pop("request_context", None)
+        return filtered
+
     def _primary_available(self) -> bool:
         """Return True if the primary provider is not currently tripped."""
         if self._primary_tripped_at is None:
@@ -129,7 +145,9 @@ class FallbackProvider(LLMProvider):
 
     async def chat(self, **kwargs: Any) -> LLMResponse:
         if not self._has_fallbacks:
-            return await self._primary.chat(**kwargs)
+            return await self._primary.chat(
+                **self._provider_kwargs(self._primary, kwargs)
+            )
         return await self._try_with_fallback(
             lambda p, kw: p.chat(**kw), kwargs, has_streamed=None
         )
@@ -137,7 +155,9 @@ class FallbackProvider(LLMProvider):
     async def chat_stream(self, **kwargs: Any) -> LLMResponse:
         on_stream_recover = kwargs.pop("on_stream_recover", None)
         if not self._has_fallbacks:
-            return await self._primary.chat_stream(**kwargs)
+            return await self._primary.chat_stream(
+                **self._provider_kwargs(self._primary, kwargs)
+            )
 
         has_streamed: list[bool] = [False]
         original_delta = kwargs.get("on_content_delta")
@@ -169,7 +189,9 @@ class FallbackProvider(LLMProvider):
 
         if self._primary_available():
             primary_was_attempted = True
-            response = await call(self._primary, kwargs)
+            response = await call(
+                self._primary, self._provider_kwargs(self._primary, kwargs)
+            )
             if response.finish_reason != "error":
                 self._primary_failures = 0
                 self._primary_tripped_at = None
@@ -267,7 +289,10 @@ class FallbackProvider(LLMProvider):
             else:
                 kwargs["reasoning_effort"] = fallback.reasoning_effort
             try:
-                fallback_response = await call(fallback_provider, kwargs)
+                fallback_response = await call(
+                    fallback_provider,
+                    self._provider_kwargs(fallback_provider, kwargs),
+                )
             finally:
                 for name, value in original_values.items():
                     if value is _MISSING:

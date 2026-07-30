@@ -758,3 +758,29 @@ async def test_runner_runtime_audit_closes_cancelled_tool_span():
     assert end["call_id"] == "call_wait"
     assert end["status"] == "cancelled"
     assert end["duration_ms"] >= 0
+
+@pytest.mark.asyncio
+async def test_runner_passes_request_context_to_opted_in_provider():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.supports_request_context = True
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="done", tool_calls=[]))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "inspect"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=16000,
+        session_key="cli:topic",
+        turn_id="turn-123",
+    ))
+
+    request_kwargs = provider.chat_with_retry.await_args.kwargs
+    assert request_kwargs["request_context"] == {
+        "session_key": "cli:topic",
+        "turn_id": "turn-123",
+    }

@@ -233,6 +233,25 @@ async def test_codex_prompt_cache_key_uses_stable_conversation_prefix(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_codex_provider_exposes_response_items_for_runner_persistence(monkeypatch) -> None:
+    _mock_codex_token(monkeypatch)
+    response_items = [{
+        "type": "reasoning", "id": "rs_1",
+        "encrypted_content": "opaque-token", "summary": [],
+    }]
+
+    async def fake_request(*args, **kwargs):
+        return "", [], "stop", {}, None, response_items, {"kind": "codex_sse"}
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
+
+    response = await OpenAICodexProvider().chat([{"role": "user", "content": "hello"}])
+
+    assert response.response_items == response_items
+    assert response.provider_diagnostics == {"kind": "codex_sse"}
+
+
+@pytest.mark.asyncio
 async def test_codex_timeout_error_is_typed_and_retryable(monkeypatch) -> None:
     _mock_codex_token(monkeypatch)
 
@@ -698,6 +717,144 @@ async def test_codex_provider_tolerates_oauth_get_token_without_proxy_parameter(
     assert response.content == "ok"
     assert seen == {"token_called": True, "request_proxy": "http://127.0.0.1:23458"}
 
+@pytest.mark.asyncio
+async def test_codex_responses_lite_uses_catalog_protocol(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "use_responses_lite": True,
+                        "default_verbosity": "low",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _mock_codex_token(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    async def fake_request(
+        url,
+        headers,
+        body,
+        verify,
+        proxy=None,
+        on_content_delta=None,
+        on_thinking_delta=None,
+        on_tool_call_delta=None,
+    ):
+        _ = url, verify, proxy, on_content_delta, on_thinking_delta, on_tool_call_delta
+        seen["headers"] = headers
+        seen["body"] = body
+        return "ok", [], "stop", {}, None
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
+    provider = OpenAICodexProvider(default_model="openai-codex/gpt-5.6-sol")
+
+    response = await provider.chat(
+        [
+            {"role": "system", "content": "You are nanobot."},
+            {"role": "user", "content": "hello"},
+        ],
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read one file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
+        reasoning_effort="high",
+    )
+
+    assert response.content == "ok"
+    headers = seen["headers"]
+    body = seen["body"]
+    assert headers["x-openai-internal-codex-responses-lite"] == "true"
+    assert body["instructions"] == ""
+    assert "tools" not in body
+    assert body["input"][0] == {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [{
+            "type": "function",
+            "name": "read_file",
+            "description": "Read one file",
+            "parameters": {"type": "object", "properties": {}},
+        }],
+    }
+    assert body["input"][1] == {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": "You are nanobot."}],
+    }
+    assert body["input"][2]["role"] == "user"
+    assert body["reasoning"] == {"context": "all_turns", "effort": "high"}
+    assert body["parallel_tool_calls"] is False
+    assert body["text"] == {"verbosity": "low"}
+
+
+@pytest.mark.asyncio
+async def test_codex_legacy_responses_preserves_existing_protocol(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "models_cache.json").write_text(
+        json.dumps({"models": [{"slug": "gpt-5.5", "use_responses_lite": False}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _mock_codex_token(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    async def fake_request(
+        url,
+        headers,
+        body,
+        verify,
+        proxy=None,
+        on_content_delta=None,
+        on_thinking_delta=None,
+        on_tool_call_delta=None,
+    ):
+        _ = url, verify, proxy, on_content_delta, on_thinking_delta, on_tool_call_delta
+        seen["headers"] = headers
+        seen["body"] = body
+        return "ok", [], "stop", {}, None
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
+    provider = OpenAICodexProvider(default_model="gpt-5.5")
+
+    await provider.chat(
+        [
+            {"role": "system", "content": "You are nanobot."},
+            {"role": "user", "content": "hello"},
+        ],
+        tools=[{"name": "read_file", "parameters": {"type": "object"}}],
+    )
+
+    headers = seen["headers"]
+    body = seen["body"]
+    assert "x-openai-internal-codex-responses-lite" not in headers
+    assert body["instructions"] == "You are nanobot."
+    assert body["input"][0]["role"] == "user"
+    assert body["tools"][0]["name"] == "read_file"
+    assert body["reasoning"] == {"summary": "auto"}
+    assert body["parallel_tool_calls"] is True
+    assert body["text"] == {"verbosity": "medium"}
+
+
+def test_codex_responses_lite_reasoning_requires_all_turns_context() -> None:
+    assert _build_reasoning_options(None, use_responses_lite=True) == {
+        "context": "all_turns"
+    }
+
+
 def test_codex_model_catalog_clamps_configured_context_window(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -784,3 +941,64 @@ def test_codex_response_server_error_without_status_is_retryable() -> None:
     assert response.error_type == "server_error"
     assert response.error_code == "server_error"
     assert response.error_should_retry is True
+
+@pytest.mark.asyncio
+async def test_codex_reuses_turn_state_only_within_same_turn(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "models_cache.json").write_text(
+        json.dumps({"models": [{"slug": "gpt-5.6-sol", "use_responses_lite": True}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _mock_codex_token(monkeypatch)
+    requests: list[tuple[dict[str, str], dict[str, Any]]] = []
+
+    async def fake_request(
+        url,
+        headers,
+        body,
+        verify,
+        proxy=None,
+        on_content_delta=None,
+        on_thinking_delta=None,
+        on_tool_call_delta=None,
+    ):
+        _ = url, verify, proxy, on_content_delta, on_thinking_delta, on_tool_call_delta
+        requests.append((dict(headers), body))
+        if len(requests) == 1:
+            headers.capture_turn_state("route-state-1")
+        return "ok", [], "stop", {}, None
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
+    provider = OpenAICodexProvider(default_model="gpt-5.6-sol")
+    messages = [{"role": "user", "content": "inspect workspace"}]
+
+    await provider.chat(
+        messages,
+        request_context={"session_key": "cli:topic", "turn_id": "turn-1"},
+    )
+    await provider.chat(
+        messages,
+        request_context={"session_key": "cli:topic", "turn_id": "turn-1"},
+    )
+    await provider.chat(
+        messages,
+        request_context={"session_key": "cli:topic", "turn_id": "turn-2"},
+    )
+
+    first_headers, first_body = requests[0]
+    second_headers, second_body = requests[1]
+    third_headers, third_body = requests[2]
+    assert "x-codex-turn-state" not in first_headers
+    assert second_headers["x-codex-turn-state"] == "route-state-1"
+    assert "x-codex-turn-state" not in third_headers
+    assert first_headers["session-id"] == second_headers["session-id"]
+    assert second_headers["session-id"] == third_headers["session-id"]
+    assert first_headers["thread-id"] == second_headers["thread-id"]
+    assert second_headers["thread-id"] == third_headers["thread-id"]
+    assert first_headers["x-codex-turn-metadata"] == second_headers["x-codex-turn-metadata"]
+    assert second_headers["x-codex-turn-metadata"] != third_headers["x-codex-turn-metadata"]
+    assert first_body["prompt_cache_key"] == first_headers["session-id"]
+    assert second_body["client_metadata"]["thread_id"] == second_headers["thread-id"]
+    assert third_body["client_metadata"]["turn_id"] != second_body["client_metadata"]["turn_id"]

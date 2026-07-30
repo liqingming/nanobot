@@ -17,6 +17,7 @@ from nanobot.providers.openai_responses.parsing import (
     consume_sdk_stream,
     consume_sse,
     consume_sse_with_reasoning,
+    consume_sse_with_response_items,
     map_finish_reason,
     parse_response_output,
 )
@@ -158,6 +159,30 @@ class TestConvertMessages:
         assert items[0]["id"] == "fc_1"
         assert items[0]["name"] == "get_weather"
         assert items[0]["arguments"] == '{"city": "SF"}'
+
+    def test_assistant_replays_raw_response_items_without_reconstruction(self):
+        response_items = [
+            {
+                "type": "reasoning", "id": "rs_1", "encrypted_content": "opaque-token",
+                "summary": [{"type": "summary_text", "text": "brief"}],
+            },
+            {
+                "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "read_file", "arguments": '{"path":"README.md"}',
+                "status": "completed",
+            },
+        ]
+        _, items = convert_messages([{
+            "role": "assistant", "content": "must not be reconstructed",
+            "response_items": response_items,
+            "tool_calls": [{
+                "id": "call_1|fc_1",
+                "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+            }],
+        }])
+
+        assert items == response_items
+        assert items is not response_items
 
     def test_assistant_tool_call_history_repairs_malformed_arguments(self):
         _, items = convert_messages([{
@@ -431,6 +456,7 @@ class TestParseResponseOutput:
         result = parse_response_output(resp)
         assert result.content == "42"
         assert result.reasoning_content == "I think therefore I am."
+        assert result.response_items == resp["output"]
 
     def test_empty_output(self):
         resp = {"output": [], "status": "completed", "usage": {}}
@@ -597,6 +623,28 @@ class TestConsumeSse:
         _, _, _, _, reasoning = await consume_sse_with_reasoning(response)
 
         assert reasoning == "cached summary"
+
+    @pytest.mark.asyncio
+    async def test_completed_response_preserves_encrypted_reasoning_and_phase(self):
+        output = [
+            {
+                "type": "reasoning", "id": "rs_1",
+                "encrypted_content": "opaque-token", "summary": [],
+            },
+            {
+                "type": "message", "id": "msg_1", "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "done"}],
+            },
+        ]
+        response = _SseResponse([{
+            "type": "response.completed",
+            "response": {"status": "completed", "output": output},
+        }])
+
+        *_, response_items = await consume_sse_with_response_items(response)
+
+        assert response_items == output
 
     @pytest.mark.asyncio
     async def test_reasoning_summary_from_done_item(self):

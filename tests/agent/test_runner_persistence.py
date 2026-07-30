@@ -25,6 +25,10 @@ async def test_runner_persists_large_tool_results_for_follow_up_calls(tmp_path):
                 content="working",
                 tool_calls=[ToolCallRequest(id="call_big", name="list_dir", arguments={"path": "."})],
                 usage={"prompt_tokens": 5, "completion_tokens": 3},
+                response_items=[{
+                    "type": "reasoning", "id": "rs_1",
+                    "encrypted_content": "opaque-token", "summary": [],
+                }],
             )
         captured_second_call[:] = messages
         return LLMResponse(content="done", tool_calls=[], usage={})
@@ -47,6 +51,8 @@ async def test_runner_persists_large_tool_results_for_follow_up_calls(tmp_path):
     ))
 
     assert result.final_content == "done"
+    assistant_message = next(msg for msg in captured_second_call if msg.get("role") == "assistant")
+    assert assistant_message["response_items"][0]["encrypted_content"] == "opaque-token"
     tool_message = next(msg for msg in captured_second_call if msg.get("role") == "tool")
     assert "[tool output persisted]" in tool_message["content"]
     assert "tool-results" in tool_message["content"]

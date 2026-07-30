@@ -557,6 +557,7 @@ def build_assistant_message(
     tool_calls: list[dict[str, Any]] | None = None,
     reasoning_content: str | None = None,
     thinking_blocks: list[dict] | None = None,
+    response_items: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a provider-safe assistant message with optional reasoning fields."""
     msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
@@ -568,6 +569,8 @@ def build_assistant_message(
         msg["reasoning_content"] = ""
     if thinking_blocks:
         msg["thinking_blocks"] = thinking_blocks
+    if response_items:
+        msg["response_items"] = response_items
     return msg
 
 
@@ -601,6 +604,10 @@ def estimate_prompt_tokens(
             rc = msg.get("reasoning_content")
             if isinstance(rc, str) and rc:
                 parts.append(rc)
+
+            response_items = msg.get("response_items")
+            if response_items:
+                parts.append(json.dumps(response_items, ensure_ascii=False))
 
             for key in ("name", "tool_call_id"):
                 value = msg.get(key)
@@ -645,6 +652,10 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
     rc = message.get("reasoning_content")
     if isinstance(rc, str) and rc:
         parts.append(rc)
+
+    response_items = message.get("response_items")
+    if response_items:
+        parts.append(json.dumps(response_items, ensure_ascii=False))
 
     payload = "\n".join(parts)
     if not payload:

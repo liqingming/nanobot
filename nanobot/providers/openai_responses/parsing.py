@@ -82,6 +82,30 @@ def _tool_arguments_source(*values: Any) -> Any:
     return "{}"
 
 
+def _response_item_to_dict(item: Any) -> dict[str, Any] | None:
+    """Return a JSON-compatible Responses output item without changing its fields."""
+    if isinstance(item, dict):
+        return dict(item)
+    dump = getattr(item, "model_dump", None)
+    if callable(dump):
+        value = dump()
+        return value if isinstance(value, dict) else None
+    try:
+        value = vars(item)
+    except TypeError:
+        return None
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _response_output_items(output: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for raw_item in output or []:
+        item = _response_item_to_dict(raw_item)
+        if item is not None:
+            items.append(item)
+    return items
+
+
 async def iter_sse(
     response: httpx.Response,
     *,
@@ -160,6 +184,31 @@ async def consume_sse_with_reasoning(
     idle_timeout_s: float | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
     """Consume a Responses API SSE stream, including visible reasoning summaries."""
+    content, tool_calls, finish_reason, usage, reasoning_content, _ = (
+        await consume_sse_with_response_items(
+            response,
+            on_content_delta=on_content_delta,
+            on_tool_call_delta=on_tool_call_delta,
+            on_reasoning_delta=on_reasoning_delta,
+            on_event=on_event,
+            first_line_timeout_s=first_line_timeout_s,
+            idle_timeout_s=idle_timeout_s,
+        )
+    )
+    return content, tool_calls, finish_reason, usage, reasoning_content
+
+
+async def consume_sse_with_response_items(
+    response: httpx.Response,
+    on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    *,
+    first_line_timeout_s: float | None = None,
+    idle_timeout_s: float | None = None,
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None, list[dict[str, Any]]]:
+    """Consume a Responses API SSE stream, including visible reasoning summaries."""
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
@@ -168,6 +217,7 @@ async def consume_sse_with_reasoning(
     usage: dict[str, int] = {}
     reasoning_content: str | None = None
     streamed_reasoning = False
+    response_items: list[dict[str, Any]] = []
 
     async for event in iter_sse(
         response,
@@ -248,6 +298,9 @@ async def consume_sse_with_reasoning(
                     })
         elif event_type == "response.output_item.done":
             item = event.get("item") or {}
+            raw_item = _response_item_to_dict(item)
+            if raw_item is not None:
+                response_items.append(raw_item)
             if item.get("type") == "function_call":
                 call_id = item.get("call_id")
                 if not call_id:
@@ -283,6 +336,9 @@ async def consume_sse_with_reasoning(
             status = response_obj.get("status")
             finish_reason = map_finish_reason(status)
             usage = _usage_from_response_obj(response_obj) or usage
+            completed_items = _response_output_items(response_obj.get("output") or [])
+            if completed_items:
+                response_items = completed_items
             if not reasoning_content:
                 summary = _extract_reasoning_summary_from_output(response_obj.get("output") or [])
                 if summary:
@@ -293,7 +349,7 @@ async def consume_sse_with_reasoning(
             detail = event.get("error") or event.get("message") or event
             raise ResponsesAPIError(detail)
 
-    return content, tool_calls, finish_reason, usage, reasoning_content
+    return content, tool_calls, finish_reason, usage, reasoning_content, response_items
 
 
 def _extract_reasoning_summary_from_output(output: Any) -> str | None:
@@ -320,6 +376,7 @@ def parse_response_output(response: Any) -> LLMResponse:
         response = dump() if callable(dump) else vars(response)
 
     output = response.get("output") or []
+    response_items = _response_output_items(output)
     content_parts: list[str] = []
     tool_calls: list[ToolCallRequest] = []
     reasoning_content: str | None = None
@@ -366,6 +423,7 @@ def parse_response_output(response: Any) -> LLMResponse:
         finish_reason=finish_reason,
         usage=usage,
         reasoning_content=reasoning_content if isinstance(reasoning_content, str) else None,
+        response_items=response_items or None,
     )
 
 

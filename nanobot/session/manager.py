@@ -264,10 +264,16 @@ class Session:
                     breadcrumbs = "\n".join(mcp_lines)
                     content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
             if role == "assistant" and isinstance(content, str) and not content.strip():
-                if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
+                if not any(
+                    key in message
+                    for key in ("tool_calls", "reasoning_content", "thinking_blocks", "response_items")
+                ):
                     continue
             entry: dict[str, Any] = {"role": message["role"], "content": content}
-            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
+            for key in (
+                "tool_calls", "tool_call_id", "name", "reasoning_content",
+                "thinking_blocks", "response_items",
+            ):
                 if key in message:
                     entry[key] = message[key]
             out.append(entry)

@@ -82,6 +82,10 @@ class _FakeProvider(LLMProvider):
         return self._response
 
 
+class _ContextAwareFakeProvider(_FakeProvider):
+    supports_request_context = True
+
+
 # -- config-level tests --
 
 
@@ -246,6 +250,89 @@ def test_inline_fallback_reasoning_effort_does_not_inherit_primary() -> None:
 
 
 # -- FallbackProvider tests --
+
+
+class TestRequestContextRouting:
+    def test_wrapper_opts_in_so_runner_can_supply_context(self) -> None:
+        primary = _FakeProvider("primary")
+        fb = FallbackProvider(
+            primary=primary,
+            fallback_presets=[_fallback("fallback-a")],
+            provider_factory=MagicMock(),
+        )
+
+        assert fb.supports_request_context is True
+
+    @pytest.mark.asyncio
+    async def test_primary_receives_context_only_when_supported(self) -> None:
+        context = {"session_key": "cli:topic", "turn_id": "turn-1"}
+        supported = _ContextAwareFakeProvider("supported")
+        supported_wrapper = FallbackProvider(
+            primary=supported,
+            fallback_presets=[],
+            provider_factory=MagicMock(),
+        )
+        unsupported = _FakeProvider("unsupported")
+        unsupported_wrapper = FallbackProvider(
+            primary=unsupported,
+            fallback_presets=[],
+            provider_factory=MagicMock(),
+        )
+
+        await supported_wrapper.chat(messages=[], request_context=context)
+        await unsupported_wrapper.chat(messages=[], request_context=context)
+
+        assert supported.chat_calls[0]["request_context"] == context
+        assert "request_context" not in unsupported.chat_calls[0]
+
+    @pytest.mark.asyncio
+    async def test_context_reaches_supported_fallback_from_unsupported_primary(self) -> None:
+        context = {"session_key": "cli:topic", "turn_id": "turn-1"}
+        primary = _FakeProvider("primary", _error_response())
+        fallback = _ContextAwareFakeProvider("fallback", _make_response("ok"))
+        fb = FallbackProvider(
+            primary=primary,
+            fallback_presets=[_fallback("fallback-a")],
+            provider_factory=MagicMock(return_value=fallback),
+        )
+
+        await fb.chat(messages=[], request_context=context)
+
+        assert "request_context" not in primary.chat_calls[0]
+        assert fallback.chat_calls[0]["request_context"] == context
+
+    @pytest.mark.asyncio
+    async def test_context_is_removed_from_unsupported_stream_fallback(self) -> None:
+        context = {"session_key": "cli:topic", "turn_id": "turn-1"}
+        primary = _ContextAwareFakeProvider("primary", _error_response(""))
+        fallback = _FakeProvider("fallback", _make_response("ok"))
+        fb = FallbackProvider(
+            primary=primary,
+            fallback_presets=[_fallback("fallback-a")],
+            provider_factory=MagicMock(return_value=fallback),
+        )
+
+        await fb.chat_stream(messages=[], request_context=context)
+
+        assert primary.chat_stream_calls[0]["request_context"] == context
+        assert "request_context" not in fallback.chat_stream_calls[0]
+
+    @pytest.mark.asyncio
+    async def test_circuit_open_still_passes_context_to_supported_fallback(self) -> None:
+        context = {"session_key": "cli:topic", "turn_id": "turn-1"}
+        primary = _FakeProvider("primary", _error_response())
+        fallback = _ContextAwareFakeProvider("fallback", _make_response("ok"))
+        fb = FallbackProvider(
+            primary=primary,
+            fallback_presets=[_fallback("fallback-a")],
+            provider_factory=MagicMock(return_value=fallback),
+        )
+        fb._primary_tripped_at = float("inf")
+
+        await fb.chat(messages=[], request_context=context)
+
+        assert primary.chat_calls == []
+        assert fallback.chat_calls[0]["request_context"] == context
 
 
 class TestNoFallbackWhenPrimarySucceeds:
