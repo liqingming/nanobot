@@ -37,6 +37,7 @@ CODEX_EVENT_TIMEOUT_ENV = "NANOBOT_CODEX_APP_SERVER_EVENT_TIMEOUT_S"
 DEFAULT_CODEX_RPC_TIMEOUT_S = 45.0
 DEFAULT_CODEX_EVENT_TIMEOUT_S = 240.0
 DEFAULT_CODEX_RECOVERY_ATTEMPTS = 1
+_APP_SERVER_STREAM_LIMIT = 4 * 1024 * 1024
 _LEDGER_VERSION = 1
 _LEDGER_MAX_BYTES = 4 * 1024 * 1024
 _LEDGER_RETENTION_S = 7 * 24 * 60 * 60
@@ -336,6 +337,7 @@ class _CodexAppServerTurn:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self.env,
+            limit=_APP_SERVER_STREAM_LIMIT,
         )
         assert self.process.stderr is not None
         self._stderr_task = asyncio.create_task(self._drain_stderr(self.process.stderr))

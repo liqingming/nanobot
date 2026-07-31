@@ -63,10 +63,11 @@ for raw_line in sys.stdin:
         send({"id": message["id"], "result": {"turn": {"id": "turn-1"}}})
         if mode == "hang_turn":
             continue
-        if mode == "answer":
+        if mode in {"answer", "large_event"}:
+            text = "x" * (128 * 1024) if mode == "large_event" else "done"
             send({
                 "method": "item/completed",
-                "params": {"item": {"id": "answer-1", "type": "agentMessage", "text": "done"}},
+                "params": {"item": {"id": "answer-1", "type": "agentMessage", "text": text}},
             })
             send({
                 "method": "turn/completed",
@@ -578,6 +579,24 @@ async def test_stdio_protocol_continues_tool_result_and_usage_is_incremental(
     assert second.usage["total_tokens"] == 8
     assert first.usage["total_tokens"] + second.usage["total_tokens"] == 18
     assert provider._turns == {}
+
+
+async def test_stdio_protocol_accepts_json_lines_larger_than_asyncio_default(
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
+    )
+    provider._app_server_command = _fake_command("large_event")
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "large response"}],
+        tools=_tool_schema(),
+        request_context={"session_key": "session", "turn_id": "large-event"},
+    )
+
+    assert response.finish_reason == "stop"
+    assert response.content == "x" * (128 * 1024)
 
 
 @pytest.mark.parametrize("mode", ["crash_before_result", "crash_after_tool"])
