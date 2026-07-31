@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Extract sanitized tool failures from all sessions in a nanobot work directory."""
+"""Resolve one nanobot topic and extract sanitized tool failures."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -18,29 +19,92 @@ _OUTPUT_ERROR = re.compile(
 _SECRET = re.compile(
     r"(?i)((?:api[-_]?key|authorization|token|password|secret|cookie)\s*[:=])\s*\S+"
 )
+_UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
 
 
-def _session_directories(directory: Path) -> list[Path]:
-    directory = directory.expanduser().resolve()
-    if (directory / "runtime.log").is_file():
-        return [directory]
-    sessions_root = directory if directory.name == "sessions" else directory / "sessions"
-    if not sessions_root.is_dir():
-        return []
-    return sorted(
-        (
-            candidate.resolve()
-            for candidate in sessions_root.iterdir()
-            if candidate.is_dir() and (candidate / "runtime.log").is_file()
-        ),
-        key=lambda path: path.name,
-    )
+def _runtime_data_dir(work_directory: Path) -> Path:
+    workspace = work_directory.expanduser().resolve()
+    default_workspace = (Path.home() / ".nanobot" / "workspace").resolve(strict=False)
+    if workspace == default_workspace:
+        return workspace
+    digest = hashlib.sha1(str(workspace).encode()).hexdigest()[:8]
+    safe_name = re.sub(r"[^\w-]", "_", workspace.name) or "root"
+    return Path.home() / ".nanobot" / "caches" / f"{safe_name}_{digest}"
+
+
+def _safe_session_key(key: str) -> str:
+    return _UNSAFE_CHARS.sub("_", key.replace(":", "_")).strip()
+
+
+def _topic_sessions(data_dir: Path) -> list[dict[str, str]]:
+    sessions_dir = data_dir / "sessions"
+    rows: list[dict[str, str]] = []
+    if not sessions_dir.is_dir():
+        return rows
+    for path in sorted(sessions_dir.glob("*.jsonl")):
+        try:
+            with path.open(encoding="utf-8") as stream:
+                record = json.loads(stream.readline())
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        metadata = record.get("metadata") if isinstance(record, dict) else None
+        title = metadata.get("cli_title") if isinstance(metadata, dict) else None
+        key = record.get("key") if isinstance(record, dict) else None
+        if (
+            record.get("_type") != "metadata"
+            or not isinstance(title, str)
+            or not isinstance(key, str)
+        ):
+            continue
+        rows.append(
+            {
+                "title": title.strip(),
+                "key": key,
+                "updated_at": str(record.get("updated_at") or ""),
+            }
+        )
+    return rows
+
+
+def _resolve_topic(work_directory: Path, topic: str) -> tuple[Path, dict[str, str]]:
+    data_dir = _runtime_data_dir(work_directory)
+    sessions = _topic_sessions(data_dir)
+    wanted = topic.strip()
+    matches = [session for session in sessions if session["title"] == wanted]
+    if len(matches) != 1:
+        payload = {
+            "error": "topic_not_found" if not matches else "topic_not_unique",
+            "work_directory": str(work_directory.expanduser().resolve()),
+            "data_directory": str(data_dir),
+            "topic": wanted,
+            "candidates": matches or sessions,
+        }
+        raise TopicResolutionError(payload)
+    session = matches[0]
+    runtime_log = data_dir / "sessions" / _safe_session_key(session["key"]) / "runtime.log"
+    if not runtime_log.is_file():
+        raise TopicResolutionError(
+            {
+                "error": "runtime_log_not_found",
+                "work_directory": str(work_directory.expanduser().resolve()),
+                "data_directory": str(data_dir),
+                "topic": wanted,
+                "session_key": session["key"],
+                "runtime_log": str(runtime_log),
+            }
+        )
+    return runtime_log, session
+
+
+class TopicResolutionError(Exception):
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(str(payload.get("error") or "topic_resolution_error"))
+        self.payload = payload
 
 
 def _safe_text(value: Any, limit: int = 500) -> str:
     text = value if isinstance(value, str) else ""
-    text = _SECRET.sub(r"\1 <redacted>", text)
-    return text[:limit]
+    return _SECRET.sub(r"\1 <redacted>", text)[:limit]
 
 
 def _kind(record: dict[str, Any]) -> str | None:
@@ -57,10 +121,10 @@ def _kind(record: dict[str, Any]) -> str | None:
     return "tool_error" if record.get("status") == "error" else None
 
 
-def scan(session_dir: Path) -> list[dict[str, Any]]:
+def scan(log_path: Path) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
     seen: set[str] = set()
-    with (session_dir / "runtime.log").open(encoding="utf-8", errors="replace") as stream:
+    with log_path.open(encoding="utf-8", errors="replace") as stream:
         for line_number, line in enumerate(stream, start=1):
             try:
                 record = json.loads(line)
@@ -75,7 +139,7 @@ def scan(session_dir: Path) -> list[dict[str, Any]]:
             seen.add(dedupe_key)
             failures.append(
                 {
-                    "session": session_dir.name,
+                    "sequence": len(failures) + 1,
                     "timestamp": record.get("ts"),
                     "line": line_number,
                     "kind": kind,
@@ -99,33 +163,24 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--directory", required=True)
+    parser.add_argument("--topic", required=True)
     args = parser.parse_args()
 
-    directory = Path(args.directory).expanduser().resolve()
-    sessions = _session_directories(directory)
-    if not sessions:
-        print(
-            json.dumps(
-                {"error": "runtime_logs_not_found", "directory": str(directory)},
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
+    work_directory = Path(args.directory)
+    try:
+        runtime_log, session = _resolve_topic(work_directory, args.topic)
+    except TopicResolutionError as exc:
+        print(json.dumps(exc.payload, ensure_ascii=False, indent=2))
         return 2
-
-    failures = [failure for session in sessions for failure in scan(session)]
-    failures.sort(
-        key=lambda item: (str(item.get("timestamp") or ""), item["session"], item["line"])
-    )
-    for sequence, failure in enumerate(failures, start=1):
-        failure["sequence"] = sequence
 
     print(
         json.dumps(
             {
-                "directory": str(directory),
-                "sessions_scanned": len(sessions),
-                "failures": failures,
+                "work_directory": str(work_directory.expanduser().resolve()),
+                "topic": session["title"],
+                "session_key": session["key"],
+                "runtime_log": str(runtime_log),
+                "failures": scan(runtime_log),
             },
             ensure_ascii=False,
             indent=2,
