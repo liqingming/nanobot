@@ -18,50 +18,53 @@ def test_fork_builtin_skill_is_registered(tmp_path) -> None:
     entries = {entry["name"]: entry for entry in loader.list_skills(filter_unavailable=False)}
 
     assert entries["scan-tool-corrections"]["source"] == "fork-builtin"
-    assert "Require exactly two inputs" in loader.load_skill("scan-tool-corrections")
+    assert "Require exactly one input" in loader.load_skill("scan-tool-corrections")
 
 
-def test_scanner_orders_deduplicates_and_redacts_failures(tmp_path) -> None:
-    session = tmp_path / "sessions" / "cli_session_demo"
+def _write_log(session: Path, records: list[dict[str, object]]) -> None:
     session.mkdir(parents=True)
-    records = [
-        {
-            "ts": "2026-01-01T00:00:01",
-            "event": "runner.tool.error_result",
-            "tool": "exec",
-            "call_id": "call-1",
-            "result": "token=should-not-leak command timed out",
-        },
-        {
-            "ts": "2026-01-01T00:00:01",
-            "event": "runner.tool.audit.end",
-            "tool": "exec",
-            "call_id": "call-1",
-            "status": "error",
-        },
-        {
-            "ts": "2026-01-01T00:00:02",
-            "event": "runner.tool.audit.end",
-            "tool": "exec",
-            "call_id": "call-2",
-            "status": "ok",
-            "detail": "Exit code: 1\nSyntaxError: bad quoting",
-        },
-    ]
     (session / "runtime.log").write_text(
         "".join(json.dumps(record) + "\n" for record in records),
         encoding="utf-8",
     )
 
-    result = subprocess.run(
+
+def test_scanner_scans_all_sessions_orders_deduplicates_and_redacts(tmp_path) -> None:
+    _write_log(
+        tmp_path / "sessions" / "cli_session_later",
         [
-            sys.executable,
-            str(SCRIPT),
-            "--directory",
-            str(tmp_path),
-            "--session",
-            "session_demo",
+            {
+                "ts": "2026-01-01T00:00:02",
+                "event": "runner.tool.audit.end",
+                "tool": "exec",
+                "call_id": "call-2",
+                "status": "ok",
+                "detail": "Exit code: 1\nSyntaxError: bad quoting",
+            }
         ],
+    )
+    _write_log(
+        tmp_path / "sessions" / "cli_session_earlier",
+        [
+            {
+                "ts": "2026-01-01T00:00:01",
+                "event": "runner.tool.error_result",
+                "tool": "exec",
+                "call_id": "call-1",
+                "result": "token=should-not-leak command timed out",
+            },
+            {
+                "ts": "2026-01-01T00:00:01",
+                "event": "runner.tool.audit.end",
+                "tool": "exec",
+                "call_id": "call-1",
+                "status": "error",
+            },
+        ],
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--directory", str(tmp_path)],
         capture_output=True,
         check=False,
         text=True,
@@ -70,7 +73,12 @@ def test_scanner_orders_deduplicates_and_redacts_failures(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     failures = payload["failures"]
+    assert payload["sessions_scanned"] == 2
     assert [failure["sequence"] for failure in failures] == [1, 2]
+    assert [failure["session"] for failure in failures] == [
+        "cli_session_earlier",
+        "cli_session_later",
+    ]
     assert [failure["kind"] for failure in failures] == ["tool_error", "nonzero_exit"]
     assert "should-not-leak" not in failures[0]["summary"]
     assert "<redacted>" in failures[0]["summary"]

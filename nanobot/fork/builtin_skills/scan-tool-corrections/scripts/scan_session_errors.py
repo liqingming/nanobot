@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract sanitized tool failures from one nanobot runtime session."""
+"""Extract sanitized tool failures from all sessions in a nanobot work directory."""
 
 from __future__ import annotations
 
@@ -20,33 +20,21 @@ _SECRET = re.compile(
 )
 
 
-def _session_candidates(directory: Path, session: str) -> list[Path]:
+def _session_directories(directory: Path) -> list[Path]:
     directory = directory.expanduser().resolve()
-    if (directory / "runtime.log").is_file() and session in {".", directory.name}:
+    if (directory / "runtime.log").is_file():
         return [directory]
-
-    roots = [directory, directory / "sessions"]
-    names = {session}
-    if session.startswith("cli:"):
-        names.add(session.replace(":", "_", 1))
-    if session.startswith("session_"):
-        names.add(f"cli_{session}")
-
-    candidates: list[Path] = []
-    for root in roots:
-        for name in names:
-            candidate = root / name
-            if (candidate / "runtime.log").is_file():
-                candidates.append(candidate.resolve())
-        if root.is_dir():
-            for candidate in root.iterdir():
-                if (
-                    candidate.is_dir()
-                    and session.casefold() in candidate.name.casefold()
-                    and (candidate / "runtime.log").is_file()
-                ):
-                    candidates.append(candidate.resolve())
-    return list(dict.fromkeys(candidates))
+    sessions_root = directory if directory.name == "sessions" else directory / "sessions"
+    if not sessions_root.is_dir():
+        return []
+    return sorted(
+        (
+            candidate.resolve()
+            for candidate in sessions_root.iterdir()
+            if candidate.is_dir() and (candidate / "runtime.log").is_file()
+        ),
+        key=lambda path: path.name,
+    )
 
 
 def _safe_text(value: Any, limit: int = 500) -> str:
@@ -69,10 +57,10 @@ def _kind(record: dict[str, Any]) -> str | None:
     return "tool_error" if record.get("status") == "error" else None
 
 
-def scan(log_path: Path) -> list[dict[str, Any]]:
+def scan(session_dir: Path) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
     seen: set[str] = set()
-    with log_path.open(encoding="utf-8", errors="replace") as stream:
+    with (session_dir / "runtime.log").open(encoding="utf-8", errors="replace") as stream:
         for line_number, line in enumerate(stream, start=1):
             try:
                 record = json.loads(line)
@@ -87,7 +75,7 @@ def scan(log_path: Path) -> list[dict[str, Any]]:
             seen.add(dedupe_key)
             failures.append(
                 {
-                    "sequence": len(failures) + 1,
+                    "session": session_dir.name,
                     "timestamp": record.get("ts"),
                     "line": line_number,
                     "kind": kind,
@@ -107,24 +95,38 @@ def scan(log_path: Path) -> list[dict[str, Any]]:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--directory", required=True)
-    parser.add_argument("--session", required=True)
     args = parser.parse_args()
 
-    candidates = _session_candidates(Path(args.directory), args.session)
-    if len(candidates) != 1:
-        payload = {
-            "error": "session_not_unique" if candidates else "session_not_found",
-            "candidates": [str(path) for path in candidates],
-        }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    directory = Path(args.directory).expanduser().resolve()
+    sessions = _session_directories(directory)
+    if not sessions:
+        print(
+            json.dumps(
+                {"error": "runtime_logs_not_found", "directory": str(directory)},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 2
 
-    log_path = candidates[0] / "runtime.log"
+    failures = [failure for session in sessions for failure in scan(session)]
+    failures.sort(
+        key=lambda item: (str(item.get("timestamp") or ""), item["session"], item["line"])
+    )
+    for sequence, failure in enumerate(failures, start=1):
+        failure["sequence"] = sequence
+
     print(
         json.dumps(
-            {"session_dir": str(candidates[0]), "failures": scan(log_path)},
+            {
+                "directory": str(directory),
+                "sessions_scanned": len(sessions),
+                "failures": failures,
+            },
             ensure_ascii=False,
             indent=2,
         )
