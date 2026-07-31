@@ -283,6 +283,77 @@ def test_tool_argument_canonicalization_ignores_json_key_order() -> None:
     assert _canonical_tool_arguments('{"b":2,"a":1}') == _canonical_tool_arguments({"a": 1, "b": 2})
 
 
+def test_ledger_keeps_original_result_after_context_compaction(tmp_path: Path) -> None:
+    ledger = _idempotency_ledger(
+        ("session", "compacted-result"),
+        root_override=tmp_path / "ledger",
+    )
+    call = {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "function": {"name": "exec", "arguments": {"command": "git status"}},
+            }
+        ],
+    }
+    ledger.record_messages(
+        [
+            call,
+            {"role": "tool", "tool_call_id": "call-1", "content": "original result"},
+        ]
+    )
+
+    ledger.record_messages(
+        [
+            call,
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "[ToolDigest td_123 status=ok]",
+            },
+        ]
+    )
+
+    assert ledger.entries[0]["content"] == "original result"
+
+
+def test_ledger_rejects_reused_call_id_with_different_signature(tmp_path: Path) -> None:
+    ledger = _idempotency_ledger(
+        ("session", "conflicting-signature"),
+        root_override=tmp_path / "ledger",
+    )
+    ledger.record_messages(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {"name": "exec", "arguments": {"command": "git status"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+        ]
+    )
+
+    with pytest.raises(CodexIdempotencyLedgerError, match="Conflicting"):
+        ledger.record_messages(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "exec", "arguments": {"command": "git diff"}},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            ]
+        )
+
 def test_recovery_fails_safe_for_ambiguous_repeated_signature(tmp_path: Path) -> None:
     ledger = _idempotency_ledger(
         ("session", "ambiguous"),

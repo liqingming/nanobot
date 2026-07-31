@@ -146,10 +146,13 @@ class _ToolResultLedger:
             signature = _tool_signature(name, canonical_arguments)
             old = existing.get(call_id)
             if old is not None:
-                if old.get("signature") != signature or old.get("content") != content:
+                if old.get("signature") != signature:
                     raise CodexIdempotencyLedgerError(
                         f"Conflicting durable result for tool call {call_id}."
                     )
+                # The ledger is write-once. Context governance may replace an
+                # older tool result with a digest before a later model request;
+                # keep the original durable result for bridge recovery.
                 continue
             entry = {
                 "call_id": call_id,
