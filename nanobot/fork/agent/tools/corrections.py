@@ -69,6 +69,20 @@ _CORRECTION_CATALOG = (
             "instead of nesting quoted source in python -c."
         ),
     },
+    {
+        "fingerprint": "filesystem:avoid:retry-stale-workspace-cache-path",
+        "sequence": 5,
+        "tool": "filesystem",
+        "affected_tools": ("list_dir", "find_files", "grep"),
+        "kind": "preventive_hint",
+        "observed_count": 3,
+        "hint": (
+            "For nanobot workspace caches, derive the cache directory from the authoritative "
+            "workspace path instead of reusing a stale configured hash; after path-not-found, "
+            "inspect the existing cache parent rather than retrying the same missing path with "
+            "other tools."
+        ),
+    },
 )
 
 
@@ -114,7 +128,13 @@ class ToolCorrectionStore:
                 self._entries.values(),
                 key=lambda entry: int(entry.get("sequence", 0)),
             )
-            if entry.get("tool") == tool and entry.get("kind") == "preventive_hint"
+            if (
+                entry.get("kind") == "preventive_hint"
+                and (
+                    entry.get("tool") == tool
+                    or tool in entry.get("affected_tools", ())
+                )
+            )
         )
 
     def _ensure_catalog(self) -> None:
@@ -284,3 +304,5 @@ def _corrected_tool_factory(name: str):
 
 register_fork_tool(_corrected_tool_factory("exec"))
 register_fork_tool(_corrected_tool_factory("grep"))
+register_fork_tool(_corrected_tool_factory("list_dir"))
+register_fork_tool(_corrected_tool_factory("find_files"))
