@@ -626,6 +626,10 @@ async def test_runner_runtime_audit_reconstructs_each_tool_iteration():
     assert [row["result_chars"] for row in ends] == [9, 13]
     assert [row["result_preview"] for row in ends] == ["file body", "matching line"]
     assert all(row["duration_ms"] >= 0 for row in ends)
+    plans = [fields for event, fields in events if event == "runner.tools.start"]
+    assert [row["concurrent_tools"] for row in plans] == [False, False]
+    assert [row["batch_tools"] for row in plans] == [[['read_file']], [['grep']]]
+    assert [row["batch_call_ids"] for row in plans] == [[['call_read']], [['call_grep']]]
     assert all(fields["turn_id"] == "cli:topic:turn-1" for _event, fields in events)
 
 

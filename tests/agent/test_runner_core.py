@@ -84,6 +84,7 @@ async def test_runner_returns_max_iterations_fallback():
     tools = MagicMock()
     tools.get_definitions.return_value = []
     tools.execute = AsyncMock(return_value="tool result")
+    events: list[tuple[str, dict]] = []
 
     runner = AgentRunner(provider)
     result = await runner.run(AgentRunSpec(
@@ -92,6 +93,7 @@ async def test_runner_returns_max_iterations_fallback():
         model="test-model",
         max_iterations=2,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        event_logger=lambda event, fields: events.append((event, fields)),
     ))
 
     assert result.stop_reason == "max_iterations"
@@ -104,6 +106,16 @@ async def test_runner_returns_max_iterations_fallback():
     assert provider.chat_with_retry.await_count == 3
     assert provider.chat_with_retry.await_args_list[-1].kwargs["tools"] is None
     assert tools.execute.await_count == 2
+    event_names = [event for event, _fields in events]
+    assert "runner.max_iterations.reached" in event_names
+    assert "runner.max_iterations.finalization.start" in event_names
+    assert "runner.max_iterations.finalization.response" in event_names
+    failed = [
+        fields for event, fields in events
+        if event == "runner.max_iterations.finalization.failed"
+    ]
+    assert failed[-1]["reason"] == "tool_calls_returned"
+    assert [fields for event, fields in events if event == "runner.max_iterations.fallback"]
 
 
 @pytest.mark.asyncio
@@ -112,6 +124,7 @@ async def test_runner_uses_no_tools_finalization_after_max_iterations():
 
     provider = MagicMock(spec=LLMProvider)
     calls: list[dict] = []
+    events: list[tuple[str, dict]] = []
 
     async def chat_with_retry(*, messages, tools=None, **kwargs):
         calls.append({"messages": messages, "tools": tools})
@@ -144,6 +157,7 @@ async def test_runner_uses_no_tools_finalization_after_max_iterations():
         model="test-model",
         max_iterations=2,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        event_logger=lambda event, fields: events.append((event, fields)),
     ))
 
     assert result.stop_reason == "max_iterations"
@@ -156,6 +170,17 @@ async def test_runner_uses_no_tools_finalization_after_max_iterations():
     assert calls[-1]["tools"] is None
     assert "tool-call budget" in calls[-1]["messages"][-1]["content"]
     assert tools.execute.await_count == 2
+    response_event = [
+        fields for event, fields in events
+        if event == "runner.max_iterations.finalization.response"
+    ][-1]
+    assert response_event["finish_reason"] == "stop"
+    assert response_event["tool_calls"] == []
+    assert response_event["content_chars"] > 0
+    assert [event for event, _fields in events].count(
+        "runner.max_iterations.finalization.success"
+    ) == 1
+    assert not [fields for event, fields in events if event == "runner.max_iterations.fallback"]
 
 
 @pytest.mark.asyncio

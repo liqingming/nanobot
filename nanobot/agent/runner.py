@@ -1002,6 +1002,14 @@ class AgentRunner:
             break
         else:
             stop_reason = "max_iterations"
+            self._log_event(
+                spec,
+                "runner.max_iterations.reached",
+                max_iterations=spec.max_iterations,
+                finalize_enabled=spec.finalize_on_max_iterations,
+                messages=len(messages),
+                tools_used=len(tools_used),
+            )
             # Drain any remaining injections so they are appended to the
             # conversation history instead of being re-published as
             # independent inbound messages by _dispatch's finally block.
@@ -1021,8 +1029,19 @@ class AgentRunner:
                     messages,
                     usage,
                 )
+            else:
+                self._log_event(
+                    spec,
+                    "runner.max_iterations.finalization.skipped",
+                    reason="disabled",
+                )
             if final_content is None:
                 final_content = self._max_iterations_fallback(spec)
+                self._log_event(
+                    spec,
+                    "runner.max_iterations.fallback",
+                    content_chars=len(final_content),
+                )
             self._append_final_message(messages, final_content)
 
         self._log_event(
@@ -1418,9 +1437,24 @@ class AgentRunner:
         usage: dict[str, int],
     ) -> str | None:
         retry_messages = self._budget_exhausted_finalization_messages(messages)
+        self._log_event(
+            spec,
+            "runner.max_iterations.finalization.start",
+            messages=len(retry_messages),
+            tools_enabled=False,
+        )
+        started_at = time.monotonic()
         try:
             response = await self._request_no_tools(spec, retry_messages)
-        except Exception:
+        except Exception as exc:
+            self._log_event(
+                spec,
+                "runner.max_iterations.finalization.failed",
+                reason="exception",
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+                duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+            )
             logger.exception(
                 "Budget-exhausted finalization failed for {}; using fallback",
                 spec.session_key or "default",
@@ -1429,7 +1463,25 @@ class AgentRunner:
 
         raw_usage = self._usage_or_estimate(spec, retry_messages, response)
         self._accumulate_usage(usage, raw_usage)
+        self._log_event(
+            spec,
+            "runner.max_iterations.finalization.response",
+            finish_reason=response.finish_reason,
+            tool_calls=[tool_call.name for tool_call in response.tool_calls],
+            content_chars=len(response.content or ""),
+            usage=raw_usage,
+            provider_diagnostics=response.provider_diagnostics or None,
+            duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+        )
         if response.finish_reason == "error" or response.has_tool_calls:
+            reason = "model_error" if response.finish_reason == "error" else "tool_calls_returned"
+            self._log_event(
+                spec,
+                "runner.max_iterations.finalization.failed",
+                reason=reason,
+                finish_reason=response.finish_reason,
+                tool_calls=[tool_call.name for tool_call in response.tool_calls],
+            )
             logger.warning(
                 "Budget-exhausted finalization returned finish_reason='{}' "
                 "with {} tool call(s) for {}; using fallback",
@@ -1448,7 +1500,19 @@ class AgentRunner:
         )
         clean = hook.finalize_content(context, response.content)
         if is_blank_text(clean):
+            self._log_event(
+                spec,
+                "runner.max_iterations.finalization.failed",
+                reason="blank_content",
+                finish_reason=response.finish_reason,
+            )
             return None
+        self._log_event(
+            spec,
+            "runner.max_iterations.finalization.success",
+            content_chars=len(clean),
+            duration_ms=round((time.monotonic() - started_at) * 1000, 1),
+        )
         return clean
 
     async def _request_no_tools(
@@ -1572,7 +1636,10 @@ class AgentRunner:
             "runner.tools.start",
             iteration=context.iteration,
             count=len(tool_calls),
+            concurrent_tools=spec.concurrent_tools,
             batches=[len(batch) for batch in batches],
+            batch_tools=[[tool_call.name for tool_call in batch] for batch in batches],
+            batch_call_ids=[[tool_call.id for tool_call in batch] for batch in batches],
             tools=[tc.name for tc in tool_calls],
         )
         tool_positions = {tool_call.id: index for index, tool_call in enumerate(tool_calls)}
