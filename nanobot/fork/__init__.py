@@ -22,6 +22,7 @@ populate it as files migrate from the core tree.
 from nanobot.fork.agent.tools import (  # noqa: F401
     ask_user,
     code_search,
+    corrections,
     memory_search,
     skill,
     todo,
