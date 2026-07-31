@@ -82,7 +82,9 @@ def _make_provider_core(
             raise ValueError(f"No API key configured for provider '{provider_name}'.")
 
     if backend == "openai_codex":
-        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+        from nanobot.fork.providers.codex_app_server_provider import (
+            CodexAppServerProvider as OpenAICodexProvider,
+        )
 
         provider = OpenAICodexProvider(
             default_model=model,

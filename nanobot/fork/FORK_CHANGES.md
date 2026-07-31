@@ -470,3 +470,46 @@ npm run build
 - 对应测试。
 
 提交信息使用中文。
+
+### OpenAI Codex official app-server transport
+
+Primary files:
+
+- `nanobot/fork/providers/codex_app_server_provider.py`
+- `nanobot/providers/factory.py`
+- `tests/fork/test_codex_app_server_provider.py`
+
+Behavior and sync notes:
+
+- Official `codex app-server` owns OAuth, upstream requests, websocket continuation,
+  and transport retries for the `openai_codex` provider.
+- Nanobot tools are exposed through experimental `dynamicTools`; execution and
+  workspace enforcement remain in the nanobot runner.
+- All nanobot tools are children of one `nanobot` dynamic-tool namespace. This avoids
+  an app-server top-level multi-tool name/index mismatch while tool execution stays
+  in nanobot.
+- Each outer nanobot turn uses an ephemeral app-server process so nanobot remains
+  the only persisted conversation history.
+- Codex native tools, web search, user plugins, and user MCP servers are disabled at
+  both process and thread scope. Native-tool events are rejected if a Codex version
+  ignores those settings.
+- Before a tool result is submitted to app-server, a workspace/session/turn-scoped
+  idempotency ledger atomically persists the normalized call and authoritative result.
+  A transient bridge failure is recovered once with a fresh ephemeral thread; repeated
+  calls are answered from the ledger inside the provider and never reach the runner.
+- Ledgers use restricted files under the workspace runtime data directory, are removed
+  after successful completion, and stale crash remnants expire after seven days. New
+  signatures still reach the runner; ambiguous identical signatures fail safe.
+- Thread-cumulative token usage is converted to per-response deltas before the shared
+  runner aggregates it.
+- RPC/event waits have bounded timeouts; bounded redacted stderr is retained for
+  diagnostics, and an explicit provider proxy is passed only to the Codex child process.
+- `NANOBOT_CODEX_BIN` may point to an explicit Codex executable.
+- `NANOBOT_CODEX_APP_SERVER_RPC_TIMEOUT_S` and
+  `NANOBOT_CODEX_APP_SERVER_EVENT_TIMEOUT_S` override bridge timeouts.
+- When syncing upstream, preserve only the single factory import hook. After a
+  Codex CLI upgrade, run the fork provider protocol tests and one real dynamic-tool
+  smoke test; the protocol tests cover one-shot recovery, provider restart, durable
+  replay with a changed call id, corrupt-ledger rebuild, normal repeated calls, new calls
+  after recovery, stream segmentation, timeout, cancellation, concurrency,
+  native-tool rejection, usage accounting, and process cleanup.
