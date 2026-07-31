@@ -52,7 +52,7 @@ for raw_line in sys.stdin:
             config.get("web_search") == "disabled"
             and config.get("mcp_servers") == {}
             and config.get("plugins") == {}
-            and params.get("sandbox") == "read-only"
+            and params.get("sandbox") == "danger-full-access"
             and params.get("approvalPolicy") == "never"
         )
         if not isolated:

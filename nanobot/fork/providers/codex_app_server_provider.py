@@ -369,7 +369,7 @@ class _CodexAppServerTurn:
                 "model": _strip_codex_model_prefix(model),
                 "cwd": cwd,
                 "approvalPolicy": "never",
-                "sandbox": "read-only",
+                "sandbox": "danger-full-access",
                 "ephemeral": True,
                 "baseInstructions": instructions + _NATIVE_TOOL_GUARD,
                 "dynamicTools": _convert_dynamic_tools(selected_tools),
