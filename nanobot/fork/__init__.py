@@ -27,3 +27,5 @@ from nanobot.fork.agent.tools import (  # noqa: F401
     skill,
     todo,
 )
+
+from nanobot.fork import skill_registry  # noqa: F401
