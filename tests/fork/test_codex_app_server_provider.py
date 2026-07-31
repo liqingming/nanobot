@@ -73,10 +73,25 @@ for raw_line in sys.stdin:
                 "method": "turn/completed",
                 "params": {"turn": {"id": "turn-1", "status": "completed"}},
             })
-        elif mode == "native":
+        elif mode in {"native", "native_once"}:
+            already_blocked = state_path is not None and state_path.exists()
+            if mode == "native_once" and already_blocked:
+                send({
+                    "method": "item/completed",
+                    "params": {
+                        "item": {"id": "answer-1", "type": "agentMessage", "text": "done"}
+                    },
+                })
+                send({
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                })
+                continue
+            if mode == "native_once" and state_path is not None:
+                state_path.write_text("blocked", encoding="utf-8")
             send({
                 "method": "item/started",
-                "params": {"item": {"id": "native-1", "type": "commandExecution"}},
+                "params": {"item": {"id": "native-1", "type": "fileChange"}},
             })
         else:
             send({
@@ -949,6 +964,25 @@ async def test_native_codex_tool_event_is_rejected(tmp_path: Path) -> None:
     assert response.finish_reason == "error"
     assert response.error_code == "native_tool_blocked"
     assert response.error_should_retry is False
+
+
+async def test_native_codex_tool_is_corrected_once_with_nanobot_tools(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "native-blocked-once"
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
+    )
+    provider._app_server_command = _fake_command("native_once", marker)
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "modify the file"}],
+        tools=_tool_schema(),
+        request_context={"session_key": "session", "turn_id": "native-correction"},
+    )
+
+    assert response.finish_reason == "stop"
+    assert response.content == "done"
 
 
 async def test_rpc_timeout_closes_hung_subprocess() -> None:

@@ -37,6 +37,7 @@ CODEX_EVENT_TIMEOUT_ENV = "NANOBOT_CODEX_APP_SERVER_EVENT_TIMEOUT_S"
 DEFAULT_CODEX_RPC_TIMEOUT_S = 45.0
 DEFAULT_CODEX_EVENT_TIMEOUT_S = 240.0
 DEFAULT_CODEX_RECOVERY_ATTEMPTS = 1
+DEFAULT_NATIVE_TOOL_CORRECTION_ATTEMPTS = 1
 _APP_SERVER_STREAM_LIMIT = 4 * 1024 * 1024
 _LEDGER_VERSION = 1
 _LEDGER_MAX_BYTES = 4 * 1024 * 1024
@@ -77,6 +78,13 @@ _NATIVE_TOOL_ITEM_TYPES = frozenset(
 _NATIVE_TOOL_GUARD = (
     "\n\nThe host application owns all tool execution. Use only the dynamic tools "
     "provided by the client. Do not use native Codex tools."
+)
+_NATIVE_TOOL_CORRECTION = (
+    "The previous Codex turn attempted to use a native Codex tool, which the host "
+    "blocked. Continue the same task using only the dynamic Nanobot tools provided "
+    "by the client. This applies to every capability, including shell commands, file "
+    "changes, MCP, web access, images, browser/computer use, and subagents. Do not "
+    "repeat tool calls whose successful results already appear in the transcript."
 )
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(bearer\s+)[^\s,;]+"),
@@ -740,7 +748,9 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
             )
             restored_from_ledger = recovering
             recovery_attempts = 0
+            native_tool_corrections = 0
             replayed_results = 0
+            active_messages = messages
             while True:
                 bridge = self._turns.get(key)
                 try:
@@ -760,7 +770,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                         await bridge.start(
                             model=model or self.default_model,
                             reasoning_effort=reasoning_effort,
-                            messages=messages,
+                            messages=active_messages,
                             tools=tools,
                             tool_choice=tool_choice,
                             recovery=recovering,
@@ -798,6 +808,35 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     stderr_tail = bridge.stderr_tail if bridge is not None else None
                     if bridge is not None:
                         await self._finish_turn(key, bridge, drop_lock=False)
+                    can_correct_native_tool = (
+                        isinstance(exc, CodexAppServerError)
+                        and exc.code == "native_tool_blocked"
+                        and native_tool_corrections
+                        < DEFAULT_NATIVE_TOOL_CORRECTION_ATTEMPTS
+                        and (not streamed or on_stream_recover is not None)
+                    )
+                    if can_correct_native_tool:
+                        native_tool_corrections += 1
+                        recovering = False
+                        active_messages = [
+                            *messages,
+                            {"role": "user", "content": _NATIVE_TOOL_CORRECTION},
+                        ]
+                        if streamed and on_stream_recover is not None:
+                            try:
+                                await on_stream_recover()
+                            except Exception as callback_exc:
+                                self._turn_locks.pop(key, None)
+                                return _app_server_error_response(
+                                    callback_exc,
+                                    retry_allowed=False,
+                                    stderr_tail=stderr_tail,
+                                )
+                        logger.warning(
+                            "Restarting Codex turn after blocked native tool; attempt={}",
+                            native_tool_corrections,
+                        )
+                        continue
                     can_recover = (
                         submitted
                         and ledger.has_entries
