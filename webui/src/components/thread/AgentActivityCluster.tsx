@@ -237,6 +237,7 @@ export function AgentActivityCluster({
   const activityContentRef = useRef<HTMLDivElement>(null);
   const autoFollowActivityRef = useRef(true);
   const scrollFrameRef = useRef<number | null>(null);
+  const programmaticActivityScrollTopRef = useRef<number | null>(null);
   const wasTurnStreamingRef = useRef(isTurnStreaming);
   const wasTurnStreaming = wasTurnStreamingRef.current;
   const hasExpandableFileEditDetails = fileEditDisplayMode !== "summary"
@@ -367,10 +368,16 @@ export function AgentActivityCluster({
   const scrollActivityToBottom = useCallback(() => {
     const el = activityScrollRef.current;
     if (!el) return;
-    el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+    const top = Math.max(0, el.scrollHeight - el.clientHeight);
+    programmaticActivityScrollTopRef.current = top;
+    el.scrollTop = top;
   }, []);
 
   const scheduleActivityScrollToBottom = useCallback(() => {
+    // Correct the position immediately so a busy stream cannot continually
+    // postpone following by replacing the pending animation frame. The frame
+    // remains as a layout-settling pass for markdown and expanded tool rows.
+    scrollActivityToBottom();
     cancelActivityScrollFrame();
     scrollFrameRef.current = window.requestAnimationFrame(() => {
       scrollFrameRef.current = null;
@@ -432,6 +439,12 @@ export function AgentActivityCluster({
   const onActivityScroll = useCallback(() => {
     const el = activityScrollRef.current;
     if (!el) return;
+    const programmaticTop = programmaticActivityScrollTopRef.current;
+    if (programmaticTop !== null && Math.abs(el.scrollTop - programmaticTop) < 2) {
+      programmaticActivityScrollTopRef.current = null;
+      return;
+    }
+    programmaticActivityScrollTopRef.current = null;
     const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
     autoFollowActivityRef.current = distance < ACTIVITY_SCROLL_NEAR_BOTTOM_PX;
   }, []);

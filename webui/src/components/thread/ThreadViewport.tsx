@@ -477,7 +477,10 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     if (!content || !hasMessages || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
       if (userReadingHistoryRef.current) return;
-      scrollToBottom(false, 2);
+      // ResizeObserver may fire for every streamed markdown commit. One
+      // immediate correction is sufficient here; scheduling an additional
+      // frame for every commit made the viewport and its jump button flicker.
+      scrollToBottom(false, 1);
     });
     observer.observe(content);
     return () => observer.disconnect();

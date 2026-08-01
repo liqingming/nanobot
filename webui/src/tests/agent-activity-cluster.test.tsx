@@ -217,6 +217,56 @@ describe("AgentActivityCluster", () => {
     }
   });
 
+  it("does not mistake a delayed programmatic scroll event for the user scrolling away", () => {
+    const raf = installAnimationFrameQueue();
+    try {
+      const { rerender } = render(
+        <AgentActivityCluster
+          messages={activityMessages()}
+          isTurnStreaming
+          hasBodyBelow={false}
+        />,
+      );
+
+      const scrollport = screen.getByTestId("agent-activity-scroll");
+      setScrollGeometry(scrollport, {
+        scrollHeight: 1000,
+        clientHeight: 120,
+        scrollTop: 0,
+      });
+      act(() => raf.flush());
+      expect(scrollport.scrollTop).toBe(880);
+
+      // Browsers dispatch the scroll event asynchronously. By then streamed
+      // content may already have increased scrollHeight, so the old bottom is
+      // no longer geometrically near the new bottom.
+      setScrollGeometry(scrollport, {
+        scrollHeight: 1200,
+        clientHeight: 120,
+        scrollTop: 880,
+      });
+      fireEvent.scroll(scrollport);
+
+      rerender(
+        <AgentActivityCluster
+          messages={activityMessages(" still streaming")}
+          isTurnStreaming
+          hasBodyBelow={false}
+        />,
+      );
+      setScrollGeometry(scrollport, {
+        scrollHeight: 1500,
+        clientHeight: 120,
+        scrollTop: scrollport.scrollTop,
+      });
+      act(() => raf.flush());
+
+      expect(scrollport.scrollTop).toBe(1380);
+    } finally {
+      raf.restore();
+    }
+  });
+
   it("does not pull the user down after they scroll up inside the activity pane", () => {
     const raf = installAnimationFrameQueue();
     try {
