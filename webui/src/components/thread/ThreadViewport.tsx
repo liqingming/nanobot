@@ -473,6 +473,17 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   }, [hasMessages, measureComposerDock]);
 
   useEffect(() => {
+    const content = contentRef.current;
+    if (!content || !hasMessages || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (userReadingHistoryRef.current) return;
+      scrollToBottom(false, 2);
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [hasMessages, scrollToBottom]);
+
+  useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
 

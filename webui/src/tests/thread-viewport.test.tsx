@@ -425,6 +425,52 @@ describe("ThreadViewport", () => {
     expect(scrollTo).not.toHaveBeenCalled();
   });
 
+  it("keeps following the bottom when rendered message content grows", async () => {
+    const resizeObserver = stubResizeObserver();
+    const scrollTo = vi.fn();
+
+    try {
+      const { container } = render(
+        <ThreadViewport
+          messages={messages}
+          isStreaming
+          composer={<div>composer</div>}
+        />,
+      );
+      const scroller = container.firstElementChild?.firstElementChild as HTMLElement;
+      Object.defineProperties(scroller, {
+        scrollHeight: { configurable: true, value: 1200 },
+        clientHeight: { configurable: true, value: 500 },
+        scrollTop: { configurable: true, writable: true, value: 700 },
+        scrollTo: { configurable: true, value: scrollTo },
+      });
+      act(() => {
+        scroller.dispatchEvent(new Event("scroll"));
+      });
+
+      Object.defineProperty(scroller, "scrollHeight", {
+        configurable: true,
+        value: 1500,
+      });
+      scrollTo.mockClear();
+      const contentObserver = resizeObserver.observers.find(
+        (observer) => observer.element?.classList.contains("max-w-[64rem]"),
+      );
+      expect(contentObserver).toBeDefined();
+
+      act(() => {
+        contentObserver?.callback([], contentObserver as unknown as ResizeObserver);
+      });
+
+      expect(scrollTo).toHaveBeenCalledWith({
+        top: 1000,
+        behavior: "auto",
+      });
+    } finally {
+      resizeObserver.restore();
+    }
+  });
+
   it("keeps the scroll-to-bottom button above a growing composer", () => {
     const resizeObserver = stubResizeObserver();
 
