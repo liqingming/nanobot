@@ -48,11 +48,15 @@ for raw_line in sys.stdin:
     elif method == "thread/start":
         params = message["params"]
         config = params.get("config", {})
+        workspace_config = config.get("sandbox_workspace_write", {})
         isolated = (
             config.get("web_search") == "disabled"
             and config.get("mcp_servers") == {}
             and config.get("plugins") == {}
-            and params.get("sandbox") == "danger-full-access"
+            and params.get("sandbox") == "workspace-write"
+            and params.get("runtimeWorkspaceRoots")
+            and workspace_config.get("writable_roots")
+            and workspace_config.get("network_access") is False
             and params.get("approvalPolicy") == "never"
         )
         if not isolated:
@@ -73,9 +77,9 @@ for raw_line in sys.stdin:
                 "method": "turn/completed",
                 "params": {"turn": {"id": "turn-1", "status": "completed"}},
             })
-        elif mode in {"native", "native_once"}:
+        elif mode in {"unsupported_native", "unsupported_native_once"}:
             already_blocked = state_path is not None and state_path.exists()
-            if mode == "native_once" and already_blocked:
+            if mode == "unsupported_native_once" and already_blocked:
                 send({
                     "method": "item/completed",
                     "params": {
@@ -87,11 +91,101 @@ for raw_line in sys.stdin:
                     "params": {"turn": {"id": "turn-1", "status": "completed"}},
                 })
                 continue
-            if mode == "native_once" and state_path is not None:
+            if mode == "unsupported_native_once" and state_path is not None:
                 state_path.write_text("blocked", encoding="utf-8")
             send({
                 "method": "item/started",
-                "params": {"item": {"id": "native-1", "type": "fileChange"}},
+                "params": {"item": {"id": "native-1", "type": "mcpToolCall"}},
+            })
+        elif mode in {"native", "native_failed", "native_approval"}:
+            send({
+                "method": "item/started",
+                "params": {"item": {
+                    "id": "patch-1",
+                    "type": "fileChange",
+                    "status": "inProgress",
+                    "changes": [{"path": "example.txt", "kind": "update", "diff": "@@"}],
+                }},
+            })
+            if mode == "native_approval":
+                send({
+                    "id": 700,
+                    "method": "item/fileChange/requestApproval",
+                    "params": {
+                        "itemId": "patch-1",
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "startedAtMs": 1,
+                        "grantRoot": "outside-workspace",
+                    },
+                })
+                continue
+            send({
+                "method": "item/completed",
+                "params": {"item": {
+                    "id": "patch-1",
+                    "type": "fileChange",
+                    "status": "failed" if mode == "native_failed" else "completed",
+                    "changes": [{"path": "example.txt", "kind": "update", "diff": "@@"}],
+                }},
+            })
+            send({
+                "method": "item/completed",
+                "params": {"item": {"id": "answer-1", "type": "agentMessage", "text": "done"}},
+            })
+            send({
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}},
+            })
+        elif mode in {"native_command", "native_command_failed", "native_command_approval"}:
+            send({
+                "method": "item/started",
+                "params": {"item": {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "status": "inProgress",
+                    "command": "git status --short",
+                    "cwd": ".",
+                    "commandActions": [],
+                }},
+            })
+            if mode == "native_command_approval":
+                send({
+                    "id": 701,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "itemId": "command-1",
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "startedAtMs": 1,
+                        "reason": "network access",
+                    },
+                })
+                continue
+            send({
+                "method": "item/commandExecution/outputDelta",
+                "params": {"itemId": "command-1", "delta": "output"},
+            })
+            send({
+                "method": "item/completed",
+                "params": {"item": {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "status": "failed" if mode == "native_command_failed" else "completed",
+                    "command": "git status --short",
+                    "cwd": ".",
+                    "commandActions": [],
+                    "aggregatedOutput": "output",
+                    "exitCode": 1 if mode == "native_command_failed" else 0,
+                }},
+            })
+            send({
+                "method": "item/completed",
+                "params": {"item": {"id": "answer-1", "type": "agentMessage", "text": "done"}},
+            })
+            send({
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}},
             })
         else:
             send({
@@ -131,6 +225,45 @@ for raw_line in sys.stdin:
             if mode == "crash_before_result":
                 print("fatal token=sk-super-secret-value", file=sys.stderr, flush=True)
                 raise SystemExit(16)
+    elif message.get("id") == 700 and "result" in message:
+        if message["result"].get("decision") != "decline":
+            raise SystemExit(19)
+        send({
+            "method": "item/completed",
+            "params": {"item": {
+                "id": "patch-1", "type": "fileChange", "status": "declined", "changes": []
+            }},
+        })
+        send({
+            "method": "item/completed",
+            "params": {"item": {"id": "answer-1", "type": "agentMessage", "text": "done"}},
+        })
+        send({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn-1", "status": "completed"}},
+        })
+    elif message.get("id") == 701 and "result" in message:
+        if message["result"].get("decision") != "decline":
+            raise SystemExit(20)
+        send({
+            "method": "item/completed",
+            "params": {"item": {
+                "id": "command-1",
+                "type": "commandExecution",
+                "status": "declined",
+                "command": "network command",
+                "cwd": ".",
+                "commandActions": [],
+            }},
+        })
+        send({
+            "method": "item/completed",
+            "params": {"item": {"id": "answer-1", "type": "agentMessage", "text": "done"}},
+        })
+        send({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn-1", "status": "completed"}},
+        })
     elif message.get("id") in {900, 901} and "result" in message:
         if mode == "crash_after_tool":
             print("fatal token=sk-super-secret-value", file=sys.stderr, flush=True)
@@ -951,11 +1084,11 @@ async def test_corrupt_ledger_is_rebuilt_from_authoritative_messages(
     assert list(ledger_dir.glob("*.json")) == []
 
 
-async def test_native_codex_tool_event_is_rejected(tmp_path: Path) -> None:
+async def test_unsupported_native_codex_tool_event_is_rejected(tmp_path: Path) -> None:
     provider = CodexAppServerProvider(
         default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
     )
-    provider._app_server_command = _fake_command("native")
+    provider._app_server_command = _fake_command("unsupported_native")
     response = await provider.chat(
         messages=[{"role": "user", "content": "inspect"}],
         tools=_tool_schema(),
@@ -966,14 +1099,112 @@ async def test_native_codex_tool_event_is_rejected(tmp_path: Path) -> None:
     assert response.error_should_retry is False
 
 
-async def test_native_codex_tool_is_corrected_once_with_nanobot_tools(
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    [("native", "completed"), ("native_failed", "failed")],
+)
+async def test_native_file_change_is_supported_and_reported(
+    tmp_path: Path,
+    mode: str,
+    expected_status: str,
+) -> None:
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
+    )
+    provider._app_server_command = _fake_command(mode)
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "modify the file"}],
+        tools=_tool_schema(),
+        request_context={"session_key": "session", "turn_id": f"native-{mode}"},
+    )
+
+    assert response.finish_reason == "stop"
+    assert response.content == "done"
+    assert response.provider_diagnostics["native_file_changes"] == {
+        "count": 1,
+        "statuses": {expected_status: 1},
+        "approval_requests_declined": 0,
+    }
+
+
+async def test_native_file_change_expansion_approval_is_declined(tmp_path: Path) -> None:
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
+    )
+    provider._app_server_command = _fake_command("native_approval")
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "modify outside the workspace"}],
+        tools=_tool_schema(),
+        request_context={"session_key": "session", "turn_id": "native-approval"},
+    )
+
+    assert response.finish_reason == "stop"
+    assert response.provider_diagnostics["native_file_changes"] == {
+        "count": 1,
+        "statuses": {"declined": 1},
+        "approval_requests_declined": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    [("native_command", "completed"), ("native_command_failed", "failed")],
+)
+async def test_native_command_execution_is_supported_and_reported(
+    tmp_path: Path,
+    mode: str,
+    expected_status: str,
+) -> None:
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
+    )
+    provider._app_server_command = _fake_command(mode)
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "inspect the workspace"}],
+        tools=_tool_schema(),
+        request_context={"session_key": "session", "turn_id": f"command-{mode}"},
+    )
+
+    assert response.finish_reason == "stop"
+    assert response.content == "done"
+    assert response.provider_diagnostics["native_command_executions"] == {
+        "count": 1,
+        "statuses": {expected_status: 1},
+        "approval_requests_declined": 0,
+    }
+
+
+async def test_native_command_expansion_approval_is_declined(tmp_path: Path) -> None:
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
+    )
+    provider._app_server_command = _fake_command("native_command_approval")
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "run a network command"}],
+        tools=_tool_schema(),
+        request_context={"session_key": "session", "turn_id": "command-approval"},
+    )
+
+    assert response.finish_reason == "stop"
+    assert response.provider_diagnostics["native_command_executions"] == {
+        "count": 1,
+        "statuses": {"declined": 1},
+        "approval_requests_declined": 1,
+    }
+
+
+async def test_unsupported_native_codex_tool_is_corrected_once_with_nanobot_tools(
     tmp_path: Path,
 ) -> None:
     marker = tmp_path / "native-blocked-once"
     provider = CodexAppServerProvider(
         default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
     )
-    provider._app_server_command = _fake_command("native_once", marker)
+    provider._app_server_command = _fake_command("unsupported_native_once", marker)
 
     response = await provider.chat(
         messages=[{"role": "user", "content": "modify the file"}],

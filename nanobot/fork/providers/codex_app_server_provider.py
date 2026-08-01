@@ -43,8 +43,6 @@ _LEDGER_VERSION = 1
 _LEDGER_MAX_BYTES = 4 * 1024 * 1024
 _LEDGER_RETENTION_S = 7 * 24 * 60 * 60
 _DISABLED_FEATURES = (
-    "shell_tool",
-    "unified_exec",
     "apps",
     "remote_plugin",
     "browser_use",
@@ -64,8 +62,6 @@ _THREAD_CONFIG_OVERRIDES: dict[str, Any] = {
 }
 _NATIVE_TOOL_ITEM_TYPES = frozenset(
     {
-        "commandExecution",
-        "fileChange",
         "mcpToolCall",
         "collabAgentToolCall",
         "webSearch",
@@ -76,15 +72,18 @@ _NATIVE_TOOL_ITEM_TYPES = frozenset(
     }
 )
 _NATIVE_TOOL_GUARD = (
-    "\n\nThe host application owns all tool execution. Use only the dynamic tools "
-    "provided by the client. Do not use native Codex tools."
+    "\n\nThe host application owns dynamic tool execution. Native Codex commands and file "
+    "changes are supported inside the configured workspace sandbox. For every other "
+    "capability, use only the dynamic tools provided by the client; do not use other "
+    "native Codex tools."
 )
 _NATIVE_TOOL_CORRECTION = (
     "The previous Codex turn attempted to use a native Codex tool, which the host "
     "blocked. Continue the same task using only the dynamic Nanobot tools provided "
-    "by the client. This applies to every capability, including shell commands, file "
-    "changes, MCP, web access, images, browser/computer use, and subagents. Do not "
-    "repeat tool calls whose successful results already appear in the transcript."
+    "by the client. Native commands and file changes are the only supported exceptions. "
+    "This restriction applies to MCP, web access, images, browser/computer use, and "
+    "subagents. Do not repeat tool calls whose successful results already appear in the "
+    "transcript."
 )
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(bearer\s+)[^\s,;]+"),
@@ -312,6 +311,10 @@ class _CodexAppServerTurn:
         self._reported_usage: dict[str, int] = {}
         self._submitted_tool_results = False
         self._streamed_output = False
+        self._native_file_changes: dict[str, str] = {}
+        self._native_file_change_approvals_declined = 0
+        self._native_command_executions: dict[str, str] = {}
+        self._native_command_approvals_declined = 0
         self._stderr_lines: deque[str] = deque(maxlen=24)
         self._stderr_task: asyncio.Task[None] | None = None
 
@@ -371,17 +374,25 @@ class _CodexAppServerTurn:
             instructions += "\n\n" + tool_choice_instruction
         workspace = current_workspace_scope()
         cwd = str(workspace.project_path if workspace else Path.cwd().resolve())
+        thread_config = {
+            **_THREAD_CONFIG_OVERRIDES,
+            "sandbox_workspace_write": {
+                "network_access": False,
+                "writable_roots": [cwd],
+            },
+        }
         result = await self._rpc(
             "thread/start",
             {
                 "model": _strip_codex_model_prefix(model),
                 "cwd": cwd,
                 "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
+                "sandbox": "workspace-write",
+                "runtimeWorkspaceRoots": [cwd],
                 "ephemeral": True,
                 "baseInstructions": instructions + _NATIVE_TOOL_GUARD,
                 "dynamicTools": _convert_dynamic_tools(selected_tools),
-                "config": _THREAD_CONFIG_OVERRIDES,
+                "config": thread_config,
             },
         )
         thread = result.get("thread") if isinstance(result, dict) else None
@@ -485,9 +496,32 @@ class _CodexAppServerTurn:
             if method == "thread/tokenUsage/updated":
                 self._last_usage = _map_token_usage(params)
                 continue
+            if method == "item/commandExecution/requestApproval" and "id" in message:
+                # Any approval request means the command needs permissions beyond the
+                # non-interactive workspace sandbox (including network access). Fail closed.
+                await self._send(
+                    {"id": message["id"], "result": {"decision": "decline"}}
+                )
+                self._native_command_approvals_declined += 1
+                continue
+            if method == "item/fileChange/requestApproval" and "id" in message:
+                # The bridge is non-interactive. workspace-write may proceed without an
+                # approval, but requests for broader roots must fail closed instead of
+                # hanging the app-server waiting for input that can never arrive.
+                await self._send(
+                    {"id": message["id"], "result": {"decision": "decline"}}
+                )
+                self._native_file_change_approvals_declined += 1
+                continue
             if method in {"item/started", "item/completed"}:
                 item = params.get("item")
                 item_type = item.get("type") if isinstance(item, dict) else None
+                if item_type == "commandExecution":
+                    self._record_native_command(item, completed=method == "item/completed")
+                    continue
+                if item_type == "fileChange":
+                    self._record_native_file_change(item, completed=method == "item/completed")
+                    continue
                 if item_type in _NATIVE_TOOL_ITEM_TYPES:
                     raise CodexAppServerError(
                         f"Codex app-server attempted a native tool outside nanobot: {item_type}.",
@@ -514,7 +548,7 @@ class _CodexAppServerTurn:
                     finish_reason="tool_calls",
                     usage=self._take_usage_delta(),
                     reasoning_content="".join(reasoning_parts) or None,
-                    provider_diagnostics={"transport": "codex_app_server"},
+                    provider_diagnostics=self._provider_diagnostics(),
                 )
             if method == "turn/completed":
                 raw_turn = params.get("turn")
@@ -532,7 +566,7 @@ class _CodexAppServerTurn:
                     finish_reason="stop",
                     usage=self._take_usage_delta(),
                     reasoning_content="".join(reasoning_parts) or None,
-                    provider_diagnostics={"transport": "codex_app_server"},
+                    provider_diagnostics=self._provider_diagnostics(),
                 )
             if "id" in message and isinstance(method, str):
                 await self._send(
@@ -544,6 +578,46 @@ class _CodexAppServerTurn:
                         },
                     }
                 )
+
+    def _record_native_file_change(self, item: dict[str, Any], *, completed: bool) -> None:
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            item_id = f"anonymous-{len(self._native_file_changes) + 1}"
+        status = item.get("status")
+        if not isinstance(status, str) or not status:
+            status = "completed" if completed else "inProgress"
+        self._native_file_changes[item_id] = status
+
+    def _record_native_command(self, item: dict[str, Any], *, completed: bool) -> None:
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            item_id = f"anonymous-{len(self._native_command_executions) + 1}"
+        status = item.get("status")
+        if not isinstance(status, str) or not status:
+            status = "completed" if completed else "inProgress"
+        self._native_command_executions[item_id] = status
+
+    def _provider_diagnostics(self) -> dict[str, Any]:
+        diagnostics: dict[str, Any] = {"transport": "codex_app_server"}
+        if self._native_file_changes:
+            status_counts: dict[str, int] = {}
+            for status in self._native_file_changes.values():
+                status_counts[status] = status_counts.get(status, 0) + 1
+            diagnostics["native_file_changes"] = {
+                "count": len(self._native_file_changes),
+                "statuses": status_counts,
+                "approval_requests_declined": self._native_file_change_approvals_declined,
+            }
+        if self._native_command_executions:
+            status_counts = {}
+            for status in self._native_command_executions.values():
+                status_counts[status] = status_counts.get(status, 0) + 1
+            diagnostics["native_command_executions"] = {
+                "count": len(self._native_command_executions),
+                "statuses": status_counts,
+                "approval_requests_declined": self._native_command_approvals_declined,
+            }
+        return diagnostics
 
     async def close(self) -> None:
         if self._closed:

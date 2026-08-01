@@ -490,9 +490,14 @@ Behavior and sync notes:
   in nanobot.
 - Each outer nanobot turn uses an ephemeral app-server process so nanobot remains
   the only persisted conversation history.
-- Codex native tools, web search, user plugins, and user MCP servers are disabled at
-  both process and thread scope. Native-tool events are rejected if a Codex version
-  ignores those settings.
+- Native Codex commands and file changes are supported as first-class app-server events
+  inside a `workspace-write` sandbox. The thread config explicitly disables command
+  network access and restricts writable roots to the current workspace. Unexpected
+  command or file-change expansion approvals are declined so the non-interactive bridge
+  cannot hang or silently widen its permissions.
+- Other Codex native tools, web search, user plugins, and user MCP servers are disabled
+  at both process and thread scope. Their native-tool events are rejected if a Codex
+  version ignores those settings.
 - Before a tool result is submitted to app-server, a workspace/session/turn-scoped
   idempotency ledger atomically persists the normalized call and authoritative result.
   A transient bridge failure is recovered once with a fresh ephemeral thread; repeated
