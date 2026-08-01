@@ -82,8 +82,9 @@ _NATIVE_TOOL_CORRECTION = (
     "blocked. Continue the same task using only the dynamic Nanobot tools provided "
     "by the client. Native commands and file changes are the only supported exceptions. "
     "This restriction applies to MCP, web access, images, browser/computer use, and "
-    "subagents. Do not repeat tool calls whose successful results already appear in the "
-    "transcript."
+    "subagents. To inspect a local image, call the Nanobot read_file tool with its path; "
+    "the image will be returned in that tool result. Never call imageView. Do not repeat "
+    "tool calls whose successful results already appear in the transcript."
 )
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(bearer\s+)[^\s,;]+"),
@@ -167,7 +168,7 @@ class _ToolResultLedger:
                 "name": name,
                 "arguments": canonical_arguments,
                 "signature": signature,
-                "content": content,
+                "content": _serialize_tool_result(content),
                 "success": not _looks_like_tool_error(content),
             }
             self.entries.append(entry)
@@ -179,10 +180,10 @@ class _ToolResultLedger:
     def begin_recovery(self) -> None:
         self._replay_offsets.clear()
 
-    def cached_result(self, call: ToolCallRequest) -> tuple[str, bool] | None:
+    def cached_result(self, call: ToolCallRequest) -> tuple[Any, bool] | None:
         for entry in self.entries:
             if entry.get("call_id") == call.id:
-                return str(entry.get("content") or ""), bool(entry.get("success"))
+                return _deserialize_tool_result(entry.get("content")), bool(entry.get("success"))
         signature = _tool_signature(
             call.name,
             _canonical_tool_arguments(call.arguments),
@@ -201,7 +202,7 @@ class _ToolResultLedger:
             )
         self._replay_offsets[signature] = offset + 1
         entry = matches[offset]
-        return str(entry.get("content") or ""), bool(entry.get("success"))
+        return _deserialize_tool_result(entry.get("content")), bool(entry.get("success"))
 
     def clear(self) -> None:
         with suppress(OSError):
@@ -430,7 +431,7 @@ class _CodexAppServerTurn:
     async def submit_cached_tool_result(
         self,
         call_id: str,
-        content: str,
+        content: Any,
         *,
         success: bool,
     ) -> None:
@@ -444,7 +445,7 @@ class _CodexAppServerTurn:
         self,
         call_id: str,
         request_id: Any,
-        content: str,
+        content: Any,
         *,
         success: bool,
     ) -> None:
@@ -452,7 +453,7 @@ class _CodexAppServerTurn:
             {
                 "id": request_id,
                 "result": {
-                    "contentItems": [{"type": "inputText", "text": content}],
+                    "contentItems": _tool_result_content_items(content),
                     "success": success,
                 },
             }
@@ -1318,15 +1319,77 @@ def _message_content_text(content: Any) -> str:
     return str(content)
 
 
-def _tool_results_by_id(messages: list[dict[str, Any]]) -> dict[str, str]:
-    results: dict[str, str] = {}
+def _tool_results_by_id(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    results: dict[str, Any] = {}
     for message in messages:
         if message.get("role") != "tool":
             continue
         call_id = message.get("tool_call_id")
         if isinstance(call_id, str) and call_id:
-            results[call_id] = _message_content_text(message.get("content"))
+            results[call_id] = message.get("content")
     return results
+
+
+def _tool_result_content_items(content: Any) -> list[dict[str, str]]:
+    """Map a Nanobot tool result to Codex dynamic-tool multimodal content items."""
+    parts = content if isinstance(content, list) else [content]
+    items: list[dict[str, str]] = []
+    for part in parts:
+        if isinstance(part, str):
+            items.append({"type": "inputText", "text": part})
+            continue
+        if not isinstance(part, dict):
+            items.append({"type": "inputText", "text": str(part)})
+            continue
+        part_type = part.get("type")
+        if part_type in {"text", "input_text", "inputText"} and isinstance(
+            part.get("text"), str
+        ):
+            items.append({"type": "inputText", "text": part["text"]})
+            continue
+        if part_type in {"image_url", "input_image", "inputImage"}:
+            image = part.get("image_url")
+            url = image.get("url") if isinstance(image, dict) else image
+            url = url or part.get("imageUrl") or part.get("url")
+            if isinstance(url, str) and url:
+                items.append({"type": "inputImage", "imageUrl": url})
+                continue
+        if part_type in {"audio_url", "input_audio", "inputAudio"}:
+            audio = part.get("audio_url")
+            url = audio.get("url") if isinstance(audio, dict) else audio
+            url = url or part.get("audioUrl") or part.get("url")
+            if isinstance(url, str) and url:
+                items.append({"type": "inputAudio", "audioUrl": url})
+                continue
+        items.append(
+            {
+                "type": "inputText",
+                "text": json.dumps(part, ensure_ascii=False, separators=(",", ":")),
+            }
+        )
+    return items or [{"type": "inputText", "text": ""}]
+
+
+def _serialize_tool_result(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    return json.dumps(
+        {"nanobot_multimodal_tool_result": content},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _deserialize_tool_result(content: Any) -> Any:
+    if not isinstance(content, str):
+        return content or ""
+    try:
+        value = json.loads(content)
+    except (TypeError, ValueError):
+        return content
+    if isinstance(value, dict) and "nanobot_multimodal_tool_result" in value:
+        return value["nanobot_multimodal_tool_result"]
+    return content
 
 
 def _tool_calls_by_id(
@@ -1404,7 +1467,8 @@ def _is_recoverable_bridge_error(exc: Exception) -> bool:
     return isinstance(exc, CodexAppServerError) and exc.retryable is True
 
 
-def _looks_like_tool_error(text: str) -> bool:
+def _looks_like_tool_error(content: Any) -> bool:
+    text = _message_content_text(content)
     return text.lstrip().lower().startswith(("error:", "tool error:", "failed:"))
 
 

@@ -22,6 +22,7 @@ from nanobot.fork.providers.codex_app_server_provider import (
     _messages_to_app_server_input,
     _strip_codex_model_prefix,
     _tool_call_from_server_request,
+    _tool_result_content_items,
     _tool_results_by_id,
     _usage_delta,
 )
@@ -600,6 +601,109 @@ def test_dynamic_tool_request_and_results_keep_call_id() -> None:
     assert call.name == "exec"
     assert call.arguments == {"command": "Write-Output ok"}
     assert results == {"call_123": "ok"}
+
+
+def test_dynamic_tool_result_preserves_multimodal_content() -> None:
+    content = [
+        {"type": "text", "text": "chart"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AAAA"},
+            "_meta": {"path": "chart.png"},
+        },
+    ]
+    results = _tool_results_by_id(
+        [{"role": "tool", "tool_call_id": "call-image", "content": content}]
+    )
+
+    assert results == {"call-image": content}
+    assert _tool_result_content_items(results["call-image"]) == [
+        {"type": "inputText", "text": "chart"},
+        {"type": "inputImage", "imageUrl": "data:image/png;base64,AAAA"},
+    ]
+
+
+def test_ledger_restores_multimodal_tool_result(tmp_path: Path) -> None:
+    ledger = _idempotency_ledger(
+        ("session", "image-recovery"),
+        root_override=tmp_path / "ledger",
+    )
+    content = [
+        {"type": "text", "text": "chart"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+    ledger.record_messages(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-image",
+                        "function": {"name": "read_file", "arguments": {"path": "chart.png"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-image", "content": content},
+        ]
+    )
+
+    restored = _idempotency_ledger(
+        ("session", "image-recovery"),
+        root_override=tmp_path / "ledger",
+    )
+    cached = restored.cached_result(
+        _tool_call_from_server_request(
+            {
+                "id": 60,
+                "method": "item/tool/call",
+                "params": {
+                    "callId": "call-image",
+                    "tool": "read_file",
+                    "arguments": {"path": "chart.png"},
+                },
+            }
+        )
+    )
+    assert cached == (content, True)
+
+
+async def test_submit_dynamic_tool_result_sends_image_content_item() -> None:
+    turn = _CodexAppServerTurn(["unused"])
+    turn._pending_tools["call-image"] = 42
+    sent: list[dict] = []
+
+    async def capture(message: dict) -> None:
+        sent.append(message)
+
+    turn._send = capture  # type: ignore[method-assign]
+    await turn.submit_tool_results(
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "call-image",
+                "content": [
+                    {"type": "text", "text": "chart"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }
+        ]
+    )
+
+    assert sent == [
+        {
+            "id": 42,
+            "result": {
+                "contentItems": [
+                    {"type": "inputText", "text": "chart"},
+                    {"type": "inputImage", "imageUrl": "data:image/png;base64,AAAA"},
+                ],
+                "success": True,
+            },
+        }
+    ]
 
 
 def test_usage_and_model_mapping() -> None:
