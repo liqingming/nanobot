@@ -102,6 +102,34 @@ class TestHandleStop:
         assert "2 task" in out.content
 
 
+class TestLoopShutdown:
+    @pytest.mark.asyncio
+    async def test_close_mcp_cancels_active_tasks_and_closes_provider(self):
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        provider.aclose = AsyncMock()
+        loop, _bus = _make_loop()
+        loop.provider = provider
+        cancelled = asyncio.Event()
+
+        async def slow_task():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = asyncio.create_task(slow_task())
+        await asyncio.sleep(0)
+        loop._active_tasks["test:c1"] = [task]
+
+        await loop.close_mcp()
+
+        assert cancelled.is_set()
+        assert task.done()
+        provider.aclose.assert_awaited_once()
+
+
 class TestDispatch:
     def test_exec_tool_not_registered_when_disabled(self):
         from nanobot.agent.tools.shell import ExecToolConfig

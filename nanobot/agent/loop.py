@@ -382,6 +382,7 @@ class AgentLoop:
         # registering its dispatch task. The run loop and _dispatch both consume them.
         self._cancelled_turn_requests: set[tuple[str, str]] = set()
         self._background_tasks: list[asyncio.Task] = []
+        self._close_lock = asyncio.Lock()
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Per-session pending queues for mid-turn message injection.
         # When a session has an active task, new messages for that session
@@ -1701,33 +1702,58 @@ class AgentLoop:
                 await self._publish_next_deferred_automation_turn(session_key)
 
     async def close_mcp(self) -> None:
-        """Drain pending background archives, then close MCP connections."""
-        if self._background_tasks:
-            print(f"正在完成 {len(self._background_tasks)} 个后台任务（记忆整理等），请稍候…")
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            self._background_tasks.clear()
-        code_search_tool = self.tools.get("code_search")
-        close_code_search = getattr(code_search_tool, "aclose", None)
-        if callable(close_code_search):
-            try:
-                result = close_code_search()
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                logger.debug("code_search cleanup error", exc_info=True)
-        from nanobot.agent.tools.exec_session import DEFAULT_EXEC_SESSION_MANAGER
-        await DEFAULT_EXEC_SESSION_MANAGER.shutdown()
-        from nanobot.agent.tools.managed_process import shutdown_managed_tasks
+        """Stop active work and release all async resources owned by the loop."""
+        close_lock = getattr(self, "_close_lock", None)
+        if close_lock is None:
+            close_lock = self._close_lock = asyncio.Lock()
+        async with close_lock:
+            current = asyncio.current_task()
+            active_tasks = {
+                task
+                for tasks in getattr(self, "_active_tasks", {}).values()
+                for task in tasks
+                if task is not current and not task.done()
+            }
+            for task in active_tasks:
+                task.cancel()
+            if active_tasks:
+                await asyncio.gather(*active_tasks, return_exceptions=True)
 
-        shutdown_managed_tasks()
-        if self._mcp_stacks:
-            print("正在断开 MCP 连接…")
-        for name, stack in self._mcp_stacks.items():
-            try:
-                await stack.aclose()
-            except (RuntimeError, BaseExceptionGroup):
-                logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
-        self._mcp_stacks.clear()
+            if self._background_tasks:
+                print(f"正在完成 {len(self._background_tasks)} 个后台任务（记忆整理等），请稍候…")
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+                self._background_tasks.clear()
+            code_search_tool = self.tools.get("code_search")
+            close_code_search = getattr(code_search_tool, "aclose", None)
+            if callable(close_code_search):
+                try:
+                    result = close_code_search()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.debug("code_search cleanup error", exc_info=True)
+            from nanobot.agent.tools.exec_session import DEFAULT_EXEC_SESSION_MANAGER
+            await DEFAULT_EXEC_SESSION_MANAGER.shutdown()
+            from nanobot.agent.tools.managed_process import shutdown_managed_tasks
+
+            shutdown_managed_tasks()
+            if self._mcp_stacks:
+                print("正在断开 MCP 连接…")
+            for name, stack in self._mcp_stacks.items():
+                try:
+                    await stack.aclose()
+                except (RuntimeError, BaseExceptionGroup):
+                    logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
+            self._mcp_stacks.clear()
+
+            close_provider = getattr(getattr(self, "provider", None), "aclose", None)
+            if callable(close_provider):
+                try:
+                    result = close_provider()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.debug("Provider cleanup error", exc_info=True)
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""

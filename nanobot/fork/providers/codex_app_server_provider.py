@@ -38,6 +38,7 @@ DEFAULT_CODEX_RPC_TIMEOUT_S = 45.0
 DEFAULT_CODEX_EVENT_TIMEOUT_S = 240.0
 DEFAULT_CODEX_RECOVERY_ATTEMPTS = 1
 DEFAULT_NATIVE_TOOL_CORRECTION_ATTEMPTS = 1
+DEFAULT_COMMAND_REFRESH_ATTEMPTS = 1
 _APP_SERVER_STREAM_LIMIT = 4 * 1024 * 1024
 _LEDGER_VERSION = 1
 _LEDGER_MAX_BYTES = 4 * 1024 * 1024
@@ -651,7 +652,16 @@ class _CodexAppServerTurn:
         if transport is not None:
             with suppress(RuntimeError, ValueError):
                 transport.close()
-            await asyncio.sleep(0)
+            # On Windows, ``Process.wait()`` only waits for the child exit.  The
+            # Proactor subprocess transport is finalized later, after all pipe
+            # ``connection_lost`` callbacks have run.  Give those callbacks a
+            # bounded chance to finish before ``asyncio.run()`` closes the loop;
+            # otherwise their destructors emit noisy ``closed pipe`` tracebacks.
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while getattr(transport, "_loop", None) is not None:
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0)
 
     async def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         request_id = self._next_rpc_id
@@ -776,6 +786,14 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         self._turns: dict[tuple[str, str], _CodexAppServerTurn] = {}
         self._turn_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
+    async def aclose(self) -> None:
+        """Close every app-server bridge still owned by this provider."""
+        bridges = list(dict.fromkeys(self._turns.values()))
+        self._turns.clear()
+        self._turn_locks.clear()
+        if bridges:
+            await asyncio.gather(*(bridge.close() for bridge in bridges), return_exceptions=True)
+
     async def _call_codex(
         self,
         messages: list[dict[str, Any]],
@@ -814,6 +832,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
             restored_from_ledger = recovering
             recovery_attempts = 0
             native_tool_corrections = 0
+            command_refresh_attempts = 0
             replayed_results = 0
             active_messages = messages
             while True:
@@ -854,6 +873,8 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     diagnostics = dict(response.provider_diagnostics or {})
                     if recovery_attempts:
                         diagnostics["bridge_recovery_attempts"] = recovery_attempts
+                    if command_refresh_attempts:
+                        diagnostics["app_server_command_refreshes"] = command_refresh_attempts
                     if restored_from_ledger:
                         diagnostics["restored_from_idempotency_ledger"] = True
                     if replayed_results:
@@ -873,6 +894,24 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     stderr_tail = bridge.stderr_tail if bridge is not None else None
                     if bridge is not None:
                         await self._finish_turn(key, bridge, drop_lock=False)
+                    can_refresh_command = (
+                        isinstance(exc, FileNotFoundError)
+                        and bridge is not None
+                        and bridge.process is None
+                        and command_refresh_attempts < DEFAULT_COMMAND_REFRESH_ATTEMPTS
+                        and not submitted
+                        and not streamed
+                    )
+                    if can_refresh_command:
+                        command_refresh_attempts += 1
+                        if self._app_server_command == bridge.command:
+                            self._app_server_command = None
+                        logger.warning(
+                            "Re-resolving Codex app-server command after launch path vanished; "
+                            "attempt={}",
+                            command_refresh_attempts,
+                        )
+                        continue
                     can_correct_native_tool = (
                         isinstance(exc, CodexAppServerError)
                         and exc.code == "native_tool_blocked"

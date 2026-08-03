@@ -830,6 +830,40 @@ async def test_app_server_always_uses_full_access_sandbox(
     assert "sandbox_workspace_write" not in config
 
 
+async def test_stale_cached_codex_command_is_resolved_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
+    )
+    stale_command = [str(tmp_path / "removed-codex.exe"), "app-server", "--stdio"]
+    fresh_command = _fake_command("answer")
+    provider._app_server_command = stale_command
+    resolutions = 0
+
+    def resolve_again() -> list[str]:
+        nonlocal resolutions
+        resolutions += 1
+        return fresh_command
+
+    monkeypatch.setattr(
+        "nanobot.fork.providers.codex_app_server_provider._resolve_codex_app_server_command",
+        resolve_again,
+    )
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "continue"}],
+        tools=None,
+        request_context={"session_key": "session", "turn_id": "stale-command"},
+    )
+
+    assert response.content == "done"
+    assert response.provider_diagnostics["app_server_command_refreshes"] == 1
+    assert provider._app_server_command == fresh_command
+    assert resolutions == 1
+
+
 async def test_stdio_protocol_continues_tool_result_and_usage_is_incremental(
     tmp_path: Path,
 ) -> None:
@@ -1382,6 +1416,28 @@ async def test_rpc_timeout_closes_hung_subprocess() -> None:
     assert bridge.process is None
     transport = getattr(process, "_transport", None)
     assert transport is None or transport.is_closing()
+    assert transport is None or getattr(transport, "_loop", None) is None
+
+
+async def test_provider_aclose_closes_active_app_server_bridges(tmp_path: Path) -> None:
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
+    )
+    bridge = _CodexAppServerTurn(_fake_command("hang_turn"))
+    await bridge.start(
+        model="gpt-test",
+        reasoning_effort=None,
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        tool_choice=None,
+    )
+    provider._turns[("session", "turn")] = bridge
+
+    await provider.aclose()
+
+    assert bridge.process is None
+    assert provider._turns == {}
+    assert provider._turn_locks == {}
 
 
 async def test_cancellation_closes_active_subprocess_and_turn_state(tmp_path: Path) -> None:
