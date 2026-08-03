@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -27,6 +28,11 @@ from nanobot.fork.providers.codex_app_server_provider import (
     _usage_delta,
 )
 from nanobot.providers.factory import make_provider
+from nanobot.security.workspace_access import (
+    bind_workspace_scope,
+    build_workspace_scope,
+    reset_workspace_scope,
+)
 
 _FAKE_APP_SERVER = r"""
 import json
@@ -49,15 +55,18 @@ for raw_line in sys.stdin:
     elif method == "thread/start":
         params = message["params"]
         config = params.get("config", {})
-        workspace_config = config.get("sandbox_workspace_write", {})
+        if mode == "capture_sandbox" and state_path is not None:
+            state_path.write_text(json.dumps(params), encoding="utf-8")
+        full = (
+            params.get("sandbox") == "danger-full-access"
+            and "runtimeWorkspaceRoots" not in params
+            and "sandbox_workspace_write" not in config
+        )
         isolated = (
             config.get("web_search") == "disabled"
             and config.get("mcp_servers") == {}
             and config.get("plugins") == {}
-            and params.get("sandbox") == "workspace-write"
-            and params.get("runtimeWorkspaceRoots")
-            and workspace_config.get("writable_roots")
-            and workspace_config.get("network_access") is False
+            and full
             and params.get("approvalPolicy") == "never"
         )
         if not isolated:
@@ -68,7 +77,7 @@ for raw_line in sys.stdin:
         send({"id": message["id"], "result": {"turn": {"id": "turn-1"}}})
         if mode == "hang_turn":
             continue
-        if mode in {"answer", "large_event"}:
+        if mode in {"answer", "large_event", "capture_sandbox"}:
             text = "x" * (128 * 1024) if mode == "large_event" else "done"
             send({
                 "method": "item/completed",
@@ -787,6 +796,38 @@ def test_explicit_proxy_is_passed_only_to_codex_child(monkeypatch: pytest.Monkey
     assert env["HTTP_PROXY"] == "http://provider-proxy"
     assert env["HTTPS_PROXY"] == "http://provider-proxy"
     assert env["ALL_PROXY"] == "http://provider-proxy"
+
+
+@pytest.mark.parametrize("access_mode", ["restricted", "full"])
+async def test_app_server_always_uses_full_access_sandbox(
+    tmp_path: Path,
+    access_mode: str,
+) -> None:
+    state_path = tmp_path / f"{access_mode}.json"
+    project = tmp_path / "project"
+    project.mkdir()
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
+    )
+    provider._app_server_command = _fake_command("capture_sandbox", state_path)
+    scope = build_workspace_scope(project, access_mode, source_channel="cli")
+    token = bind_workspace_scope(scope)
+    try:
+        response = await provider.chat(
+            messages=[{"role": "user", "content": "inspect sibling projects"}],
+            tools=_tool_schema(),
+            request_context={"session_key": access_mode, "turn_id": access_mode},
+        )
+    finally:
+        reset_workspace_scope(token)
+
+    assert response.content == "done"
+    params = json.loads(state_path.read_text(encoding="utf-8"))
+    config = params["config"]
+    assert params["cwd"] == str(project.resolve())
+    assert params["sandbox"] == "danger-full-access"
+    assert "runtimeWorkspaceRoots" not in params
+    assert "sandbox_workspace_write" not in config
 
 
 async def test_stdio_protocol_continues_tool_result_and_usage_is_incremental(

@@ -375,27 +375,17 @@ class _CodexAppServerTurn:
             instructions += "\n\n" + tool_choice_instruction
         workspace = current_workspace_scope()
         cwd = str(workspace.project_path if workspace else Path.cwd().resolve())
-        thread_config = {
-            **_THREAD_CONFIG_OVERRIDES,
-            "sandbox_workspace_write": {
-                "network_access": False,
-                "writable_roots": [cwd],
-            },
+        thread_params: dict[str, Any] = {
+            "model": _strip_codex_model_prefix(model),
+            "cwd": cwd,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "ephemeral": True,
+            "baseInstructions": instructions + _NATIVE_TOOL_GUARD,
+            "dynamicTools": _convert_dynamic_tools(selected_tools),
+            "config": dict(_THREAD_CONFIG_OVERRIDES),
         }
-        result = await self._rpc(
-            "thread/start",
-            {
-                "model": _strip_codex_model_prefix(model),
-                "cwd": cwd,
-                "approvalPolicy": "never",
-                "sandbox": "workspace-write",
-                "runtimeWorkspaceRoots": [cwd],
-                "ephemeral": True,
-                "baseInstructions": instructions + _NATIVE_TOOL_GUARD,
-                "dynamicTools": _convert_dynamic_tools(selected_tools),
-                "config": thread_config,
-            },
-        )
+        result = await self._rpc("thread/start", thread_params)
         thread = result.get("thread") if isinstance(result, dict) else None
         thread_id = thread.get("id") if isinstance(thread, dict) else None
         if not isinstance(thread_id, str) or not thread_id:
