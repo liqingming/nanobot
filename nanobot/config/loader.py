@@ -102,8 +102,25 @@ def resolve_config_env_vars(config: Config) -> Config:
 
     Walks in place so fields declared with ``exclude=True`` survive;
     returns the same instance when no references are present.
-    Raises ``ValueError`` if a referenced variable is not set.
+    Missing variables in optional channel configs disable only that channel.
+    References elsewhere remain strict and raise ``ValueError`` when missing.
     """
+    extras = config.channels.__pydantic_extra__ or {}
+    updates: dict[str, Any] = {}
+    for name, section in extras.items():
+        try:
+            updates[name] = _resolve_in_place(section)
+        except ValueError as exc:
+            resolved = _resolve_env_vars_or_empty(section)
+            if not isinstance(resolved, dict):
+                raise
+            resolved["enabled"] = False
+            updates[name] = resolved
+            logger.warning("{} channel disabled: {}", name, exc)
+    if updates:
+        channels = config.channels.model_copy()
+        channels.__pydantic_extra__ = {**extras, **updates}
+        config = config.model_copy(update={"channels": channels})
     return _resolve_in_place(config)
 
 
@@ -136,6 +153,19 @@ def _resolve_in_place(obj: Any) -> Any:
     if isinstance(obj, list):
         resolved = [_resolve_in_place(v) for v in obj]
         return resolved if any(nv is not ov for nv, ov in zip(resolved, obj)) else obj
+    return obj
+
+
+def _resolve_env_vars_or_empty(obj: Any) -> Any:
+    """Resolve env references, using an empty value for missing variables."""
+    if isinstance(obj, str):
+        return _ENV_REF_PATTERN.sub(
+            lambda match: os.environ.get(match.group(1), ""), obj
+        )
+    if isinstance(obj, dict):
+        return {key: _resolve_env_vars_or_empty(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_env_vars_or_empty(value) for value in obj]
     return obj
 
 

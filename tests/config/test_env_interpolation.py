@@ -66,6 +66,44 @@ class TestResolveConfig:
         resolved = resolve_config_env_vars(raw)
         assert resolved.providers.groq.api_key == "resolved-key"
 
+    def test_missing_optional_channel_env_disables_only_that_channel(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("FEISHU_APP_ID", raising=False)
+        monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps({
+                "channels": {
+                    "feishu": {
+                        "enabled": True,
+                        "appId": "${FEISHU_APP_ID}",
+                        "appSecret": "${FEISHU_APP_SECRET}",
+                    },
+                    "websocket": {"enabled": True},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        resolved = resolve_config_env_vars(load_config(config_path))
+
+        assert resolved.channels.feishu["enabled"] is False
+        assert resolved.channels.feishu["appId"] == ""
+        assert resolved.channels.feishu["appSecret"] == ""
+        assert resolved.channels.websocket["enabled"] is True
+
+    def test_missing_non_channel_env_remains_an_error(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TEST_API_KEY", raising=False)
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps({"providers": {"groq": {"apiKey": "${TEST_API_KEY}"}}}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="TEST_API_KEY"):
+            resolve_config_env_vars(load_config(config_path))
+
     def test_save_preserves_templates(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MY_TOKEN", "real-token")
         config_path = tmp_path / "config.json"
