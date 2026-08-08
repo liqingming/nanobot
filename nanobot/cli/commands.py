@@ -1431,7 +1431,9 @@ def trigger(
 
     runtime_config = _load_runtime_config(config, workspace)
     content = _read_trigger_cli_message(message)
-    store = LocalTriggerStore(runtime_config.workspace_path)
+    store = LocalTriggerStore(
+        _runtime_data_dir_for_workspace(runtime_config.workspace_path)
+    )
     try:
         delivery = store.enqueue(trigger_id, content)
     except (TriggerNotFoundError, TriggerDisabledError) as exc:
@@ -1703,7 +1705,12 @@ def _run_gateway(
     port = port if port is not None else config.gateway.port
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
-    sync_workspace_templates(config.workspace_path)
+    # Keep project files in the selected workspace while storing Nanobot-owned
+    # sessions, memory, cron state, templates, and runtime logs in the central
+    # per-workspace cache.  This mirrors the agent/serve commands and prevents
+    # a long-running Gateway from polluting a custom project workspace.
+    data_dir = _runtime_data_dir_for_workspace(config.workspace_path)
+    sync_workspace_templates(data_dir)
     bus = MessageBus()
     runtime_events = RuntimeEventBus()
     try:
@@ -1711,7 +1718,7 @@ def _run_gateway(
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1) from exc
-    session_manager = SessionManager(config.workspace_path)
+    session_manager = SessionManager(data_dir)
 
     # Self-heal the gateway state file with the current PID after any restart.
     from nanobot.config.loader import get_config_path
@@ -1731,10 +1738,10 @@ def _run_gateway(
     if is_default_workspace(config.workspace_path):
         _migrate_cron_store(config)
 
-    # Create cron service with workspace-scoped store
-    cron_store_path = config.workspace_path / "cron" / "jobs.json"
+    # Create runtime services with the same per-workspace data root.
+    cron_store_path = data_dir / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
-    trigger_store = LocalTriggerStore(config.workspace_path)
+    trigger_store = LocalTriggerStore(data_dir)
 
     # Create agent with cron service
     agent = AgentLoop.from_config(
@@ -1748,6 +1755,7 @@ def _run_gateway(
         provider_snapshot_loader=load_provider_snapshot,
         runtime_events=runtime_events,
         provider_signature=provider_snapshot.signature,
+        data_dir=data_dir,
         hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
         local_trigger_store=trigger_store,
         hook_factories=[create_file_edit_activity_hook],
@@ -1876,7 +1884,7 @@ def _run_gateway(
 
         # Heartbeat is a system job that checks HEARTBEAT.md for active tasks.
         if job.name == "heartbeat":
-            heartbeat_file = config.workspace_path / "HEARTBEAT.md"
+            heartbeat_file = data_dir / "HEARTBEAT.md"
             try:
                 content = heartbeat_file.read_text(encoding="utf-8")
             except OSError:

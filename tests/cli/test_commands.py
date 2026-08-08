@@ -2062,7 +2062,7 @@ def _patch_serve_runtime(monkeypatch, config: Config, seen: dict[str, object]) -
     monkeypatch.setattr("aiohttp.web.run_app", _fake_run_app)
 
 
-def test_gateway_uses_workspace_from_config_by_default(monkeypatch, tmp_path: Path) -> None:
+def test_gateway_uses_cached_data_dir_for_config_workspace(monkeypatch, tmp_path: Path) -> None:
     config_file = _write_instance_config(tmp_path)
     config = Config()
     config.agents.defaults.workspace = str(tmp_path / "config-workspace")
@@ -2080,7 +2080,7 @@ def test_gateway_uses_workspace_from_config_by_default(monkeypatch, tmp_path: Pa
 
     assert isinstance(result.exception, _StopGatewayError)
     assert seen["config_path"] == config_file.resolve()
-    assert seen["workspace"] == Path(config.agents.defaults.workspace)
+    assert seen["workspace"] == get_workspace_cache_dir(config.workspace_path)
 
 
 def test_gateway_workspace_option_overrides_config(monkeypatch, tmp_path: Path) -> None:
@@ -2103,11 +2103,11 @@ def test_gateway_workspace_option_overrides_config(monkeypatch, tmp_path: Path) 
     )
 
     assert isinstance(result.exception, _StopGatewayError)
-    assert seen["workspace"] == override
+    assert seen["workspace"] == get_workspace_cache_dir(override)
     assert config.workspace_path == override
 
 
-def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Path) -> None:
+def test_gateway_uses_cached_data_directory_for_cron_store(monkeypatch, tmp_path: Path) -> None:
     config_file = _write_instance_config(tmp_path)
     config = Config()
     config.agents.defaults.workspace = str(tmp_path / "config-workspace")
@@ -2129,7 +2129,7 @@ def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
     assert isinstance(result.exception, _StopGatewayError)
-    assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_workspace_cache_dir(config.workspace_path) / "cron" / "jobs.json"
 
 
 def test_gateway_unbound_agent_cron_is_skipped(
@@ -2473,9 +2473,14 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
     _patch_cli_command_runtime(
         monkeypatch,
         config,
+        sync_templates=lambda path: seen.__setitem__("templates", path),
         message_bus=lambda: bus,
-        session_manager=lambda _workspace: _FakeSessionManager(),
-        cron_service=lambda _store_path: _FakeCronService(),
+        session_manager=lambda root: (
+            seen.__setitem__("session_root", root) or _FakeSessionManager()
+        ),
+        cron_service=lambda store_path: (
+            seen.__setitem__("cron_store", store_path) or _FakeCronService()
+        ),
     )
 
     class _FakeMemory:
@@ -2569,6 +2574,12 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
     agent = seen["agent"]
     agent_kwargs = seen["agent_from_config_kwargs"]
     kwargs = seen["local_trigger_queue_kwargs"]
+    data_dir = get_workspace_cache_dir(config.workspace_path)
+    assert seen["templates"] == data_dir
+    assert seen["session_root"] == data_dir
+    assert seen["cron_store"] == data_dir / "cron" / "jobs.json"
+    assert agent_kwargs["data_dir"] == data_dir
+    assert agent_kwargs["local_trigger_store"].workspace_path == data_dir
     assert "local_trigger_store" in agent_kwargs
     assert kwargs["store"] is agent_kwargs["local_trigger_store"]
     assert "bus" not in kwargs
@@ -2608,7 +2619,7 @@ def test_gateway_workspace_override_does_not_migrate_legacy_cron(
     )
 
     assert isinstance(result.exception, _StopGatewayError)
-    assert seen["cron_store"] == override / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_workspace_cache_dir(override) / "cron" / "jobs.json"
     assert legacy_file.exists()
     assert not (override / "cron" / "jobs.json").exists()
 
@@ -2644,7 +2655,7 @@ def test_gateway_custom_config_workspace_does_not_migrate_legacy_cron(
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
     assert isinstance(result.exception, _StopGatewayError)
-    assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
+    assert seen["cron_store"] == get_workspace_cache_dir(config.workspace_path) / "cron" / "jobs.json"
     assert legacy_file.exists()
     assert not (custom_workspace / "cron" / "jobs.json").exists()
 
@@ -3106,7 +3117,7 @@ def test_serve_uses_api_config_defaults_and_workspace_override(
     assert seen["api_key"] == "secret"
 
 
-def test_trigger_cli_queues_message_in_workspace(
+def test_trigger_cli_queues_message_in_workspace_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3117,7 +3128,7 @@ def test_trigger_cli_queues_message_in_workspace(
     config.agents.defaults.workspace = str(tmp_path / "workspace")
     _patch_cli_command_runtime(monkeypatch, config)
 
-    store = LocalTriggerStore(config.workspace_path)
+    store = LocalTriggerStore(get_workspace_cache_dir(config.workspace_path))
     trigger = store.create(
         name="Review hook",
         channel="websocket",
