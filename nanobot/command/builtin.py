@@ -337,6 +337,7 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
         )
 
     name = parts[0]
+    persistence_warning: str | None = None
     try:
         loop.set_model_preset(name)
     except (KeyError, ValueError) as exc:
@@ -350,6 +351,12 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
             ),
             metadata=metadata,
         )
+    try:
+        from nanobot.config.loader import save_active_model_preset
+
+        save_active_model_preset(name)
+    except (OSError, ValueError) as exc:
+        persistence_warning = f"Warning: model switched for this run but was not saved: {exc}"
 
     max_tokens = getattr(getattr(loop.provider, "generation", None), "max_tokens", None)
     lines = [
@@ -359,6 +366,8 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
     ]
     if max_tokens is not None:
         lines.append(f"- Max output tokens: {max_tokens}")
+    if persistence_warning is not None:
+        lines.append(persistence_warning)
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,

@@ -85,7 +85,7 @@ async def test_enabled_skin_uses_terminal_default_canvas_but_opaque_popup() -> N
 
 
 @pytest.mark.asyncio
-async def test_argument_command_selection_enters_edit_mode_without_submit() -> None:
+async def test_model_command_selection_submits_to_open_picker() -> None:
     tui = TextualTUI()
     submitted: list[str] = []
 
@@ -93,7 +93,7 @@ async def test_argument_command_selection_enters_edit_mode_without_submit() -> N
         submitted.append(text)
 
     tui.set_on_submit(on_submit)
-    tui.set_commands([("/model", "Switch model preset", "edit")])
+    tui.set_commands([("/model", "Switch model preset", "submit")])
 
     app = tui._app
     async with app.run_test() as pilot:
@@ -106,8 +106,8 @@ async def test_argument_command_selection_enters_edit_mode_without_submit() -> N
         await pilot.pause()
 
         inp = app.query_one("#input")
-        assert inp.value == "/model "
-        assert submitted == []
+        assert inp.value == ""
+        assert submitted == ["/model"]
         assert tui._popup_mode == "hidden"
 
 

@@ -735,6 +735,7 @@ def _is_cli_local_command(text: str) -> bool:
     command = text.strip()
     return (
         _is_exit_command(command)
+        or command == "/model"
         or command == "/skills"
         or command == "/system-prompt"
         or command == "/skin"
@@ -1048,7 +1049,11 @@ def _resolve_cli_session_key(
 
 def _tui_command_palette() -> list[tuple[str, str, str]]:
     items = [
-        (spec.command, spec.description, "edit" if spec.arg_hint else "submit")
+        (
+            spec.command,
+            spec.description,
+            "submit" if spec.command == "/model" else ("edit" if spec.arg_hint else "submit"),
+        )
         for spec in BUILTIN_COMMAND_SPECS
         if spec.command != "/new"
     ]
@@ -1074,6 +1079,45 @@ def _tui_command_palette() -> list[tuple[str, str, str]]:
         seen.add(command)
         deduped.append((command, description, action))
     return sorted(deduped, key=lambda item: item[0].lower())
+
+
+def _model_picker_items(agent_loop: AgentLoop) -> list[tuple[str, str]]:
+    """Build model preset picker rows, highlighting the active preset."""
+    active = agent_loop.model_preset or "default"
+    names = ["default", *sorted(name for name in agent_loop.model_presets if name != "default")]
+    items: list[tuple[str, str]] = []
+    for name in names:
+        preset = agent_loop.model_presets.get(name)
+        model = getattr(preset, "model", "")
+        marker = "✓ " if name == active else "  "
+        label = f"{marker}{name}"
+        if model:
+            label += f" — {model}"
+        items.append((name, label))
+    return items
+
+
+def _switch_model_from_picker(agent_loop: AgentLoop, tui: Any, name: str) -> None:
+    """Apply a model preset selected from the interactive CLI picker."""
+    try:
+        agent_loop.set_model_preset(name)
+    except (KeyError, ValueError) as exc:
+        tui.add_system(f"切换模型预设失败: {exc}")
+        return
+    try:
+        from nanobot.config.loader import save_active_model_preset
+
+        config_path = save_active_model_preset(name)
+    except (OSError, ValueError) as exc:
+        tui.add_system(
+            f"已切换模型预设: {name}\n模型: {agent_loop.model}\n"
+            f"但保存启动默认值失败: {exc}"
+        )
+        return
+    tui.add_system(
+        f"已切换模型预设: {name}\n模型: {agent_loop.model}\n"
+        f"已保存为启动默认值: {config_path}"
+    )
 
 
 def _runtime_data_dir_for_workspace(workspace_path: Path) -> Path:
@@ -2666,6 +2710,13 @@ def agent(
                     return
 
                 # ── 话题管理命令 ──────────────────────────────────────────────
+                if text == "/model":
+                    async def _on_model_select(name: str) -> None:
+                        _switch_model_from_picker(agent_loop, tui, name)
+
+                    tui.show_topic_popup(_model_picker_items(agent_loop), _on_model_select)
+                    return
+
                 if text == "/skills":
                     tui.add_system(_format_skills_command(agent_loop.context.skills))
                     return

@@ -14,6 +14,7 @@ from nanobot.command.builtin import (
     register_builtin_commands,
 )
 from nanobot.command.router import CommandContext, CommandRouter
+from nanobot.config.loader import set_config_path
 from nanobot.config.schema import ModelPresetConfig
 
 
@@ -29,6 +30,7 @@ def _provider(default_model: str, max_tokens: int = 123) -> MagicMock:
 
 
 def _make_loop(tmp_path) -> AgentLoop:
+    set_config_path(tmp_path / "config.json")
     return AgentLoop(
         bus=MessageBus(),
         provider=_provider("base-model", max_tokens=123),
@@ -87,6 +89,9 @@ async def test_model_command_switches_preset(tmp_path) -> None:
     assert loop.model == "openai/gpt-4.1"
     assert loop.subagents.model == "openai/gpt-4.1"
     assert loop.consolidator.model == "openai/gpt-4.1"
+    assert (tmp_path / "config.json").read_text(encoding="utf-8").find(
+        '"modelPreset": "fast"'
+    ) >= 0
 
 
 @pytest.mark.asyncio

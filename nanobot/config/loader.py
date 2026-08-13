@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +93,51 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def save_active_model_preset(name: str, config_path: Path | None = None) -> Path:
+    """Persist only the active model preset without resolving config secrets."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("model preset name must be a non-empty string")
+
+    path = config_path or get_config_path()
+    data: dict[str, Any] = {}
+    if path.exists():
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"Failed to update config at {path}: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError(f"Failed to update config at {path}: root must be an object")
+        data = loaded
+
+    agents = data.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        raise ValueError(f"Failed to update config at {path}: agents must be an object")
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        raise ValueError(f"Failed to update config at {path}: agents.defaults must be an object")
+
+    # Preserve the spelling already used by hand-written configs. Remove the
+    # alternate spelling so two conflicting values can never coexist.
+    key = "model_preset" if "model_preset" in defaults else "modelPreset"
+    defaults[key] = name.strip()
+    defaults.pop("modelPreset" if key == "model_preset" else "model_preset", None)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return path
 
 
 _ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")

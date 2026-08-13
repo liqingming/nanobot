@@ -1,7 +1,9 @@
+import json
 import warnings
 
 import pytest
 
+from nanobot.config.loader import load_config, save_active_model_preset
 from nanobot.config.schema import Config
 
 
@@ -14,6 +16,26 @@ def test_resolve_preset_returns_defaults_when_no_preset() -> None:
     assert resolved.context_window_tokens == config.agents.defaults.context_window_tokens
     assert resolved.temperature == config.agents.defaults.temperature
     assert resolved.reasoning_effort == config.agents.defaults.reasoning_effort
+
+
+def test_save_active_model_preset_preserves_raw_env_references(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({
+            "agents": {"defaults": {"model": "base", "modelPreset": "default"}},
+            "modelPresets": {"fast": {"model": "openai/gpt-4.1"}},
+            "providers": {"openai": {"apiKey": "${OPENAI_API_KEY}"}},
+        }),
+        encoding="utf-8",
+    )
+
+    saved_path = save_active_model_preset("fast", config_path)
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved_path == config_path
+    assert data["agents"]["defaults"]["modelPreset"] == "fast"
+    assert data["providers"]["openai"]["apiKey"] == "${OPENAI_API_KEY}"
+    assert load_config(config_path).agents.defaults.model_preset == "fast"
 
 
 def test_provider_api_type_accepts_exact_values_only() -> None:

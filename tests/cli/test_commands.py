@@ -320,6 +320,54 @@ def test_resume_palette_selection_submits_to_show_topic_list() -> None:
     ) in palette
 
 
+def test_model_palette_selection_submits_to_show_preset_list() -> None:
+    palette = cli_commands._tui_command_palette()
+
+    assert (
+        "/model",
+        "Show or switch the active model preset.",
+        "submit",
+    ) in palette
+    assert cli_commands._is_cli_local_command("/model")
+
+
+def test_model_picker_lists_presets_and_highlights_current() -> None:
+    loop = SimpleNamespace(
+        model_preset="fast",
+        model_presets={
+            "default": SimpleNamespace(model="base-model"),
+            "fast": SimpleNamespace(model="openai/gpt-4.1"),
+        },
+    )
+
+    assert cli_commands._model_picker_items(loop) == [
+        ("default", "  default — base-model"),
+        ("fast", "✓ fast — openai/gpt-4.1"),
+    ]
+
+
+def test_model_picker_selection_switches_and_persists(tmp_path, monkeypatch) -> None:
+    loop = SimpleNamespace(model="base-model")
+
+    def set_model_preset(name: str) -> None:
+        loop.model = "openai/gpt-4.1"
+
+    loop.set_model_preset = set_model_preset
+    tui = MagicMock()
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    cli_commands._switch_model_from_picker(loop, tui, "fast")
+
+    tui.add_system.assert_called_once_with(
+        f"已切换模型预设: fast\n模型: openai/gpt-4.1\n"
+        f"已保存为启动默认值: {config_path}"
+    )
+    assert json.loads(config_path.read_text(encoding="utf-8"))["agents"]["defaults"] == {
+        "modelPreset": "fast"
+    }
+
+
 def test_bookmark_commands_are_cli_local_palette_actions() -> None:
     palette = cli_commands._tui_command_palette()
     actions = {command: action for command, _description, action in palette}
@@ -3345,7 +3393,7 @@ def test_fork_tui_command_palette_marks_argument_commands_for_edit() -> None:
 
     actions = {command: action for command, _description, action in _tui_command_palette()}
 
-    assert actions["/model"] == "edit"
+    assert actions["/model"] == "submit"
     assert actions["/history"] == "edit"
     assert actions["/goal"] == "edit"
     assert actions["/pairing"] == "edit"
