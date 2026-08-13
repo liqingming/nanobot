@@ -1961,10 +1961,10 @@ if _TEXTUAL_AVAILABLE:
             try:
                 bar = self.query_one("#todo-bar", Static)
                 bar.update(text)
-                if text:
-                    bar.add_class("visible")
-                else:
-                    bar.remove_class("visible")
+                # Like #live, showing or hiding the todo row changes #output's
+                # height. Preserve the bottom anchor unless the user has
+                # intentionally scrolled into history.
+                self._change_live_visibility(bar, bool(text))
             except Exception:
                 pass
 

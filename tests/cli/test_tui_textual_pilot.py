@@ -1683,3 +1683,32 @@ async def test_welcome_page_lists_bound_shortcuts_and_common_commands(tmp_path):
     assert "Ctrl+Shift+B" not in welcome
     assert "Alt+B" not in welcome
     assert "Ctrl+Alt+B" not in welcome
+
+
+@pytest.mark.asyncio
+async def test_todo_bar_visibility_preserves_output_bottom_anchor() -> None:
+    tui = TextualTUI()
+    tui.set_commands([])
+
+    app = tui._app
+    async with app.run_test(size=(80, 14)) as pilot:
+        await pilot.pause()
+        out = app.query_one("#output")
+        for i in range(80):
+            out.write(f"history {i}")
+        out.scroll_end(animate=False, immediate=True, force=True)
+        await pilot.pause()
+        assert out.is_at_bottom()
+
+        app.update_todo_bar("⚡ 正在执行 (0/3)")
+        # Visibility changes take effect after Textual's next layout refresh.
+        await pilot.pause(0.05)
+
+        assert out.is_at_bottom()
+        assert out.scroll_offset.y == out.max_scroll_y
+
+        app.update_todo_bar("")
+        await pilot.pause(0.05)
+
+        assert out.is_at_bottom()
+        assert out.scroll_offset.y == out.max_scroll_y
