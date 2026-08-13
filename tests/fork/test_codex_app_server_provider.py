@@ -18,9 +18,11 @@ from nanobot.fork.providers.codex_app_server_provider import (
     _codex_subprocess_env,
     _CodexAppServerTurn,
     _convert_dynamic_tools,
+    _current_turn_messages,
     _idempotency_ledger,
     _map_token_usage,
     _messages_to_app_server_input,
+    _skill_requires_unavailable_tools,
     _strip_codex_model_prefix,
     _tool_call_from_server_request,
     _tool_result_content_items,
@@ -52,11 +54,27 @@ for raw_line in sys.stdin:
         if mode == "hang":
             continue
         send({"id": message["id"], "result": {}})
+    elif method == "skills/list":
+        skills = []
+        if mode == "capture_skills" and state_path is not None:
+            skills.append({
+                "name": "browser:control-in-app-browser",
+                "description": "browser",
+                "path": str(state_path / "SKILL.md"),
+                "scope": "user",
+                "enabled": True,
+            })
+        send({
+            "id": message["id"],
+            "result": {"data": [{"cwd": message["params"]["cwds"][0], "skills": skills, "errors": []}]},
+        })
     elif method == "thread/start":
         params = message["params"]
         config = params.get("config", {})
         if mode == "capture_sandbox" and state_path is not None:
             state_path.write_text(json.dumps(params), encoding="utf-8")
+        if mode == "capture_skills" and state_path is not None:
+            (state_path / "params.json").write_text(json.dumps(params), encoding="utf-8")
         full = (
             params.get("sandbox") == "danger-full-access"
             and "runtimeWorkspaceRoots" not in params
@@ -74,14 +92,51 @@ for raw_line in sys.stdin:
         else:
             send({"id": message["id"], "result": {"thread": {"id": "thread-1"}}})
     elif method == "turn/start":
+        if mode == "capture_skills" and state_path is not None:
+            (state_path / "turn.json").write_text(
+                json.dumps(message["params"]), encoding="utf-8"
+            )
         send({"id": message["id"], "result": {"turn": {"id": "turn-1"}}})
         if mode == "hang_turn":
             continue
-        if mode in {"answer", "large_event", "capture_sandbox"}:
+        if mode in {"answer", "large_event", "capture_sandbox", "capture_skills"}:
             text = "x" * (128 * 1024) if mode == "large_event" else "done"
             send({
                 "method": "item/completed",
                 "params": {"item": {"id": "answer-1", "type": "agentMessage", "text": text}},
+            })
+            send({
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}},
+            })
+        elif mode == "image_view" or (
+            mode == "image_after_tool" and state_path is not None and state_path.exists()
+        ):
+            send({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "image-1",
+                        "type": "imageView",
+                        "path": "reference.png",
+                    }
+                },
+            })
+            send({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "image-1",
+                        "type": "imageView",
+                        "path": "reference.png",
+                    }
+                },
+            })
+            send({
+                "method": "item/completed",
+                "params": {
+                    "item": {"id": "answer-1", "type": "agentMessage", "text": "done"}
+                },
             })
             send({
                 "method": "turn/completed",
@@ -292,6 +347,19 @@ for raw_line in sys.stdin:
                 "params": {"callId": "call-2", "tool": "write", "arguments": {"value": 1}},
             })
             continue
+        if mode == "image_after_tool" and state_path is not None:
+            state_path.write_text("image", encoding="utf-8")
+            send({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "image-1",
+                        "type": "imageView",
+                        "path": "reference.png",
+                    }
+                },
+            })
+            continue
         send({
             "method": "thread/tokenUsage/updated",
             "params": {
@@ -348,6 +416,24 @@ def _tool_schema() -> list[dict[str, object]]:
                 },
             },
         }
+    ]
+
+
+def _tool_schema_with_read_file() -> list[dict[str, object]]:
+    return [
+        *_tool_schema(),
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "read a workspace file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        },
     ]
 
 
@@ -438,6 +524,45 @@ def test_recovery_input_includes_completed_current_turn_history() -> None:
     assert "tool [call-1]: ok" in checkpoint
 
 
+def test_history_omits_content_read_from_disabled_skill() -> None:
+    skill_path = r"C:\Users\test\.codex\plugins\browser\skills\control\SKILL.md"
+    messages = [
+        {"role": "user", "content": "test the browser"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "read-browser-skill",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": skill_path.replace("\\", "/")}),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "read-browser-skill",
+            "name": "read_file",
+            "content": "You MUST call mcp__node_repl__js now.",
+        },
+        {"role": "user", "content": "continue"},
+    ]
+
+
+    _instructions, turn_input = _messages_to_app_server_input(
+        messages,
+        disabled_skill_paths={skill_path},
+    )
+
+    transcript = turn_input[0]["text"]
+    assert "mcp__node_repl__js" not in transcript
+    assert "disabled because its required tools are unavailable" in transcript
+    assert "read-browser-skill" in transcript
+
+
 def test_tool_argument_canonicalization_ignores_json_key_order() -> None:
     assert _canonical_tool_arguments('{"b":2,"a":1}') == _canonical_tool_arguments({"a": 1, "b": 2})
 
@@ -513,7 +638,7 @@ def test_ledger_rejects_reused_call_id_with_different_signature(tmp_path: Path) 
             ]
         )
 
-def test_recovery_fails_safe_for_ambiguous_repeated_signature(tmp_path: Path) -> None:
+def test_recovery_replays_repeated_signature_in_original_order(tmp_path: Path) -> None:
     ledger = _idempotency_ledger(
         ("session", "ambiguous"),
         root_override=tmp_path / "ledger",
@@ -538,7 +663,7 @@ def test_recovery_fails_safe_for_ambiguous_repeated_signature(tmp_path: Path) ->
         ]
     )
     ledger.begin_recovery()
-    recovered_call = _tool_call_from_server_request(
+    first_recovered_call = _tool_call_from_server_request(
         {
             "id": 60,
             "method": "item/tool/call",
@@ -549,8 +674,102 @@ def test_recovery_fails_safe_for_ambiguous_repeated_signature(tmp_path: Path) ->
             },
         }
     )
-    with pytest.raises(CodexIdempotencyLedgerError, match="Ambiguous"):
-        ledger.cached_result(recovered_call)
+    second_recovered_call = _tool_call_from_server_request(
+        {
+            "id": 61,
+            "method": "item/tool/call",
+            "params": {
+                "callId": "another-new-call-id",
+                "tool": "write",
+                "arguments": {"value": 1},
+            },
+        }
+    )
+
+    assert ledger.cached_result(first_recovered_call) == ("first", True)
+    assert ledger.cached_result(second_recovered_call) == ("second", True)
+    with pytest.raises(CodexIdempotencyLedgerError, match="repeated again"):
+        ledger.cached_result(second_recovered_call)
+
+
+def test_recovery_fails_safe_when_tool_order_diverges(tmp_path: Path) -> None:
+    ledger = _idempotency_ledger(
+        ("session", "order-diverged"),
+        root_override=tmp_path / "ledger",
+    )
+    ledger.record_messages(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {"name": "read", "arguments": {"path": "a"}},
+                    },
+                    {
+                        "id": "call-2",
+                        "function": {"name": "write", "arguments": {"path": "b"}},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "first"},
+            {"role": "tool", "tool_call_id": "call-2", "content": "second"},
+        ]
+    )
+    ledger.begin_recovery()
+    out_of_order_call = _tool_call_from_server_request(
+        {
+            "id": 62,
+            "method": "item/tool/call",
+            "params": {
+                "callId": "new-call-id",
+                "tool": "write",
+                "arguments": {"path": "b"},
+            },
+        }
+    )
+
+    with pytest.raises(CodexIdempotencyLedgerError, match="order diverged"):
+        ledger.cached_result(out_of_order_call)
+
+
+def test_current_turn_messages_excludes_older_tool_results(tmp_path: Path) -> None:
+    messages = [
+        {"role": "user", "content": "older"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "old-call",
+                    "function": {"name": "write", "arguments": {"value": "old"}},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "old-call", "content": "old result"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "current"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "new-call",
+                    "function": {"name": "write", "arguments": {"value": "new"}},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "new-call", "content": "new result"},
+    ]
+
+    turn_messages = _current_turn_messages(messages)
+
+    assert turn_messages[0] == {"role": "user", "content": "current"}
+    assert _tool_results_by_id(turn_messages) == {"new-call": "new result"}
+    ledger = _idempotency_ledger(
+        ("session", "current-turn-only"),
+        root_override=tmp_path / "ledger",
+    )
+    ledger.record_messages(turn_messages)
+    assert [entry["call_id"] for entry in ledger.entries] == ["new-call"]
 
 
 def test_ledger_write_cleans_stale_json_and_temp_files(tmp_path: Path) -> None:
@@ -786,6 +1005,73 @@ def test_tool_choice_filters_dynamic_tools() -> None:
     )
     assert selected == tools
     assert "write" in (instruction or "")
+
+
+def test_skill_dependency_scan_detects_missing_dynamic_tool(tmp_path: Path) -> None:
+    skill_file = tmp_path / "SKILL.md"
+    skill_file.write_text("Use `mcp__node_repl__js` to control the browser.", encoding="utf-8")
+    skill = {"path": str(skill_file), "enabled": True}
+
+    assert _skill_requires_unavailable_tools(skill, {"read_file"}) is True
+    assert _skill_requires_unavailable_tools(skill, {"mcp__node_repl__js"}) is False
+
+    declared = {
+        "path": str(tmp_path / "missing.md"),
+        "dependencies": {"tools": [{"type": "mcp", "value": "docs"}]},
+    }
+    assert _skill_requires_unavailable_tools(declared, {"read_file"}) is True
+    assert _skill_requires_unavailable_tools(declared, {"mcp__docs__search"}) is False
+
+
+async def test_app_server_hides_skill_with_unavailable_dynamic_tool(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "browser-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "Use `mcp__node_repl__js` to control the browser.",
+        encoding="utf-8",
+    )
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger"
+    )
+    provider._app_server_command = _fake_command("capture_skills", skill_dir)
+
+    response = await provider.chat(
+        messages=[
+            {"role": "user", "content": "test the browser"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "read-browser-skill",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({"path": str(skill_dir / "SKILL.md")}),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "read-browser-skill",
+                "name": "read_file",
+                "content": "You MUST call mcp__node_repl__js now.",
+            },
+            {"role": "user", "content": "continue"},
+        ],
+        tools=_tool_schema(),
+        request_context={"session_key": "session", "turn_id": "skill-filter"},
+    )
+
+    assert response.content == "done"
+    params = json.loads((skill_dir / "params.json").read_text(encoding="utf-8"))
+    assert params["config"]["skills"] == {
+        "config": [{"path": str(skill_dir / "SKILL.md"), "enabled": False}]
+    }
+    turn = json.loads((skill_dir / "turn.json").read_text(encoding="utf-8"))
+    rendered_input = json.dumps(turn["input"], ensure_ascii=False)
+    assert "mcp__node_repl__js" not in rendered_input
+    assert "disabled because its required tools are unavailable" in rendered_input
 
 
 def test_explicit_proxy_is_passed_only_to_codex_child(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1276,6 +1562,135 @@ async def test_unsupported_native_codex_tool_event_is_rejected(tmp_path: Path) -
     assert response.finish_reason == "error"
     assert response.error_code == "native_tool_blocked"
     assert response.error_should_retry is False
+
+
+async def test_native_image_view_is_bridged_through_nanobot_read_file(tmp_path: Path) -> None:
+    ledger_dir = tmp_path / "ledger"
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=ledger_dir
+    )
+    provider._app_server_command = _fake_command("image_view")
+    context = {"session_key": "session", "turn_id": "image-view"}
+    messages = [{"role": "user", "content": "inspect the image"}]
+
+    bridged = await provider.chat(
+        messages=messages,
+        tools=_tool_schema_with_read_file(),
+        request_context=context,
+    )
+
+    assert bridged.finish_reason == "tool_calls"
+    assert bridged.tool_calls[0].name == "read_file"
+    assert bridged.tool_calls[0].arguments == {"path": "reference.png"}
+    assert bridged.provider_diagnostics["native_image_view_bridged"] is True
+    assert provider._turns == {}
+
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [bridged.tool_calls[0].to_openai_tool_call()],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": bridged.tool_calls[0].id,
+                "content": [
+                    {"type": "text", "text": "reference"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            },
+        ]
+    )
+    completed = await provider.chat(
+        messages=messages,
+        tools=_tool_schema_with_read_file(),
+        request_context=context,
+    )
+
+    assert completed.finish_reason == "stop"
+    assert completed.content == "done"
+    assert completed.provider_diagnostics["idempotent_tool_replays"] == 1
+    assert list(ledger_dir.glob("*.json")) == []
+
+
+async def test_native_image_view_recovery_skips_prior_tool_replay(tmp_path: Path) -> None:
+    marker = tmp_path / "image-after-tool"
+    ledger_dir = tmp_path / "ledger"
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=ledger_dir
+    )
+    provider._app_server_command = _fake_command("image_after_tool", marker)
+    context = {"session_key": "session", "turn_id": "image-after-tool"}
+    messages = [{"role": "user", "content": "inspect after another tool"}]
+
+    first = await provider.chat(
+        messages=messages,
+        tools=_tool_schema_with_read_file(),
+        request_context=context,
+    )
+    assert first.tool_calls[0].name == "write"
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [first.tool_calls[0].to_openai_tool_call()],
+            },
+            {"role": "tool", "tool_call_id": first.tool_calls[0].id, "content": "ok"},
+        ]
+    )
+
+    bridged = await provider.chat(
+        messages=messages,
+        tools=_tool_schema_with_read_file(),
+        request_context=context,
+    )
+    assert bridged.tool_calls[0].name == "read_file"
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [bridged.tool_calls[0].to_openai_tool_call()],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": bridged.tool_calls[0].id,
+                "content": [
+                    {"type": "text", "text": "reference"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            },
+        ]
+    )
+
+    completed = await provider.chat(
+        messages=messages,
+        tools=_tool_schema_with_read_file(),
+        request_context=context,
+    )
+
+    assert completed.finish_reason == "stop"
+    assert completed.content == "done"
+    assert completed.provider_diagnostics["idempotent_tool_replays"] == 1
+    assert list(ledger_dir.glob("*.json")) == []
+
+
+def test_native_image_view_bridge_fails_closed_without_path_or_read_file() -> None:
+    bridge = _CodexAppServerTurn(["unused"])
+    with pytest.raises(CodexAppServerError, match="read_file is unavailable"):
+        bridge._bridge_image_view({"id": "image-1", "type": "imageView", "path": "a.png"})
+
+    bridge._dynamic_tool_names = {"read_file"}
+    with pytest.raises(CodexAppServerError, match="missing an image path"):
+        bridge._bridge_image_view({"id": "image-1", "type": "imageView"})
 
 
 @pytest.mark.parametrize(

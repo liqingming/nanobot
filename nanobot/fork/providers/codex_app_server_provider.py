@@ -66,7 +66,6 @@ _NATIVE_TOOL_ITEM_TYPES = frozenset(
         "mcpToolCall",
         "collabAgentToolCall",
         "webSearch",
-        "imageView",
         "imageGeneration",
         "computerUse",
         "browserUse",
@@ -87,6 +86,7 @@ _NATIVE_TOOL_CORRECTION = (
     "the image will be returned in that tool result. Never call imageView. Do not repeat "
     "tool calls whose successful results already appear in the transcript."
 )
+_SKILL_DYNAMIC_TOOL_RE = re.compile(r"\bmcp__[A-Za-z0-9_]+")
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)\b(api[_-]?key|token|secret|password)(\s*[:=]\s*)[^\s,;]+"),
@@ -129,7 +129,8 @@ class _ToolResultLedger:
         self.session_key = session_key
         self.turn_id = turn_id
         self.entries: list[dict[str, Any]] = []
-        self._replay_offsets: dict[str, int] = {}
+        self._replay_index = 0
+        self._native_image_replay_indexes: set[int] = set()
         self._load()
 
     @property
@@ -179,37 +180,59 @@ class _ToolResultLedger:
             self._write()
 
     def begin_recovery(self) -> None:
-        self._replay_offsets.clear()
+        self._replay_index = 0
 
-    def cached_result(self, call: ToolCallRequest) -> tuple[Any, bool] | None:
-        for entry in self.entries:
-            if entry.get("call_id") == call.id:
-                return _deserialize_tool_result(entry.get("content")), bool(entry.get("success"))
+    def begin_native_image_recovery(self) -> None:
+        self._native_image_replay_indexes.clear()
+
+    def cached_native_image_result(self, call: ToolCallRequest) -> tuple[Any, bool] | None:
+        """Match a synthetic imageView result without imposing global tool order."""
         signature = _tool_signature(
             call.name,
             _canonical_tool_arguments(call.arguments),
         )
-        matches = [entry for entry in self.entries if entry.get("signature") == signature]
-        if not matches:
+        for index, entry in enumerate(self.entries):
+            if index in self._native_image_replay_indexes:
+                continue
+            call_id = entry.get("call_id")
+            if not isinstance(call_id, str) or not call_id.startswith("native-image-view-"):
+                continue
+            if entry.get("signature") != signature:
+                continue
+            self._native_image_replay_indexes.add(index)
+            return _deserialize_tool_result(entry.get("content")), bool(entry.get("success"))
+        return None
+
+    def cached_result(self, call: ToolCallRequest) -> tuple[Any, bool] | None:
+        signature = _tool_signature(
+            call.name,
+            _canonical_tool_arguments(call.arguments),
+        )
+        if self._replay_index >= len(self.entries):
+            if any(entry.get("signature") == signature for entry in self.entries):
+                raise CodexIdempotencyLedgerError(
+                    "Tool signature repeated again during the same recovery."
+                )
             return None
-        if len(matches) > 1:
+        entry = self.entries[self._replay_index]
+        if entry.get("signature") != signature:
+            remaining_signatures = {
+                item.get("signature") for item in self.entries[self._replay_index + 1 :]
+            }
+            if signature not in remaining_signatures:
+                return None
             raise CodexIdempotencyLedgerError(
-                "Ambiguous repeated tool signature during Codex bridge recovery."
+                "Tool replay order diverged during Codex bridge recovery."
             )
-        offset = self._replay_offsets.get(signature, 0)
-        if offset >= len(matches):
-            raise CodexIdempotencyLedgerError(
-                "Tool signature repeated again during the same recovery."
-            )
-        self._replay_offsets[signature] = offset + 1
-        entry = matches[offset]
+        self._replay_index += 1
         return _deserialize_tool_result(entry.get("content")), bool(entry.get("success"))
 
     def clear(self) -> None:
         with suppress(OSError):
             self.path.unlink(missing_ok=True)
         self.entries.clear()
-        self._replay_offsets.clear()
+        self._replay_index = 0
+        self._native_image_replay_indexes.clear()
 
     def _load(self) -> None:
         if not self.path.exists():
@@ -317,6 +340,7 @@ class _CodexAppServerTurn:
         self._native_file_change_approvals_declined = 0
         self._native_command_executions: dict[str, str] = {}
         self._native_command_approvals_declined = 0
+        self._dynamic_tool_names: set[str] = set()
         self._stderr_lines: deque[str] = deque(maxlen=24)
         self._stderr_task: asyncio.Task[None] | None = None
 
@@ -367,15 +391,25 @@ class _CodexAppServerTurn:
         )
         await self._notify("initialized", {})
 
+        workspace = current_workspace_scope()
+        cwd = str(workspace.project_path if workspace else Path.cwd().resolve())
+        selected_tools, tool_choice_instruction = _apply_tool_choice(tools, tool_choice)
+        self._dynamic_tool_names = {
+            name
+            for tool in selected_tools or []
+            if (name := _tool_schema_name(tool)) is not None
+        }
+        config = dict(_THREAD_CONFIG_OVERRIDES)
+        disabled_skills = await self._unsupported_skill_overrides(cwd, selected_tools)
+        if disabled_skills:
+            config["skills"] = {"config": disabled_skills}
         instructions, turn_input = _messages_to_app_server_input(
             messages,
             include_current_turn_history=recovery,
+            disabled_skill_paths={entry["path"] for entry in disabled_skills},
         )
-        selected_tools, tool_choice_instruction = _apply_tool_choice(tools, tool_choice)
         if tool_choice_instruction:
             instructions += "\n\n" + tool_choice_instruction
-        workspace = current_workspace_scope()
-        cwd = str(workspace.project_path if workspace else Path.cwd().resolve())
         thread_params: dict[str, Any] = {
             "model": _strip_codex_model_prefix(model),
             "cwd": cwd,
@@ -384,7 +418,7 @@ class _CodexAppServerTurn:
             "ephemeral": True,
             "baseInstructions": instructions + _NATIVE_TOOL_GUARD,
             "dynamicTools": _convert_dynamic_tools(selected_tools),
-            "config": dict(_THREAD_CONFIG_OVERRIDES),
+            "config": config,
         }
         result = await self._rpc("thread/start", thread_params)
         thread = result.get("thread") if isinstance(result, dict) else None
@@ -395,6 +429,50 @@ class _CodexAppServerTurn:
         if reasoning_effort:
             turn_params["effort"] = reasoning_effort
         await self._rpc("turn/start", turn_params)
+
+    async def _unsupported_skill_overrides(
+        self,
+        cwd: str,
+        tools: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Hide Codex skills whose required native tools are unavailable to Nanobot."""
+        try:
+            result = await self._rpc("skills/list", {"cwds": [cwd], "forceReload": False})
+        except Exception:
+            # Older app-server versions may not expose skills/list. Skill filtering
+            # is defensive isolation and must not prevent the model from starting.
+            logger.debug("Codex skill dependency discovery unavailable", exc_info=True)
+            return []
+        tool_names = {
+            name
+            for tool in tools or []
+            if (name := _tool_schema_name(tool)) is not None
+        }
+        overrides: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+        for entry in result.get("data", []):
+            if not isinstance(entry, dict) or entry.get("cwd") != cwd:
+                continue
+            for skill in entry.get("skills", []):
+                if not isinstance(skill, dict):
+                    continue
+                path = skill.get("path")
+                if not isinstance(path, str) or not path or path in seen_paths:
+                    continue
+                # skills.config is an array override. Preserve skills the user
+                # already disabled instead of replacing their config with only
+                # Nanobot's dependency-based entries.
+                if skill.get("enabled") is False or _skill_requires_unavailable_tools(
+                    skill, tool_names
+                ):
+                    overrides.append({"path": path, "enabled": False})
+                    seen_paths.add(path)
+        if overrides:
+            logger.debug(
+                "Disabled {} Codex skill(s) with unavailable tool dependencies",
+                len(overrides),
+            )
+        return overrides
 
     async def submit_tool_results(self, messages: list[dict[str, Any]]) -> None:
         if not self._pending_tools:
@@ -514,6 +592,24 @@ class _CodexAppServerTurn:
                 if item_type == "fileChange":
                     self._record_native_file_change(item, completed=method == "item/completed")
                     continue
+                if item_type == "imageView":
+                    if method == "item/completed":
+                        continue
+                    call = self._bridge_image_view(item)
+                    if on_tool_call_delta:
+                        await on_tool_call_delta(
+                            {"id": call.id, "name": call.name, "arguments": call.arguments}
+                        )
+                    diagnostics = self._provider_diagnostics()
+                    diagnostics["native_image_view_bridged"] = True
+                    return LLMResponse(
+                        content="".join(content_parts) or None,
+                        tool_calls=[call],
+                        finish_reason="tool_calls",
+                        usage=self._take_usage_delta(),
+                        reasoning_content="".join(reasoning_parts) or None,
+                        provider_diagnostics=diagnostics,
+                    )
                 if item_type in _NATIVE_TOOL_ITEM_TYPES:
                     raise CodexAppServerError(
                         f"Codex app-server attempted a native tool outside nanobot: {item_type}.",
@@ -542,6 +638,7 @@ class _CodexAppServerTurn:
                     reasoning_content="".join(reasoning_parts) or None,
                     provider_diagnostics=self._provider_diagnostics(),
                 )
+
             if method == "turn/completed":
                 raw_turn = params.get("turn")
                 turn = raw_turn if isinstance(raw_turn, dict) else {}
@@ -570,6 +667,36 @@ class _CodexAppServerTurn:
                         },
                     }
                 )
+
+    def _bridge_image_view(self, item: dict[str, Any]) -> ToolCallRequest:
+        """Translate a native imageView event into Nanobot's guarded read_file tool."""
+        if "read_file" not in self._dynamic_tool_names:
+            raise CodexAppServerError(
+                "Codex app-server requested imageView, but Nanobot read_file is unavailable.",
+                code="native_tool_blocked",
+                retryable=False,
+            )
+        path = next(
+            (
+                item.get(field)
+                for field in ("path", "imagePath", "filePath", "image_path")
+                if isinstance(item.get(field), str) and item.get(field).strip()
+            ),
+            None,
+        )
+        if path is None:
+            raise CodexAppServerError(
+                "Codex app-server imageView request is missing an image path.",
+                code="native_tool_blocked",
+                retryable=False,
+            )
+        item_id = item.get("id")
+        suffix = item_id if isinstance(item_id, str) and item_id else uuid.uuid4().hex
+        return ToolCallRequest(
+            id=f"native-image-view-{suffix}",
+            name="read_file",
+            arguments={"path": path},
+        )
 
     def _record_native_file_change(self, item: dict[str, Any], *, completed: bool) -> None:
         item_id = item.get("id")
@@ -810,13 +937,14 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         key = _turn_key(request_context)
         lock = self._turn_locks.setdefault(key, asyncio.Lock())
         async with lock:
+            turn_messages = _current_turn_messages(messages)
             try:
                 ledger = await asyncio.to_thread(
                     _idempotency_ledger,
                     key,
                     root_override=self._idempotency_dir,
                 )
-                await asyncio.to_thread(ledger.record_messages, messages)
+                await asyncio.to_thread(ledger.record_messages, turn_messages)
             except Exception as exc:
                 bridge = self._turns.get(key)
                 if bridge is not None:
@@ -827,8 +955,12 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
             recovering = (
                 self._turns.get(key) is None
                 and ledger.has_entries
-                and bool(_tool_results_by_id(messages))
+                and bool(_tool_results_by_id(turn_messages))
             )
+            native_image_recovery = recovering and _last_tool_result_is_native_image_view(
+                turn_messages
+            )
+            strict_recovery = recovering and not native_image_recovery
             restored_from_ledger = recovering
             recovery_attempts = 0
             native_tool_corrections = 0
@@ -849,8 +981,10 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                             event_timeout_s=self._event_timeout_s,
                         )
                         self._turns[key] = bridge
-                        if recovering:
+                        if strict_recovery:
                             ledger.begin_recovery()
+                        elif native_image_recovery:
+                            ledger.begin_native_image_recovery()
                         await bridge.start(
                             model=model or self.default_model,
                             reasoning_effort=reasoning_effort,
@@ -864,7 +998,8 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     response, replay_count = await self._next_response_with_replay(
                         bridge,
                         ledger,
-                        recovering=recovering,
+                        recovering=strict_recovery,
+                        native_image_recovery=native_image_recovery,
                         on_content_delta=on_content_delta,
                         on_thinking_delta=on_thinking_delta,
                         on_tool_call_delta=on_tool_call_delta,
@@ -880,6 +1015,11 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     if replayed_results:
                         diagnostics["idempotent_tool_replays"] = replayed_results
                     response.provider_diagnostics = diagnostics
+                    if diagnostics.get("native_image_view_bridged"):
+                        # imageView is a native Codex operation and has no dynamic-tool
+                        # request id to answer. Close this bridge; the next provider call
+                        # rebuilds the turn with the guarded read_file result in history.
+                        await self._finish_turn(key, bridge, drop_lock=False)
                     if not response.has_tool_calls:
                         await self._finish_turn(key, bridge)
                         await asyncio.to_thread(ledger.clear)
@@ -922,6 +1062,8 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     if can_correct_native_tool:
                         native_tool_corrections += 1
                         recovering = False
+                        strict_recovery = False
+                        native_image_recovery = False
                         active_messages = [
                             *messages,
                             {"role": "user", "content": _NATIVE_TOOL_CORRECTION},
@@ -951,6 +1093,8 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     if can_recover:
                         recovery_attempts += 1
                         recovering = True
+                        strict_recovery = True
+                        native_image_recovery = False
                         if streamed and on_stream_recover is not None:
                             try:
                                 await on_stream_recover()
@@ -981,6 +1125,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         ledger: _ToolResultLedger,
         *,
         recovering: bool,
+        native_image_recovery: bool,
         on_content_delta: Callable[[str], Awaitable[None]] | None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None,
@@ -991,9 +1136,29 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
             response = await bridge.next_response(
                 on_content_delta=on_content_delta,
                 on_thinking_delta=on_thinking_delta,
-                on_tool_call_delta=None if recovering else on_tool_call_delta,
+                on_tool_call_delta=(
+                    None if recovering or native_image_recovery else on_tool_call_delta
+                ),
             )
-            if not recovering or not response.has_tool_calls:
+            if not response.has_tool_calls:
+                response.usage = _sum_usage(replay_usage, response.usage)
+                return response, replayed
+            if native_image_recovery and response.provider_diagnostics.get(
+                "native_image_view_bridged"
+            ):
+                call = response.tool_calls[0]
+                cached = ledger.cached_native_image_result(call)
+                if cached is not None:
+                    replay_usage = _sum_usage(replay_usage, response.usage)
+                    replayed += 1
+                    continue
+                response.usage = _sum_usage(replay_usage, response.usage)
+                if on_tool_call_delta is not None:
+                    await on_tool_call_delta(
+                        {"id": call.id, "name": call.name, "arguments": call.arguments}
+                    )
+                return response, replayed
+            if not recovering:
                 response.usage = _sum_usage(replay_usage, response.usage)
                 return response, replayed
             if len(response.tool_calls) != 1:
@@ -1011,6 +1176,13 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                 return response, replayed
             content, success = cached
             replay_usage = _sum_usage(replay_usage, response.usage)
+            if response.provider_diagnostics.get("native_image_view_bridged"):
+                # imageView is a native event rather than a dynamic-tool RPC, so there is
+                # no pending request id to answer. The matching ledger entry proves that
+                # Nanobot already authorized and read this exact path. Ignore the repeated
+                # native lifecycle event and continue consuming this recovery turn.
+                replayed += 1
+                continue
             await bridge.submit_cached_tool_result(
                 call.id,
                 content,
@@ -1227,10 +1399,41 @@ def _tool_schema_name(tool: dict[str, Any]) -> str | None:
     return name if isinstance(name, str) and name else None
 
 
+def _skill_requires_unavailable_tools(skill: dict[str, Any], tool_names: set[str]) -> bool:
+    """Return whether a Codex skill depends on tools outside the dynamic namespace."""
+    dependencies = skill.get("dependencies")
+    dependency_tools = dependencies.get("tools", []) if isinstance(dependencies, dict) else []
+    for dependency in dependency_tools:
+        if not isinstance(dependency, dict):
+            continue
+        dependency_type = dependency.get("type")
+        value = dependency.get("value")
+        if not isinstance(value, str) or not value:
+            continue
+        if dependency_type == "mcp":
+            prefix = f"mcp__{value}__".casefold()
+            if not any(name.casefold().startswith(prefix) for name in tool_names):
+                return True
+        elif dependency_type == "tool" and value not in tool_names:
+            return True
+
+    path = skill.get("path")
+    if not isinstance(path, str) or not path:
+        return False
+    try:
+        markdown = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        logger.debug("Could not inspect Codex skill dependencies: {}", path, exc_info=True)
+        return False
+    referenced_tools = set(_SKILL_DYNAMIC_TOOL_RE.findall(markdown))
+    return bool(referenced_tools - tool_names)
+
+
 def _messages_to_app_server_input(
     messages: list[dict[str, Any]],
     *,
     include_current_turn_history: bool = False,
+    disabled_skill_paths: set[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     instruction_parts = [
         _message_content_text(message.get("content"))
@@ -1251,6 +1454,10 @@ def _messages_to_app_server_input(
         if message.get("role") not in {"system", "developer"}
         and (last_user_index is None or index < last_user_index)
     ]
+    omitted_tool_results = _disabled_skill_read_call_ids(
+        messages,
+        disabled_skill_paths or set(),
+    )
     turn_input: list[dict[str, Any]] = []
     if prior_messages:
         turn_input.append(
@@ -1259,7 +1466,10 @@ def _messages_to_app_server_input(
                 "text": (
                     "Existing nanobot conversation transcript follows. Treat tool calls and "
                     "tool results as completed history; do not repeat them.\n\n"
-                    + _render_transcript(prior_messages)
+                    + _render_transcript(
+                        prior_messages,
+                        omitted_tool_result_ids=omitted_tool_results,
+                    )
                 ),
             }
         )
@@ -1274,7 +1484,11 @@ def _messages_to_app_server_input(
                         "Recovery checkpoint from this same nanobot turn follows. "
                         "Every listed tool call already ran and every tool result is "
                         "authoritative. Never execute those calls again; continue after "
-                        "the final result.\n\n" + _render_transcript(current_turn_tail)
+                        "the final result.\n\n"
+                        + _render_transcript(
+                            current_turn_tail,
+                            omitted_tool_result_ids=omitted_tool_results,
+                        )
                     ),
                 }
             )
@@ -1287,7 +1501,52 @@ def _messages_to_app_server_input(
     return instructions, turn_input
 
 
-def _render_transcript(messages: list[dict[str, Any]]) -> str:
+def _disabled_skill_read_call_ids(
+    messages: list[dict[str, Any]],
+    disabled_skill_paths: set[str],
+) -> set[str]:
+    """Find historical read_file calls that loaded a now-disabled Codex skill."""
+    if not disabled_skill_paths:
+        return set()
+    disabled_path_keys = {_path_key(path) for path in disabled_skill_paths}
+    call_ids: set[str] = set()
+    for message in messages:
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict) or function.get("name") != "read_file":
+                continue
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    continue
+            path = arguments.get("path") if isinstance(arguments, dict) else None
+            call_id = tool_call.get("id")
+            if (
+                isinstance(path, str)
+                and isinstance(call_id, str)
+                and _path_key(path) in disabled_path_keys
+            ):
+                call_ids.add(call_id)
+    return call_ids
+
+
+def _path_key(path: str) -> str:
+    portable_path = path.replace("\\", os.sep).replace("/", os.sep)
+    return os.path.normcase(os.path.abspath(os.path.normpath(portable_path)))
+
+
+def _render_transcript(
+    messages: list[dict[str, Any]],
+    *,
+    omitted_tool_result_ids: set[str] | None = None,
+) -> str:
     lines: list[str] = []
     for message in messages:
         role = str(message.get("role") or "unknown")
@@ -1297,6 +1556,15 @@ def _render_transcript(messages: list[dict[str, Any]]) -> str:
             rendered = json.dumps(tool_calls, ensure_ascii=False, separators=(",", ":"))
             content = f"{content}\nTool calls: {rendered}".strip()
         call_id = message.get("tool_call_id")
+        if (
+            role == "tool"
+            and isinstance(call_id, str)
+            and call_id in (omitted_tool_result_ids or set())
+        ):
+            content = (
+                "[omitted: this result contained instructions from a Codex skill that is "
+                "disabled because its required tools are unavailable]"
+            )
         suffix = f" [{call_id}]" if isinstance(call_id, str) and call_id else ""
         lines.append(f"{role}{suffix}: {content}")
     return "\n".join(lines)
@@ -1357,6 +1625,15 @@ def _tool_results_by_id(messages: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(call_id, str) and call_id:
             results[call_id] = message.get("content")
     return results
+
+
+def _last_tool_result_is_native_image_view(messages: list[dict[str, Any]]) -> bool:
+    for message in reversed(messages):
+        if message.get("role") != "tool":
+            continue
+        call_id = message.get("tool_call_id")
+        return isinstance(call_id, str) and call_id.startswith("native-image-view-")
+    return False
 
 
 def _tool_result_content_items(content: Any) -> list[dict[str, str]]:
@@ -1442,6 +1719,14 @@ def _tool_calls_by_id(
                 continue
             calls[call_id] = (name, source.get("arguments"))
     return calls
+
+
+def _current_turn_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the current user turn, excluding tool traffic from older turns."""
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            return messages[index:]
+    return messages
 
 
 def _canonical_tool_arguments(arguments: Any) -> str:
