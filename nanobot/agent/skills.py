@@ -67,7 +67,7 @@ class SkillsLoader:
         self._meta_cache: dict[str, tuple[float, dict | None]] = {}
 
     def _skill_entries_from_dir(self, base: Path, source: str, *, skip_names: set[str] | None = None) -> list[dict[str, str]]:
-        if not base.exists():
+        if not base.is_dir():
             return []
         entries: list[dict[str, str]] = []
         for skill_dir in sorted(base.iterdir(), key=lambda path: path.name):

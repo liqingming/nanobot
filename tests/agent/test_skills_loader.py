@@ -39,6 +39,26 @@ def test_list_skills_empty_when_skills_dir_missing(tmp_path: Path) -> None:
     assert loader.list_skills(filter_unavailable=False) == []
 
 
+def test_list_skills_skips_skill_root_that_is_not_a_directory(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    claude_skills = workspace / ".claude" / "skills"
+    claude_skills.parent.mkdir()
+    claude_skills.write_text("../.agents/skills", encoding="utf-8")
+    builtin = tmp_path / "builtin"
+    builtin_path = _write_skill(builtin, "builtin", body="# Builtin")
+
+    loader = SkillsLoader(
+        workspace,
+        builtin_skills_dir=builtin,
+        extra_skill_roots=[("claude", claude_skills)],
+    )
+
+    assert loader.list_skills(filter_unavailable=False) == [
+        {"name": "builtin", "path": str(builtin_path), "source": "builtin"}
+    ]
+
+
 def test_list_skills_empty_when_skills_dir_exists_but_empty(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     (workspace / "skills").mkdir(parents=True)
