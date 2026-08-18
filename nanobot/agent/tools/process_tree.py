@@ -16,6 +16,31 @@ _PROCESS_WAIT_TIMEOUT_S = 5.0
 _KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
+async def close_subprocess_transport(
+    process: asyncio.subprocess.Process,
+    *,
+    timeout_s: float = 1.0,
+) -> None:
+    """Close a subprocess transport and let Windows pipe callbacks finish.
+
+    ``Process.wait()`` only reaps the child; on the Proactor event loop the
+    pipe transports are finalized by callbacks scheduled for later loop
+    iterations. If ``asyncio.run()`` closes the loop first, Python 3.13 can
+    emit an ``I/O operation on closed pipe`` traceback from ``__del__``.
+    """
+    transport = getattr(process, "_transport", None)
+    if transport is None:
+        return
+    with suppress(RuntimeError, ValueError):
+        transport.close()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while getattr(transport, "_loop", None) is not None:
+        if loop.time() >= deadline:
+            break
+        await asyncio.sleep(0)
+
+
 async def terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     """Force-stop *process* and every descendant, then reap the direct child.
 

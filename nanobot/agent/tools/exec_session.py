@@ -191,11 +191,9 @@ class _ExecSession:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _close_process_transport(self) -> None:
-        transport = getattr(self.process, "_transport", None)
-        if transport is not None:
-            with suppress(RuntimeError, ValueError):
-                transport.close()
-            await asyncio.sleep(0)
+        from nanobot.agent.tools.process_tree import close_subprocess_transport
+
+        await close_subprocess_transport(self.process)
 
     async def _wait_for_buffered_output(self) -> None:
         deadline = time.monotonic() + OUTPUT_DRAIN_GRACE_S

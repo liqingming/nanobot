@@ -796,6 +796,27 @@ class TestProcessTreeCleanup:
 class TestPlatformProcessTreeTermination:
 
     @pytest.mark.asyncio
+    async def test_close_transport_waits_for_scheduled_pipe_cleanup(self):
+        from nanobot.agent.tools import process_tree
+
+        loop = asyncio.get_running_loop()
+
+        class Transport:
+            _loop = loop
+
+            def close(self):
+                loop.call_soon(setattr, self, "_loop", None)
+
+        transport = Transport()
+
+        class Process:
+            _transport = transport
+
+        await process_tree.close_subprocess_transport(Process())
+
+        assert transport._loop is None
+
+    @pytest.mark.asyncio
     async def test_windows_uses_hidden_taskkill_for_whole_tree(self):
         from nanobot.agent.tools import process_tree
 

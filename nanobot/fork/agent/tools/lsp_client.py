@@ -181,6 +181,9 @@ class LspClient:
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
+        from nanobot.agent.tools.process_tree import close_subprocess_transport
+
+        await close_subprocess_transport(process)
         reader = self._reader_task
         if reader is not None and not reader.done():
             reader.cancel()
