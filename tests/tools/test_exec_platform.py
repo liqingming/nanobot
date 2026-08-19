@@ -55,8 +55,9 @@ class TestBuildEnvUnix:
 class TestBuildEnvWindows:
 
     _EXPECTED_KEYS = {
-        "SYSTEMROOT", "COMSPEC", "USERPROFILE", "HOMEDRIVE",
+        "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "USERPROFILE", "HOMEDRIVE",
         "HOMEPATH", "TEMP", "TMP", "PATHEXT", "PATH", "PYTHONUNBUFFERED",
+        "PYTHONIOENCODING", "PYTHONUTF8",
         *_WINDOWS_ENV_KEYS,
     }
 
@@ -88,6 +89,20 @@ class TestBuildEnvWindows:
         with patch("nanobot.agent.tools.shell._IS_WINDOWS", True):
             env = ExecTool()._build_env()
         assert env["SYSTEMROOT"] == r"D:\Windows"
+
+    def test_systemdrive_forwarded(self, monkeypatch):
+        monkeypatch.setenv("SYSTEMDRIVE", "D:")
+        with patch("nanobot.agent.tools.shell._IS_WINDOWS", True):
+            env = ExecTool()._build_env()
+        assert env["SYSTEMDRIVE"] == "D:"
+
+    def test_systemdrive_has_sensible_default(self):
+        with (
+            patch("nanobot.agent.tools.shell._IS_WINDOWS", True),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            env = ExecTool()._build_env()
+        assert env["SYSTEMDRIVE"] == "C:"
 
 
 # ---------------------------------------------------------------------------

@@ -744,6 +744,10 @@ class ExecTool(Tool):
             sr = os.environ.get("SYSTEMROOT", r"C:\Windows")
             env = {
                 "SYSTEMROOT": sr,
+                # Some Windows components build paths from %SystemDrive%.
+                # Keep it in the curated environment so an unexpanded token
+                # is not treated as a relative directory under the command's cwd.
+                "SYSTEMDRIVE": os.environ.get("SYSTEMDRIVE", "C:"),
                 "COMSPEC": os.environ.get("COMSPEC", f"{sr}\\system32\\cmd.exe"),
                 "USERPROFILE": os.environ.get("USERPROFILE", ""),
                 "HOMEDRIVE": os.environ.get("HOMEDRIVE", "C:"),
