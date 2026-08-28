@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import signal
 import subprocess
@@ -32,10 +33,12 @@ async def close_subprocess_transport(
     if transport is None:
         return
     with suppress(RuntimeError, ValueError):
-        transport.close()
+        close_result = transport.close()
+        if inspect.isawaitable(close_result):
+            await close_result
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
-    while getattr(transport, "_loop", None) is not None:
+    while getattr(transport, "_loop", None) is loop:
         if loop.time() >= deadline:
             break
         await asyncio.sleep(0)
@@ -66,6 +69,7 @@ async def terminate_process_tree(process: asyncio.subprocess.Process) -> None:
 
 
 async def _terminate_windows_tree(pid: int) -> None:
+    killer: asyncio.subprocess.Process | None = None
     try:
         killer = await asyncio.create_subprocess_exec(
             "taskkill",
@@ -81,6 +85,14 @@ async def _terminate_windows_tree(pid: int) -> None:
         await asyncio.wait_for(killer.wait(), timeout=_PROCESS_WAIT_TIMEOUT_S)
     except (OSError, asyncio.TimeoutError) as exc:
         logger.warning("Failed to terminate Windows process tree {}: {}", pid, exc)
+        if killer is not None and killer.returncode is None:
+            with suppress(ProcessLookupError):
+                killer.kill()
+            with suppress(asyncio.TimeoutError, ProcessLookupError):
+                await asyncio.wait_for(killer.wait(), timeout=_PROCESS_WAIT_TIMEOUT_S)
+    finally:
+        if killer is not None:
+            await close_subprocess_transport(killer)
 
 
 def _terminate_posix_tree(pid: int) -> None:

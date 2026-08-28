@@ -6,6 +6,7 @@ platform-specific binaries (all subprocess calls are mocked).
 """
 
 import asyncio
+import os
 import shutil
 import subprocess
 import sys
@@ -759,6 +760,50 @@ class TestWindowsRealExec:
 
 class TestProcessTreeCleanup:
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows Proactor transports")
+    def test_one_shot_exec_does_not_leak_transport_at_interpreter_exit(self):
+        code = (
+            "import asyncio, gc\n"
+            "from nanobot.agent.tools.shell import ExecTool\n"
+            "async def main():\n"
+            "    result = await ExecTool().execute(command='Write-Output ok')\n"
+            "    assert 'ok' in result\n"
+            "asyncio.run(main())\n"
+            "gc.collect()\n"
+        )
+        env = {**os.environ, "PYTHONWARNINGS": "always::ResourceWarning"}
+
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert "unclosed transport" not in completed.stderr
+        assert "I/O operation on closed pipe" not in completed.stderr
+
+    @pytest.mark.asyncio
+    async def test_one_shot_success_closes_subprocess_transport(self):
+        process = AsyncMock()
+        process.communicate.return_value = (b"ok", b"")
+        process.returncode = 0
+
+        with (
+            patch.object(ExecTool, "_spawn", new=AsyncMock(return_value=process)),
+            patch.object(ExecTool, "_guard_command", return_value=None),
+            patch(
+                "nanobot.agent.tools.shell.close_subprocess_transport",
+                new=AsyncMock(),
+            ) as close_transport,
+        ):
+            result = await ExecTool().execute(command="echo ok")
+
+        assert "ok" in result
+        close_transport.assert_awaited_once_with(process)
+
     @pytest.mark.asyncio
     async def test_one_shot_timeout_terminates_process_tree(self):
         process = AsyncMock()
@@ -772,11 +817,16 @@ class TestProcessTreeCleanup:
                 "nanobot.agent.tools.shell.terminate_process_tree",
                 new=AsyncMock(),
             ) as terminate,
+            patch(
+                "nanobot.agent.tools.shell.close_subprocess_transport",
+                new=AsyncMock(),
+            ) as close_transport,
         ):
             result = await ExecTool(timeout=1).execute(command="slow command")
 
         assert "Command timed out after 1 seconds" in result
         terminate.assert_awaited_once_with(process)
+        close_transport.assert_awaited_once_with(process)
 
     @pytest.mark.asyncio
     async def test_one_shot_cancellation_terminates_process_tree(self):
@@ -798,6 +848,10 @@ class TestProcessTreeCleanup:
                 "nanobot.agent.tools.shell.terminate_process_tree",
                 new=AsyncMock(),
             ) as terminate,
+            patch(
+                "nanobot.agent.tools.shell.close_subprocess_transport",
+                new=AsyncMock(),
+            ) as close_transport,
         ):
             task = asyncio.create_task(ExecTool(timeout=30).execute(command="slow command"))
             await started.wait()
@@ -806,6 +860,7 @@ class TestProcessTreeCleanup:
                 await task
 
         terminate.assert_awaited_once_with(process)
+        close_transport.assert_awaited_once_with(process)
 
 
 class TestPlatformProcessTreeTermination:
@@ -843,6 +898,11 @@ class TestPlatformProcessTreeTermination:
                 "nanobot.agent.tools.process_tree.asyncio.create_subprocess_exec",
                 new=AsyncMock(return_value=killer),
             ) as spawn,
+            patch.object(
+                process_tree,
+                "close_subprocess_transport",
+                new=AsyncMock(),
+            ) as close_transport,
         ):
             await process_tree._terminate_windows_tree(1234)
 
@@ -857,6 +917,7 @@ class TestPlatformProcessTreeTermination:
             stderr=asyncio.subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        close_transport.assert_awaited_once_with(killer)
 
     def test_posix_kills_isolated_process_group(self):
         from nanobot.agent.tools import process_tree

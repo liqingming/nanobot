@@ -775,20 +775,9 @@ class _CodexAppServerTurn:
                 for task in reader_tasks:
                     task.cancel()
                 await asyncio.gather(*reader_tasks, return_exceptions=True)
-        transport = getattr(process, "_transport", None)
-        if transport is not None:
-            with suppress(RuntimeError, ValueError):
-                transport.close()
-            # On Windows, ``Process.wait()`` only waits for the child exit.  The
-            # Proactor subprocess transport is finalized later, after all pipe
-            # ``connection_lost`` callbacks have run.  Give those callbacks a
-            # bounded chance to finish before ``asyncio.run()`` closes the loop;
-            # otherwise their destructors emit noisy ``closed pipe`` tracebacks.
-            deadline = asyncio.get_running_loop().time() + 1.0
-            while getattr(transport, "_loop", None) is not None:
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-                await asyncio.sleep(0)
+        from nanobot.agent.tools.process_tree import close_subprocess_transport
+
+        await close_subprocess_transport(process)
 
     async def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         request_id = self._next_rpc_id

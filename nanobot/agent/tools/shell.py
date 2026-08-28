@@ -27,7 +27,7 @@ from nanobot.agent.tools.exec_session import (
     clamp_session_int,
     format_session_poll,
 )
-from nanobot.agent.tools.process_tree import terminate_process_tree
+from nanobot.agent.tools.process_tree import close_subprocess_transport, terminate_process_tree
 from nanobot.agent.tools.sandbox import wrap_command
 from nanobot.agent.tools.schema import (
     BooleanSchema,
@@ -403,6 +403,7 @@ class ExecTool(Tool):
         if yield_time_ms is not None:
             return await self._execute_session(prepared, yield_time_ms, max_output_chars)
 
+        process: asyncio.subprocess.Process | None = None
         try:
             process = await self._spawn(
                 prepared.command,
@@ -451,6 +452,9 @@ class ExecTool(Tool):
 
         except Exception as e:
             return ToolResult.error(f"Error executing command: {str(e)}")
+        finally:
+            if process is not None:
+                await close_subprocess_transport(process)
 
     async def _execute_session(
         self,
