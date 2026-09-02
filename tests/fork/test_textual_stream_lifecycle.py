@@ -131,7 +131,7 @@ async def test_error_response_replaces_tool_preface_and_keeps_trace() -> None:
         live = tui._app.query_one("#live")
         tui.stream_start()
         assert live.has_class("visible")
-        assert "思考中" not in _output_text(output)
+        assert "模型处理中" not in _output_text(output)
         tui.stream_delta("先尝试读取。")
         await _settle_stream_render()
         tui.flush_stream()
@@ -150,7 +150,7 @@ async def test_error_response_replaces_tool_preface_and_keeps_trace() -> None:
         assert "read_file" in completed
         assert completed.count("读取失败。") == 1
         assert not live.has_class("visible")
-        assert "思考中" not in completed
+        assert "模型处理中" not in completed
 
 
 @pytest.mark.asyncio
@@ -167,7 +167,7 @@ async def test_cancel_flush_keeps_visible_text_and_next_turn_resets_state() -> N
 
         cancelled = _output_text(output)
         assert not tui._app.query_one("#live").has_class("visible")
-        assert "思考中" not in cancelled
+        assert "模型处理中" not in cancelled
         assert cancelled.count("取消前已经输出。") == 1
         assert "已取消当前请求。" in cancelled
 
@@ -187,8 +187,8 @@ async def test_transient_activity_stays_out_of_output_for_wrapped_tool_traces() 
         await pilot.pause()
 
         assert live.has_class("visible")
-        assert "思考中" in str(live.render())
-        assert "思考中" not in _output_text(output)
+        assert "模型处理中" in str(live.render())
+        assert "模型处理中" not in _output_text(output)
 
         long_hint = "read " + "very-long-path/" * 20
         tui.flush_stream()
@@ -202,20 +202,25 @@ async def test_transient_activity_stays_out_of_output_for_wrapped_tool_traces() 
         assert "very-long-path" not in _output_text(output)
 
         tui.add_tool_result("ok")
-        await asyncio.sleep(0.6)
         await pilot.pause()
+        assert "very-long-path" not in str(live.render())
+        assert "模型处理中" in str(live.render())
+        assert "已等待" in str(live.render())
+        await asyncio.sleep(1.1)
+        await pilot.pause()
+        assert "(1s)" in str(live.render())
 
         completed_tool = _output_text(output)
         assert completed_tool.count("very-long-path") >= 1
-        assert "思考中" not in completed_tool
+        assert "模型处理中" not in completed_tool
         assert live.has_class("visible")
-        assert "思考中" in str(live.render())
+        assert "模型处理中" in str(live.render())
 
         tui.pop_stream()
         await pilot.pause()
 
         assert not live.has_class("visible")
-        assert "思考中" not in _output_text(output)
+        assert "模型处理中" not in _output_text(output)
 
 
 @pytest.mark.asyncio
@@ -239,7 +244,7 @@ async def test_consecutive_wrapped_tool_traces_all_survive_live_status_cycles() 
 
             history = _output_text(output)
             assert all(f"summary-{seen}" in history for seen in range(index + 1))
-            assert "思考中" not in history
+            assert "模型处理中" not in history
             assert "执行中" not in history
             assert live.has_class("visible")
 

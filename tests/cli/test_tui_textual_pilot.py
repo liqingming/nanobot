@@ -1009,8 +1009,8 @@ async def test_stream_delta_only_inserts_idle_thinking_after_long_gap() -> None:
 
         await pilot.pause(1.6)
         assert live.has_class("visible")
-        assert "思考中" in str(live.render())
-        assert "思考中" not in _output_log_text(app.query_one("#output"))
+        assert "模型处理中" in str(live.render())
+        assert "模型处理中" not in _output_log_text(app.query_one("#output"))
 
         tui.stream_delta(" world")
         await pilot.pause(0.1)
@@ -1033,7 +1033,7 @@ async def test_completed_response_removes_initial_thinking_placeholder() -> None
 
         text = _output_log_text(app.query_one("#output"))
         assert "计划已确认" in text
-        assert "思考中" not in text
+        assert "模型处理中" not in text
 
 
 @pytest.mark.asyncio
@@ -1048,7 +1048,7 @@ async def test_todo_plan_replaces_transient_thinking_status() -> None:
         await pilot.pause()
         live = app.query_one("#live")
         assert live.has_class("visible")
-        assert "思考中" in str(live.render())
+        assert "模型处理中" in str(live.render())
 
         tui.clear_initial_thinking()
         tui.add_system("[~] 定位两个参数的 Jenkins 入口和传递链")
@@ -1057,7 +1057,7 @@ async def test_todo_plan_replaces_transient_thinking_status() -> None:
         assert not live.has_class("visible")
         text = _output_log_text(app.query_one("#output"))
         assert "[~] 定位两个参数的 Jenkins 入口和传递链" in text
-        assert "思考中" not in text
+        assert "模型处理中" not in text
 
 
 @pytest.mark.asyncio
@@ -1121,7 +1121,7 @@ async def test_clear_idle_thinking_removes_stale_placeholder_before_progress() -
         await pilot.pause(0.7)
         live = app.query_one("#live")
         assert live.has_class("visible")
-        assert "思考中" in str(live.render())
+        assert "模型处理中" in str(live.render())
 
         tui.clear_idle_thinking()
         tui.add_system("📊 进度: 1/3")
@@ -1131,7 +1131,7 @@ async def test_clear_idle_thinking_removes_stale_placeholder_before_progress() -
         text = _output_log_text(out)
         assert not live.has_class("visible")
         assert "📊 进度: 1/3" in text
-        assert "思考中" not in text
+        assert "模型处理中" not in text
 
 @pytest.mark.asyncio
 async def test_file_edit_event_renders_apply_patch_diff_text() -> None:

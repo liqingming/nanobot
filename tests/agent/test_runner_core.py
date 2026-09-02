@@ -262,8 +262,12 @@ async def test_runner_times_out_hung_streaming_request():
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock(spec=LLMProvider)
+    attempts = 0
+    recoveries = 0
 
     async def chat_stream_with_retry(**kwargs):
+        nonlocal attempts
+        attempts += 1
         await asyncio.sleep(3600)
 
     provider.chat_stream_with_retry = chat_stream_with_retry
@@ -273,6 +277,11 @@ async def test_runner_times_out_hung_streaming_request():
     class StreamingHook(AgentHook):
         def wants_streaming(self) -> bool:
             return True
+
+        async def on_stream_end(self, context, *, resuming=False):
+            nonlocal recoveries
+            if resuming:
+                recoveries += 1
 
     runner = AgentRunner(provider)
     started = time.monotonic()
@@ -289,6 +298,53 @@ async def test_runner_times_out_hung_streaming_request():
     assert (time.monotonic() - started) < 1.0
     assert result.stop_reason == "error"
     assert "timed out after 0.05s" in (result.final_content or "").lower()
+    assert attempts == 2
+    assert recoveries == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_recovers_once_after_model_wall_timeout():
+    from nanobot.agent.hook import AgentHook
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock(spec=LLMProvider)
+    attempts = 0
+    recoveries = 0
+
+    async def chat_stream_with_retry(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            await asyncio.sleep(3600)
+        return LLMResponse(content="recovered", finish_reason="stop")
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+        async def on_stream_end(self, context, *, resuming=False):
+            nonlocal recoveries
+            if resuming:
+                recoveries += 1
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        hook=StreamingHook(),
+        llm_timeout_s=0.05,
+    ))
+
+    assert result.stop_reason == "completed"
+    assert result.final_content == "recovered"
+    assert attempts == 2
+    assert recoveries == 1
 
 
 @pytest.mark.asyncio

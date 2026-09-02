@@ -109,23 +109,35 @@ def test_sustained_goal_active_respects_legacy_thread_goal_key():
     assert sustained_goal_active(meta) is True
 
 
-def test_runner_wall_llm_timeout_uses_metadata_override(tmp_path):
+def test_runner_wall_llm_timeout_uses_metadata_override(tmp_path, monkeypatch):
     sm = SessionManager(tmp_path)
+    monkeypatch.delenv("NANOBOT_LONG_GOAL_LLM_TIMEOUT_S", raising=False)
     assert (
         runner_wall_llm_timeout_s(
             sm,
             "cli:test",
             metadata={GOAL_STATE_KEY: {"status": "active", "objective": "x"}},
         )
-        == 0.0
+        == 900.0
     )
     assert runner_wall_llm_timeout_s(sm, "cli:test", metadata={}) is None
 
 
-def test_runner_wall_llm_timeout_reads_session_when_metadata_missing(tmp_path):
+def test_runner_wall_llm_timeout_reads_session_when_metadata_missing(tmp_path, monkeypatch):
     sm = SessionManager(tmp_path)
+    monkeypatch.setenv("NANOBOT_LONG_GOAL_LLM_TIMEOUT_S", "1200")
     sess = sm.get_or_create("c:d")
     sess.metadata = {GOAL_STATE_KEY: {"status": "active", "objective": "z"}}
-    assert runner_wall_llm_timeout_s(sm, "c:d") == 0.0
+    assert runner_wall_llm_timeout_s(sm, "c:d") == 1200.0
     sess.metadata = {}
     assert runner_wall_llm_timeout_s(sm, "c:d") is None
+
+
+def test_runner_wall_llm_timeout_rejects_disabled_or_invalid_long_goal_value(
+    tmp_path, monkeypatch
+):
+    sm = SessionManager(tmp_path)
+    meta = {GOAL_STATE_KEY: {"status": "active", "objective": "z"}}
+    for value in ("0", "-1", "invalid"):
+        monkeypatch.setenv("NANOBOT_LONG_GOAL_LLM_TIMEOUT_S", value)
+        assert runner_wall_llm_timeout_s(sm, "c:d", metadata=meta) == 900.0

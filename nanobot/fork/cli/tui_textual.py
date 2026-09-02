@@ -1846,13 +1846,15 @@ if _TEXTUAL_AVAILABLE:
                     return
                 self._thinking_frame += 1
                 icon = _SPINNER[self._thinking_frame % len(_SPINNER)]
-                base = self._tui._turn_start_time or self._thinking_start_time
-                suffix = self._elapsed_suffix(base)
                 hint = self._tui._tool_hint
                 if hint:
+                    base = self._tui._tool_start_time or self._thinking_start_time
+                    suffix = self._elapsed_suffix(base)
                     rt = Text(f"    {icon} {hint}{suffix}", style="cyan")
                 else:
-                    rt = Text(f"  {icon} 思考中...{suffix}", style="grey50")
+                    base = self._tui._model_wait_start_time or self._thinking_start_time
+                    suffix = self._elapsed_suffix(base)
+                    rt = Text(f"  {icon} 模型处理中 · 已等待{suffix or ' (0s)'}", style="grey50")
                 self.update_live(rt)
 
             self._thinking_timer = self.set_interval(0.1, _tick)
@@ -2098,6 +2100,7 @@ class TextualTUI(TUIBase):
         self._live_activity_visible: bool = False  # whether #live owns the current transient phase
         self._turn_start_time: float = 0.0  # monotonic timestamp when the current LLM turn started (stream_start)
         self._tool_start_time: float = 0.0  # monotonic timestamp when the current tool started (add_progress)
+        self._model_wait_start_time: float = 0.0  # current provider request/wait segment
         self._stream_render_task: Any = None  # debounce task for live stream rendering
         self._stream_render_follow: bool = False  # preserve bottom-follow across #live collapse
         # State for show_question_popup (sequential multi-question prompt)
@@ -2992,7 +2995,7 @@ class TextualTUI(TUIBase):
             self._render_tool_trace(self._tool_hint, summary, elapsed)
         self._tool_hint = ""
         self._active_tool_events = []
-        self._schedule_idle_thinking()
+        self._start_model_wait()
 
     _FILE_DIFF_VISIBLE_LINES = 120
     _FILE_DIFF_HUNK_RE = re.compile(
@@ -3152,6 +3155,7 @@ class TextualTUI(TUIBase):
         # turn began — not to each individual spinner restart. This keeps the
         # elapsed counter continuous across idle gaps + tool calls.
         self._turn_start_time = time.monotonic()
+        self._model_wait_start_time = self._turn_start_time
         # The response header is permanent history; activity remains in #live.
         try:
             out = self._app.query_one("#output", _OutputLog)
@@ -3180,9 +3184,18 @@ class TextualTUI(TUIBase):
         if self._tool_hint:
             content = Text(f"    ⠋ {self._tool_hint}", style="cyan")
         else:
-            content = Text("  ⠋ 思考中...", style="grey50")
+            content = Text("  ⠋ 模型处理中 · 已等待 (0s)", style="grey50")
         self._app.update_live(content)
         self._app._safe_call(self._app.start_thinking_spinner)
+
+    def _start_model_wait(self) -> None:
+        """Replace a completed tool hint with an explicit provider wait state."""
+        import time
+        self._activity_phase = "model_wait"
+        self._cancel_idle_thinking()
+        self._tool_hint = ""
+        self._model_wait_start_time = time.monotonic()
+        self._show_live_activity()
 
     def _hide_live_activity(self) -> None:
         """Stop and collapse the transient activity line without touching history."""

@@ -29,6 +29,7 @@ from nanobot.fork.providers.codex_app_server_provider import (
     _tool_results_by_id,
     _usage_delta,
 )
+from nanobot.providers.base import ToolCallRequest
 from nanobot.providers.factory import make_provider
 from nanobot.security.workspace_access import (
     bind_workspace_scope,
@@ -551,7 +552,6 @@ def test_history_omits_content_read_from_disabled_skill() -> None:
         {"role": "user", "content": "continue"},
     ]
 
-
     _instructions, turn_input = _messages_to_app_server_input(
         messages,
         disabled_skill_paths={skill_path},
@@ -599,7 +599,11 @@ def test_ledger_keeps_original_result_after_context_compaction(tmp_path: Path) -
         ]
     )
 
-    assert ledger.entries[0]["content"] == "original result"
+    assert "content" not in ledger.entries[0]
+    assert ledger.entries[0]["resultRef"]["summary"] == "original result"
+    ledger.begin_recovery()
+    cached_call = ToolCallRequest(id="replayed", name="exec", arguments={"command": "git status"})
+    assert ledger.cached_result(cached_call) == ("original result", True)
 
 
 def test_ledger_rejects_reused_call_id_with_different_signature(tmp_path: Path) -> None:
@@ -637,6 +641,7 @@ def test_ledger_rejects_reused_call_id_with_different_signature(tmp_path: Path) 
                 {"role": "tool", "tool_call_id": "call-1", "content": "result"},
             ]
         )
+
 
 def test_recovery_replays_repeated_signature_in_original_order(tmp_path: Path) -> None:
     ledger = _idempotency_ledger(
@@ -893,6 +898,126 @@ def test_ledger_restores_multimodal_tool_result(tmp_path: Path) -> None:
         )
     )
     assert cached == (content, True)
+
+
+def test_large_multimodal_result_is_externalized_and_manifest_stays_small(tmp_path: Path) -> None:
+    ledger_dir = tmp_path / "ledger"
+    ledger = _idempotency_ledger(
+        ("session", "large-image-recovery"),
+        root_override=ledger_dir,
+    )
+    image_url = "data:image/png;base64," + ("A" * (3 * 1024 * 1024))
+    content = [
+        {"type": "text", "text": "large image"},
+        {"type": "image_url", "image_url": {"url": image_url}},
+    ]
+    ledger.record_messages(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-large-image",
+                        "function": {"name": "read_file", "arguments": {"path": "large.png"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-large-image", "content": content},
+        ]
+    )
+
+    assert ledger.path.stat().st_size < 4096
+    ref = ledger.entries[0]["resultRef"]
+    assert ref["size"] > 3 * 1024 * 1024
+    assert "base64" not in ref["summary"]
+    assert (ledger.path.parent / ref["path"]).is_file()
+
+    restored = _idempotency_ledger(
+        ("session", "large-image-recovery"),
+        root_override=ledger_dir,
+    )
+    cached = restored.cached_result(
+        ToolCallRequest(id="new-id", name="read_file", arguments={"path": "large.png"})
+    )
+    assert cached == (content, True)
+
+
+def test_large_text_result_is_externalized_and_recoverable(tmp_path: Path) -> None:
+    ledger_dir = tmp_path / "ledger"
+    ledger = _idempotency_ledger(
+        ("session", "large-text-recovery"),
+        root_override=ledger_dir,
+    )
+    content = "x" * (5 * 1024 * 1024)
+    ledger.record_messages(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-large",
+                        "function": {"name": "exec", "arguments": {"cmd": "large"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-large", "content": content},
+        ]
+    )
+
+    assert ledger.path.stat().st_size < 4096
+    restored = _idempotency_ledger(
+        ("session", "large-text-recovery"),
+        root_override=ledger_dir,
+    )
+    assert restored.cached_result(
+        ToolCallRequest(id="new-id", name="exec", arguments={"cmd": "large"})
+    ) == (content, True)
+
+
+def test_externalized_result_integrity_failure_is_rejected(tmp_path: Path) -> None:
+    ledger = _idempotency_ledger(
+        ("session", "tampered-result"),
+        root_override=tmp_path / "ledger",
+    )
+    ledger.record_messages(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call-1", "function": {"name": "read", "arguments": {"path": "a"}}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "trusted"},
+        ]
+    )
+    ref = ledger.entries[0]["resultRef"]
+    (ledger.path.parent / ref["path"]).write_text("tampered", encoding="utf-8")
+
+    with pytest.raises(CodexIdempotencyLedgerError, match="integrity"):
+        ledger.cached_result(ToolCallRequest(id="new-id", name="read", arguments={"path": "a"}))
+
+
+def test_ledger_clear_removes_manifest_and_externalized_results(tmp_path: Path) -> None:
+    ledger = _idempotency_ledger(
+        ("session", "clear-results"),
+        root_override=tmp_path / "ledger",
+    )
+    ledger.record_messages(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call-1", "function": {"name": "read", "arguments": {"path": "a"}}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+        ]
+    )
+    result_root = ledger.result_root
+    assert result_root.is_dir()
+    ledger.clear()
+    assert not ledger.path.exists()
+    assert not result_root.exists()
 
 
 async def test_submit_dynamic_tool_result_sends_image_content_item() -> None:

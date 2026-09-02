@@ -20,7 +20,7 @@ async def test_subagent_forwards_resolver_to_agent_run_spec(tmp_path: Path) -> N
         bus=MessageBus(),
         max_tool_result_chars=64,
         data_dir=tmp_path / "data",
-        llm_wall_timeout_for_session=lambda sk: 0.0 if sk == "cli:direct" else None,
+        llm_wall_timeout_for_session=lambda sk: 900.0 if sk == "cli:direct" else None,
     )
 
     mgr.runner.run = AsyncMock(
@@ -45,4 +45,4 @@ async def test_subagent_forwards_resolver_to_agent_run_spec(tmp_path: Path) -> N
     spec = mgr.runner.run.call_args[0][0]
     assert spec.session_key == "cli:direct"
     assert spec.data_dir == tmp_path / "data"
-    assert spec.llm_timeout_s == 0.0
+    assert spec.llm_timeout_s == 900.0

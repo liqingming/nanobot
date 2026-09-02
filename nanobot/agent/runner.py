@@ -1179,6 +1179,7 @@ class AgentRunner:
         context: AgentHookContext,
         *,
         malformed_retry: bool = False,
+        timeout_retry: bool = False,
     ):
         timeout_s: float | None = spec.llm_timeout_s
         if timeout_s is None:
@@ -1301,6 +1302,24 @@ class AgentRunner:
                     content="Error calling LLM: stream stalled",
                     finish_reason="error",
                     error_kind="timeout",
+                )
+            if not timeout_retry:
+                self._log_event(
+                    spec,
+                    "runner.model.timeout_recovery",
+                    timeout_s=outer_timeout_s,
+                    streaming=wants_streaming or wants_progress_streaming,
+                )
+                if wants_streaming:
+                    await hook.on_stream_end(context, resuming=True)
+                # wait_for cancelled the provider call. Codex closes its bridge;
+                # retrying these same messages either starts clean or restores
+                # completed tool results from its idempotency ledger. Nanobot
+                # tools are never re-executed here.
+                return await self._request_model(
+                    spec, messages, hook, context,
+                    malformed_retry=malformed_retry,
+                    timeout_retry=True,
                 )
             return LLMResponse(
                 content=f"Error calling LLM: timed out after {outer_timeout_s:g}s",

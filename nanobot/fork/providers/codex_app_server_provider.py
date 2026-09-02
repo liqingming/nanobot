@@ -40,7 +40,7 @@ DEFAULT_CODEX_RECOVERY_ATTEMPTS = 1
 DEFAULT_NATIVE_TOOL_CORRECTION_ATTEMPTS = 1
 DEFAULT_COMMAND_REFRESH_ATTEMPTS = 1
 _APP_SERVER_STREAM_LIMIT = 4 * 1024 * 1024
-_LEDGER_VERSION = 1
+_LEDGER_VERSION = 2
 _LEDGER_MAX_BYTES = 4 * 1024 * 1024
 _LEDGER_RETENTION_S = 7 * 24 * 60 * 60
 _DISABLED_FEATURES = (
@@ -114,7 +114,12 @@ class CodexIdempotencyLedgerError(RuntimeError):
 
 
 class _ToolResultLedger:
-    """Turn-scoped durable results used only while rebuilding a crashed bridge."""
+    """Turn-scoped durable result index used while rebuilding a crashed bridge.
+
+    Tool result bodies live in per-turn sidecar files.  The JSON ledger is only a
+    small manifest, so a large image or command output cannot consume the 4 MiB
+    idempotency budget by itself.
+    """
 
     def __init__(
         self,
@@ -128,6 +133,7 @@ class _ToolResultLedger:
         self.workspace = workspace
         self.session_key = session_key
         self.turn_id = turn_id
+        self.result_root = path.with_name(f"{path.stem}.results")
         self.entries: list[dict[str, Any]] = []
         self._replay_index = 0
         self._native_image_replay_indexes: set[int] = set()
@@ -165,12 +171,13 @@ class _ToolResultLedger:
                 # older tool result with a digest before a later model request;
                 # keep the original durable result for bridge recovery.
                 continue
+            serialized = _serialize_tool_result(content)
             entry = {
                 "call_id": call_id,
                 "name": name,
                 "arguments": canonical_arguments,
                 "signature": signature,
-                "content": _serialize_tool_result(content),
+                "resultRef": self._store_result(call_id, serialized, content),
                 "success": not _looks_like_tool_error(content),
             }
             self.entries.append(entry)
@@ -200,7 +207,7 @@ class _ToolResultLedger:
             if entry.get("signature") != signature:
                 continue
             self._native_image_replay_indexes.add(index)
-            return _deserialize_tool_result(entry.get("content")), bool(entry.get("success"))
+            return self._entry_result(entry), bool(entry.get("success"))
         return None
 
     def cached_result(self, call: ToolCallRequest) -> tuple[Any, bool] | None:
@@ -225,11 +232,13 @@ class _ToolResultLedger:
                 "Tool replay order diverged during Codex bridge recovery."
             )
         self._replay_index += 1
-        return _deserialize_tool_result(entry.get("content")), bool(entry.get("success"))
+        return self._entry_result(entry), bool(entry.get("success"))
 
     def clear(self) -> None:
         with suppress(OSError):
             self.path.unlink(missing_ok=True)
+        with suppress(OSError):
+            shutil.rmtree(self.result_root)
         self.entries.clear()
         self._replay_index = 0
         self._native_image_replay_indexes.clear()
@@ -241,7 +250,7 @@ class _ToolResultLedger:
             if self.path.stat().st_size > _LEDGER_MAX_BYTES:
                 raise CodexIdempotencyLedgerError("Idempotency ledger is too large.")
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict) or raw.get("version") != _LEDGER_VERSION:
+            if not isinstance(raw, dict) or raw.get("version") not in {1, _LEDGER_VERSION}:
                 raise CodexIdempotencyLedgerError("Unsupported idempotency ledger format.")
             identity = (raw.get("workspace"), raw.get("session_key"), raw.get("turn_id"))
             if identity != (self.workspace, self.session_key, self.turn_id):
@@ -252,9 +261,25 @@ class _ToolResultLedger:
             for entry in entries:
                 if not all(
                     isinstance(entry.get(field), str)
-                    for field in ("call_id", "name", "arguments", "signature", "content")
+                    for field in ("call_id", "name", "arguments", "signature")
                 ) or not isinstance(entry.get("success"), bool):
                     raise CodexIdempotencyLedgerError("Invalid idempotency ledger entry fields.")
+                has_inline = isinstance(entry.get("content"), str)
+                result_ref = entry.get("resultRef")
+                has_external = isinstance(result_ref, dict) and all(
+                    isinstance(result_ref.get(field), expected)
+                    for field, expected in (
+                        ("path", str),
+                        ("size", int),
+                        ("sha256", str),
+                        ("contentType", str),
+                        ("summary", str),
+                    )
+                )
+                if not has_inline and not has_external:
+                    raise CodexIdempotencyLedgerError(
+                        "Ledger result reference is missing or invalid."
+                    )
                 if entry["signature"] != _tool_signature(entry["name"], entry["arguments"]):
                     raise CodexIdempotencyLedgerError("Idempotency ledger signature mismatch.")
             self.entries = entries
@@ -300,6 +325,53 @@ class _ToolResultLedger:
             with suppress(OSError):
                 tmp_path.unlink(missing_ok=True)
 
+    def _store_result(self, call_id: str, serialized: str, content: Any) -> dict[str, Any]:
+        raw = serialized.encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        call_digest = hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:16]
+        filename = f"{call_digest}-{digest[:16]}.result"
+        target = self.result_root / filename
+        self.result_root.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            _write_private_atomic(target, raw)
+        relative = target.relative_to(self.path.parent).as_posix()
+        return {
+            "path": relative,
+            "size": len(raw),
+            "sha256": digest,
+            "contentType": _tool_result_content_type(content),
+            "summary": _tool_result_summary(content),
+        }
+
+    def _entry_result(self, entry: dict[str, Any]) -> Any:
+        # Version 1 ledgers are still recoverable during a rolling upgrade.
+        if isinstance(entry.get("content"), str):
+            return _deserialize_tool_result(entry["content"])
+        result_ref = entry.get("resultRef")
+        if not isinstance(result_ref, dict):
+            raise CodexIdempotencyLedgerError("Ledger result reference is missing.")
+        candidate = (self.path.parent / str(result_ref.get("path", ""))).resolve()
+        root = self.result_root.resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise CodexIdempotencyLedgerError(
+                "Ledger result reference escapes its result directory."
+            ) from exc
+        try:
+            raw = candidate.read_bytes()
+        except OSError as exc:
+            raise CodexIdempotencyLedgerError(
+                f"Externalized tool result is unavailable: {candidate}"
+            ) from exc
+        if len(raw) != result_ref.get("size") or hashlib.sha256(raw).hexdigest() != result_ref.get(
+            "sha256"
+        ):
+            raise CodexIdempotencyLedgerError(
+                f"Externalized tool result failed integrity validation: {candidate}"
+            )
+        return _deserialize_tool_result(raw.decode("utf-8"))
+
 
 def _cleanup_stale_ledgers(root: Path, *, keep: Path) -> None:
     cutoff = time.time() - _LEDGER_RETENTION_S
@@ -310,6 +382,32 @@ def _cleanup_stale_ledgers(root: Path, *, keep: Path) -> None:
             with suppress(OSError):
                 if candidate.stat().st_mtime < cutoff:
                     candidate.unlink(missing_ok=True)
+    for candidate in root.glob("*.results"):
+        if candidate == keep.with_name(f"{keep.stem}.results"):
+            continue
+        with suppress(OSError):
+            if candidate.stat().st_mtime < cutoff:
+                shutil.rmtree(candidate)
+
+
+def _write_private_atomic(path: Path, raw: bytes) -> None:
+    """Atomically write a private sidecar before publishing its ledger reference."""
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd = os.open(tmp_path, flags, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        replace_file_with_retry(tmp_path, path)
+    except Exception as exc:
+        raise CodexIdempotencyLedgerError(
+            f"Failed to persist externalized Codex tool result: {exc}"
+        ) from exc
+    finally:
+        with suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
 
 
 class _CodexAppServerTurn:
@@ -395,9 +493,7 @@ class _CodexAppServerTurn:
         cwd = str(workspace.project_path if workspace else Path.cwd().resolve())
         selected_tools, tool_choice_instruction = _apply_tool_choice(tools, tool_choice)
         self._dynamic_tool_names = {
-            name
-            for tool in selected_tools or []
-            if (name := _tool_schema_name(tool)) is not None
+            name for tool in selected_tools or [] if (name := _tool_schema_name(tool)) is not None
         }
         config = dict(_THREAD_CONFIG_OVERRIDES)
         disabled_skills = await self._unsupported_skill_overrides(cwd, selected_tools)
@@ -443,11 +539,7 @@ class _CodexAppServerTurn:
             # is defensive isolation and must not prevent the model from starting.
             logger.debug("Codex skill dependency discovery unavailable", exc_info=True)
             return []
-        tool_names = {
-            name
-            for tool in tools or []
-            if (name := _tool_schema_name(tool)) is not None
-        }
+        tool_names = {name for tool in tools or [] if (name := _tool_schema_name(tool)) is not None}
         overrides: list[dict[str, Any]] = []
         seen_paths: set[str] = set()
         for entry in result.get("data", []):
@@ -569,18 +661,14 @@ class _CodexAppServerTurn:
             if method == "item/commandExecution/requestApproval" and "id" in message:
                 # Any approval request means the command needs permissions beyond the
                 # non-interactive workspace sandbox (including network access). Fail closed.
-                await self._send(
-                    {"id": message["id"], "result": {"decision": "decline"}}
-                )
+                await self._send({"id": message["id"], "result": {"decision": "decline"}})
                 self._native_command_approvals_declined += 1
                 continue
             if method == "item/fileChange/requestApproval" and "id" in message:
                 # The bridge is non-interactive. workspace-write may proceed without an
                 # approval, but requests for broader roots must fail closed instead of
                 # hanging the app-server waiting for input that can never arrive.
-                await self._send(
-                    {"id": message["id"], "result": {"decision": "decline"}}
-                )
+                await self._send({"id": message["id"], "result": {"decision": "decline"}})
                 self._native_file_change_approvals_declined += 1
                 continue
             if method in {"item/started", "item/completed"}:
@@ -1044,8 +1132,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     can_correct_native_tool = (
                         isinstance(exc, CodexAppServerError)
                         and exc.code == "native_tool_blocked"
-                        and native_tool_corrections
-                        < DEFAULT_NATIVE_TOOL_CORRECTION_ATTEMPTS
+                        and native_tool_corrections < DEFAULT_NATIVE_TOOL_CORRECTION_ATTEMPTS
                         and (not streamed or on_stream_recover is not None)
                     )
                     if can_correct_native_tool:
@@ -1637,9 +1724,7 @@ def _tool_result_content_items(content: Any) -> list[dict[str, str]]:
             items.append({"type": "inputText", "text": str(part)})
             continue
         part_type = part.get("type")
-        if part_type in {"text", "input_text", "inputText"} and isinstance(
-            part.get("text"), str
-        ):
+        if part_type in {"text", "input_text", "inputText"} and isinstance(part.get("text"), str):
             items.append({"type": "inputText", "text": part["text"]})
             continue
         if part_type in {"image_url", "input_image", "inputImage"}:
@@ -1673,6 +1758,45 @@ def _serialize_tool_result(content: Any) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def _tool_result_content_type(content: Any) -> str:
+    if isinstance(content, str):
+        return "text/plain"
+    if isinstance(content, list):
+        kinds = {str(item.get("type", "")) for item in content if isinstance(item, dict)}
+        if any(kind in {"image_url", "input_image", "inputImage"} for kind in kinds):
+            return "multipart/mixed; image"
+        if any(kind in {"audio_url", "input_audio", "inputAudio"} for kind in kinds):
+            return "multipart/mixed; audio"
+        return "multipart/mixed"
+    return "application/json"
+
+
+def _tool_result_summary(content: Any) -> str:
+    """Return a bounded, non-binary manifest summary for diagnostics and inspection."""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        kinds: list[str] = []
+        text_parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                kinds.append(type(item).__name__)
+                continue
+            kind = str(item.get("type", "unknown"))
+            kinds.append(kind)
+            if kind in {"text", "input_text", "inputText"} and isinstance(item.get("text"), str):
+                text_parts.append(item["text"])
+        prefix = f"{len(content)} multimodal items ({', '.join(kinds[:8])})"
+        text = prefix + ((": " + " ".join(text_parts)) if text_parts else "")
+    else:
+        try:
+            text = json.dumps(content, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = repr(content)
+    text = re.sub(r"\s+", " ", text).strip()
+    return _redact_diagnostic(text)[:240]
 
 
 def _deserialize_tool_result(content: Any) -> Any:

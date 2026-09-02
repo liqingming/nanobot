@@ -8,6 +8,7 @@ for older sessions. Callers use ``goal_state_runtime_lines``, ``goal_state_ws_bl
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Mapping, MutableMapping
 
 from nanobot.session.manager import SessionManager
@@ -17,6 +18,7 @@ GOAL_STATE_KEY = "goal_state"
 _LEGACY_GOAL_STATE_SESSION_KEY = "thread_goal"
 _MAX_OBJECTIVE_IN_RUNTIME = 4000
 _MAX_OBJECTIVE_WS = 600
+_DEFAULT_LONG_GOAL_LLM_TIMEOUT_S = 900.0
 
 
 def _session_goal_raw(metadata: Mapping[str, Any] | None) -> Any:
@@ -142,12 +144,22 @@ def runner_wall_llm_timeout_s(
 ) -> float | None:
     """Wall-clock cap for :class:`~nanobot.agent.runner.AgentRunner` when streaming an LLM.
 
-    Returns ``0.0`` to disable ``asyncio.wait_for`` around the request when this is a
-    sustained-goal turn; ``None`` means use ``NANOBOT_LLM_TIMEOUT_S``. Pass in-memory
-    ``metadata`` when the caller already holds :attr:`~nanobot.session.manager.Session.metadata`
-    for this turn.
+    Sustained-goal turns use a longer but finite wall-clock cap so non-terminal
+    provider events cannot hold the session lock forever. ``None`` means use the
+    ordinary ``NANOBOT_LLM_TIMEOUT_S`` default. Override the long-goal cap with
+    ``NANOBOT_LONG_GOAL_LLM_TIMEOUT_S``; invalid/non-positive values fall back to 900s.
     """
     meta: Mapping[str, Any] | None = metadata
     if meta is None and session_key:
         meta = sessions.get_or_create(session_key).metadata
-    return 0.0 if sustained_goal_turn(meta, message_metadata=message_metadata) else None
+    if not sustained_goal_turn(meta, message_metadata=message_metadata):
+        return None
+    raw = os.environ.get(
+        "NANOBOT_LONG_GOAL_LLM_TIMEOUT_S",
+        str(_DEFAULT_LONG_GOAL_LLM_TIMEOUT_S),
+    ).strip()
+    try:
+        timeout_s = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_LONG_GOAL_LLM_TIMEOUT_S
+    return timeout_s if timeout_s > 0 else _DEFAULT_LONG_GOAL_LLM_TIMEOUT_S
