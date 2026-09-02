@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -205,10 +206,14 @@ async def test_transient_activity_stays_out_of_output_for_wrapped_tool_traces() 
         await pilot.pause()
         assert "very-long-path" not in str(live.render())
         assert "模型处理中" in str(live.render())
-        assert "已等待" in str(live.render())
-        await asyncio.sleep(1.1)
-        await pilot.pause()
-        assert "(1s)" in str(live.render())
+        assert "本段" in str(live.render())
+        assert "累计" in str(live.render())
+        tui._model_wait_start_time = time.monotonic() - 1.2
+        tui._turn_start_time = time.monotonic() - 6.2
+        await pilot.pause(0.2)
+        model_wait = str(live.render())
+        assert "本段 (1s)" in model_wait
+        assert "累计 (6s)" in model_wait
 
         completed_tool = _output_text(output)
         assert completed_tool.count("very-long-path") >= 1

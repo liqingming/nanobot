@@ -1847,14 +1847,22 @@ if _TEXTUAL_AVAILABLE:
                 self._thinking_frame += 1
                 icon = _SPINNER[self._thinking_frame % len(_SPINNER)]
                 hint = self._tui._tool_hint
+                turn_base = self._tui._turn_start_time or self._thinking_start_time
+                total_suffix = self._elapsed_suffix(turn_base) or " (0s)"
                 if hint:
                     base = self._tui._tool_start_time or self._thinking_start_time
-                    suffix = self._elapsed_suffix(base)
-                    rt = Text(f"    {icon} {hint}{suffix}", style="cyan")
+                    suffix = self._elapsed_suffix(base) or " (0s)"
+                    rt = Text(
+                        f"    {icon} {hint} · 本次{suffix} · 累计{total_suffix}",
+                        style="cyan",
+                    )
                 else:
                     base = self._tui._model_wait_start_time or self._thinking_start_time
-                    suffix = self._elapsed_suffix(base)
-                    rt = Text(f"  {icon} 模型处理中 · 已等待{suffix or ' (0s)'}", style="grey50")
+                    suffix = self._elapsed_suffix(base) or " (0s)"
+                    rt = Text(
+                        f"  {icon} 模型处理中 · 本段{suffix} · 累计{total_suffix}",
+                        style="grey50",
+                    )
                 self.update_live(rt)
 
             self._thinking_timer = self.set_interval(0.1, _tick)
@@ -3182,9 +3190,15 @@ class TextualTUI(TUIBase):
         """Show exactly one transient activity line below the output history."""
         self._live_activity_visible = True
         if self._tool_hint:
-            content = Text(f"    ⠋ {self._tool_hint}", style="cyan")
+            content = Text(
+                f"    ⠋ {self._tool_hint} · 本次 (0s) · 累计 (0s)",
+                style="cyan",
+            )
         else:
-            content = Text("  ⠋ 模型处理中 · 已等待 (0s)", style="grey50")
+            content = Text(
+                "  ⠋ 模型处理中 · 本段 (0s) · 累计 (0s)",
+                style="grey50",
+            )
         self._app.update_live(content)
         self._app._safe_call(self._app.start_thinking_spinner)
 
