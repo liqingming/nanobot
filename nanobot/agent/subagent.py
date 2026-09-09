@@ -24,6 +24,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
+from nanobot.fork.agent.execution_scope import run_isolated_subagent
 from nanobot.providers.base import LLMProvider
 from nanobot.security.workspace_access import (
     WorkspaceScope,
@@ -255,7 +256,7 @@ class SubagentManager:
             )
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
             try:
-                result = await self.runner.run(AgentRunSpec(
+                result = await run_isolated_subagent(self.runner, AgentRunSpec(
                     initial_messages=messages,
                     tools=tools,
                     model=self.model,

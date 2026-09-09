@@ -24,6 +24,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.config.paths import get_workspace_cache_dir, is_default_workspace
+from nanobot.fork.agent.execution_scope import current_execution_id
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 from nanobot.providers.openai_codex_provider import (
     OpenAICodexProvider as LegacyOpenAICodexProvider,
@@ -229,7 +230,13 @@ class _ToolResultLedger:
             if signature not in remaining_signatures:
                 return None
             raise CodexIdempotencyLedgerError(
-                "Tool replay order diverged during Codex bridge recovery."
+                "Tool replay order diverged during Codex bridge recovery. "
+                f"session={self.session_key!r}, turn={self.turn_id!r}, "
+                f"index={self._replay_index}, "
+                f"expected_tool={entry.get('name')!r}, "
+                f"expected_call_id={entry.get('call_id')!r}, "
+                f"actual_tool={call.name!r}, actual_call_id={call.id!r}. "
+                "Tool arguments and results omitted."
             )
         self._replay_index += 1
         return self._entry_result(entry), bool(entry.get("success"))
@@ -998,6 +1005,15 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         if bridges:
             await asyncio.gather(*(bridge.close() for bridge in bridges), return_exceptions=True)
 
+    async def aclose_execution(self, execution_id: str) -> None:
+        """子任务结束或取消时，只释放它的连接，不触碰主会话及其他执行者。"""
+        key = _execution_turn_key(execution_id)
+        bridge = self._turns.get(key)
+        if bridge is not None:
+            await self._finish_turn(key, bridge)
+        else:
+            self._turn_locks.pop(key, None)
+
     async def _call_codex(
         self,
         messages: list[dict[str, Any]],
@@ -1403,7 +1419,16 @@ def _strip_codex_model_prefix(model: str) -> str:
     return model.split("/", 1)[1] if model.startswith("openai-codex/") else model
 
 
+def _execution_turn_key(execution_id: str) -> tuple[str, str]:
+    identity = f"subagent:{execution_id}"
+    return identity, identity
+
+
 def _turn_key(request_context: dict[str, Any] | None) -> tuple[str, str]:
+    # 话题键用于路由，不能作为并行执行者的连接所有权；主会话保持原有键格式。
+    execution_id = current_execution_id()
+    if execution_id is not None:
+        return _execution_turn_key(execution_id)
     context = request_context or {}
     return (
         str(context.get("session_key") or "default"),

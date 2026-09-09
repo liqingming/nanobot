@@ -5,10 +5,15 @@ import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
+from nanobot.agent.runner import AgentRunResult
+from nanobot.agent.subagent import SubagentManager, SubagentStatus
+from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
+from nanobot.fork.agent.execution_scope import current_execution_id
 from nanobot.fork.providers.codex_app_server_provider import (
     CodexAppServerError,
     CodexAppServerProvider,
@@ -27,6 +32,7 @@ from nanobot.fork.providers.codex_app_server_provider import (
     _tool_call_from_server_request,
     _tool_result_content_items,
     _tool_results_by_id,
+    _turn_key,
     _usage_delta,
 )
 from nanobot.providers.base import ToolCallRequest
@@ -734,8 +740,17 @@ def test_recovery_fails_safe_when_tool_order_diverges(tmp_path: Path) -> None:
         }
     )
 
-    with pytest.raises(CodexIdempotencyLedgerError, match="order diverged"):
+    with pytest.raises(CodexIdempotencyLedgerError, match="order diverged") as exc_info:
         ledger.cached_result(out_of_order_call)
+    message = str(exc_info.value)
+    assert "session='session'" in message
+    assert "turn='order-diverged'" in message
+    assert "expected_tool='read'" in message
+    assert "actual_tool='write'" in message
+    assert "expected_call_id='call-1'" in message
+    assert "actual_call_id='new-call-id'" in message
+    assert '"path"' not in message
+    assert ledger._replay_index == 0
 
 
 def test_current_turn_messages_excludes_older_tool_results(tmp_path: Path) -> None:
@@ -2032,3 +2047,144 @@ def test_factory_routes_openai_codex_to_fork_without_eager_binary_lookup() -> No
     assert isinstance(provider, CodexAppServerProvider)
     assert provider.__class__.__name__ == "OpenAICodexProvider"
     assert provider._app_server_command is None
+
+
+@pytest.mark.parametrize("outcome", ["complete", "cancel", "error", "max_iterations"])
+async def test_main_and_subagents_keep_independent_bridges_and_cleanup(
+    tmp_path: Path, outcome: str,
+) -> None:
+    """同一话题中交错运行，子任务退出不得关闭其他执行者的待续传连接。"""
+    provider = CodexAppServerProvider(
+        default_model="openai-codex/gpt-test", idempotency_dir=tmp_path / "ledger",
+    )
+    provider._app_server_command = _fake_command("complete")
+    bus = MessageBus()
+    manager = SubagentManager(
+        provider=provider, workspace=tmp_path, bus=bus,
+        model="gpt-test", max_tool_result_chars=16000,
+    )
+    manager._build_tools = lambda **kwargs: None
+    manager._build_subagent_prompt = lambda **kwargs: "test"
+    context = {"session_key": "cli:original-topic", "turn_id": "main-turn"}
+    origin = {"channel": "cli", "chat_id": "original-topic", "session_key": context["session_key"]}
+    ready = {name: asyncio.Event() for name in ("a", "b")}
+    resume = {name: asyncio.Event() for name in ready}
+    keys, bridges, finals = {}, {}, {}
+
+    async def first_call(messages, ctx):
+        first = await provider.chat(messages=messages, tools=_tool_schema(), request_context=ctx)
+        assert first.has_tool_calls
+        call = first.tool_calls[0]
+        messages.extend([
+            {"role": "assistant", "tool_calls": [call.to_openai_tool_call()]},
+            {"role": "tool", "tool_call_id": call.id, "content": "ok"},
+        ])
+
+    async def child_run(spec):
+        name = spec.initial_messages[-1]["content"]
+        assert spec.session_key == context["session_key"]
+        assert current_execution_id() is not None
+        child_context = {"session_key": spec.session_key, "turn_id": spec.turn_id}
+        messages = [{"role": "user", "content": name}]
+        await first_call(messages, child_context)
+        keys[name] = _turn_key(child_context)
+        bridges[name] = provider._turns[keys[name]]
+        ready[name].set()
+        await resume[name].wait()
+        if name == "a" and outcome == "error":
+            raise RuntimeError("test child failure")
+        if name == "a" and outcome == "max_iterations":
+            return AgentRunResult(
+                final_content="stopped", messages=messages, stop_reason="max_iterations",
+            )
+        if name == "b":
+            # 仅此子任务模拟断线；旧结果须在自身账本回放，不再返回给宿主执行。
+            await provider._finish_turn(keys[name], bridges[name])
+        finals[name] = await provider.chat(
+            messages=messages, tools=_tool_schema(), request_context=child_context,
+        )
+        return AgentRunResult(
+            final_content=finals[name].content, messages=messages, stop_reason="completed",
+        )
+
+    manager.runner.run = child_run
+    main_messages = [{"role": "user", "content": "main"}]
+    tasks = []
+    try:
+        await first_call(main_messages, context)
+        main_key = _turn_key(context)
+        main_bridge = provider._turns[main_key]
+        for name in ready:
+            status = SubagentStatus(
+                task_id=name, label=name, task_description=name, started_at=0,
+            )
+            tasks.append(asyncio.create_task(
+                manager._run_subagent(name, name, name, origin, status),
+            ))
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in ready.values())), 10)
+        assert len({main_key, *keys.values()}) == 3
+        assert len(provider._turns) == len(provider._turn_locks) == 3
+        assert provider._turns[main_key] is main_bridge
+        assert main_bridge.process is not None
+        ledger_paths = {
+            _idempotency_ledger(key, root_override=tmp_path / "ledger").path
+            for key in (main_key, *keys.values())
+        }
+        assert len(ledger_paths) == 3
+
+        if outcome == "cancel":
+            tasks[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tasks[0]
+        else:
+            resume["a"].set()
+            await asyncio.wait_for(tasks[0], 10)
+        assert bridges["a"].process is None
+        assert keys["a"] not in provider._turns
+        assert keys["a"] not in provider._turn_locks
+        assert provider._turns[keys["b"]] is bridges["b"]
+        assert bridges["b"].process is not None
+        assert provider._turns[main_key] is main_bridge
+        assert main_bridge.process is not None
+
+        main_final = await provider.chat(
+            messages=main_messages, tools=_tool_schema(), request_context=context,
+        )
+        assert main_final.content == "done"
+        assert not main_final.provider_diagnostics.get("restored_from_idempotency_ledger")
+        assert bridges["b"].process is not None
+        resume["b"].set()
+        await asyncio.wait_for(tasks[1], 10)
+        assert finals["b"].content == "done"
+        assert not finals["b"].has_tool_calls
+        assert finals["b"].provider_diagnostics["idempotent_tool_replays"] == 1
+        if outcome == "complete":
+            assert finals["a"].content == "done"
+            assert not finals["a"].provider_diagnostics.get("restored_from_idempotency_ledger")
+        assert provider._turns == provider._turn_locks == {}
+        assert current_execution_id() is None
+        assert _turn_key(context) == main_key
+        # 传输身份隔离不改变结果投递回原话题的行为。
+        for _ in range(1 if outcome == "cancel" else 2):
+            message = await asyncio.wait_for(bus.consume_inbound(), 2)
+            assert message.session_key_override == context["session_key"]
+            assert message.chat_id == "cli:original-topic"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await provider.aclose()
+
+
+async def test_stale_cleanup_still_closes_only_same_execution() -> None:
+    provider = CodexAppServerProvider()
+    old = AsyncMock()
+    other = AsyncMock()
+    provider._turns = {("main", "old"): old, ("subagent:other", "subagent:other"): other}
+    provider._turn_locks = {key: asyncio.Lock() for key in provider._turns}
+    await provider._close_stale_session_turns(("main", "new"))
+    old.close.assert_awaited_once()
+    other.close.assert_not_awaited()
+    assert ("main", "old") not in provider._turns
+    assert ("main", "old") not in provider._turn_locks
+    await provider.aclose()
