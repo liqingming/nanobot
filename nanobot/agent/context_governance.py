@@ -35,6 +35,8 @@ MICROCOMPACT_MIN_CHARS = 500
 # persisted; compacted messages retain an evidence-bearing digest and locator.
 MICROCOMPACT_SOFT_CHAR_BUDGET = 24_000
 MICROCOMPACT_SOFT_TARGET_CHARS = 14_000
+# Protect a bounded fresh batch, not arbitrary amounts of raw tool output.
+FRESH_TOOL_RESULT_MAX_CHARS = 14_000
 HISTORICAL_TOOL_CALL_KEEP_RECENT = 64
 INFLIGHT_COMPACT_TARGET_RATIO = 0.85
 COMPACTABLE_TOOLS = frozenset({
@@ -604,7 +606,22 @@ class ContextGovernor:
             kept_tokens += msg_tokens
         kept.reverse()
 
-        return system_messages + self._legal_history_tail(kept, non_system)
+        trimmed = system_messages + self._legal_history_tail(kept, non_system)
+        fresh_request = self._fresh_tool_request(config, messages)
+        if fresh_request is not None:
+            trimmed_estimate, _ = estimate_prompt_tokens_chain(
+                config.provider, config.model, trimmed, tools,
+            )
+            if trimmed_estimate > budget:
+                # Recovering the last user tail may restore the entire oversized
+                # turn. Prefer a fitting, complete fresh exchange to re-digesting
+                # the very read that is meant to recover missing evidence.
+                fresh_estimate, _ = estimate_prompt_tokens_chain(
+                    config.provider, config.model, fresh_request, tools,
+                )
+                if fresh_estimate <= budget:
+                    return fresh_request
+        return trimmed
 
     @staticmethod
     def _summary_for(message: dict[str, Any]) -> str:
@@ -652,6 +669,37 @@ class ContextGovernor:
             updated[idx]["content"] = summary
         return updated
 
+    @staticmethod
+    def _fresh_tool_request(
+        config: ContextGovernanceConfig,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Build a minimal request for a bounded just-completed tool batch.
+
+        Keep system instructions, the latest user request, and the full
+        assistant/tool exchange. This is not a permanent exemption for reads.
+        Callers must check the actual input budget before using it for overflow.
+        """
+        start = len(messages)
+        while start > 0 and messages[start - 1].get("role") == "tool":
+            start -= 1
+        if (start == len(messages) or start == 0 or start < config.inflight_start_index
+                or messages[start - 1].get("role") != "assistant"):
+            return None
+        fresh = messages[start:]
+        if (any(not isinstance(msg.get("content"), str) for msg in fresh)
+                or sum(len(msg["content"]) for msg in fresh) > FRESH_TOOL_RESULT_MAX_CHARS):
+            return None
+        prefix = messages[:start - 1]
+        minimal = [msg for msg in prefix if msg.get("role") == "system"]
+        latest_user = next(
+            (msg for msg in reversed(prefix) if msg.get("role") == "user"), None
+        )
+        if latest_user is not None:
+            minimal.append(latest_user)
+        minimal.extend(messages[start - 1:])
+        return minimal
+
     def _inflight_compaction_candidates(
         self,
         config: ContextGovernanceConfig,
@@ -677,13 +725,24 @@ class ContextGovernor:
         if not compactable:
             return []
         primary_count = max(0, len(compactable) - MICROCOMPACT_KEEP_RECENT)
-        primary = compactable[:primary_count]
-        if not include_recent:
-            return primary
-        # Hard overflow beats the keep-recent preference. Return recent results
-        # after stale ones so the newest result is naturally last.
-        fallback = compactable[primary_count:]
-        return primary + fallback
+        protected: set[str] = set()
+        fresh_request = self._fresh_tool_request(config, messages)
+        if fresh_request is not None:
+            fits = True
+            if include_recent:
+                estimate, _ = estimate_prompt_tokens_chain(
+                    config.provider, config.model, fresh_request, config.tools.get_definitions(),
+                )
+                fits = estimate <= self.input_budget(config)
+            if fits:
+                protected = {
+                    str(msg["tool_call_id"]) for msg in fresh_request
+                    if msg.get("role") == "tool" and msg.get("tool_call_id")
+                }
+        candidates = compactable if include_recent else compactable[:primary_count]
+        # Hard overflow can still reclaim recent results, but not a bounded
+        # fresh recovery read that fits independently of the accumulated history.
+        return [candidate for candidate in candidates if candidate[1] not in protected]
 
     def _compact_tool_result_at(
         self,
