@@ -7,14 +7,78 @@ original bug we fixed by unifying Enter routing through decide_enter_action.
 """
 from __future__ import annotations
 
-import pytest
-from textual.events import Paste
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
+from textual.events import AppBlur, AppFocus, Paste
+from textual.widgets import Button
+
+from nanobot.fork.cli import tui_textual
 from nanobot.fork.cli.tui_textual import _TEXTUAL_AVAILABLE, TextualTUI, _compact_path_label
 
 pytestmark = pytest.mark.skipif(
     not _TEXTUAL_AVAILABLE, reason="textual library is not installed"
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["input", "button", "none"])
+async def test_windows_app_focus_keeps_internal_focus(monkeypatch, target) -> None:
+    """窗口失焦不清空控件焦点，回焦也不抢占其他控件或空焦点。"""
+    monkeypatch.setattr(tui_textual, "_sys", SimpleNamespace(platform="win32"))
+    tui = TextualTUI()
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input")
+        inp.value = "中文 draft"
+        inp.cursor_position = 2
+        button = Button("测试焦点")
+        await app.screen.mount(button)
+        focused = {"input": inp, "button": button, "none": None}[target]
+        app.screen.set_focus(focused)
+        await pilot.pause()
+        selection = inp.selection
+        set_focus = Mock(wraps=app.screen.set_focus)
+        monkeypatch.setattr(app.screen, "set_focus", set_focus)
+
+        for _ in range(2):
+            app.post_message(AppBlur())
+            await pilot.pause()
+            assert app.app_focus is False
+            assert app.focused is focused
+            app.post_message(AppFocus())
+            await pilot.pause()
+            assert app.app_focus is True
+            assert app.focused is focused
+
+        set_focus.assert_not_called()
+        assert inp.value == "中文 draft"
+        assert inp.selection == selection
+
+
+@pytest.mark.asyncio
+async def test_non_windows_app_focus_uses_textual_behavior(monkeypatch) -> None:
+    """非 Windows 平台继续使用 Textual 原有的焦点保存/恢复行为。"""
+    monkeypatch.setattr(tui_textual, "_sys", SimpleNamespace(platform="linux"))
+    tui = TextualTUI()
+    app = tui._app
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input")
+        assert app.focused is inp
+        set_focus = Mock(wraps=app.screen.set_focus)
+        monkeypatch.setattr(app.screen, "set_focus", set_focus)
+        app.post_message(AppBlur())
+        await pilot.pause()
+        assert app.app_focus is False
+        # TextArea 可能随后自行恢复焦点，检查失焦过程确实沿用基类行为。
+        set_focus.assert_any_call(None)
+        app.post_message(AppFocus())
+        await pilot.pause()
+        assert app.app_focus is True
+        assert app.focused is inp
 
 
 async def _press_text(pilot, text: str) -> None:

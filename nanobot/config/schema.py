@@ -141,7 +141,8 @@ class AgentDefaults(Base):
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 1000  # fork: bump default 200 → 1000 to accommodate long sustained tasks
     max_concurrent_subagents: int = Field(default=1, ge=1)
-    fail_on_tool_error: bool = True
+    # 普通工具错误交给 Agent 检查并恢复；需要严格失败时仍可由调用方显式开启。
+    fail_on_tool_error: bool = False
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     tool_hint_max_length: int = Field(

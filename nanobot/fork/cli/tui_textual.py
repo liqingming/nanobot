@@ -1474,6 +1474,14 @@ if _TEXTUAL_AVAILABLE:
             self._lag_last: float = 0.0
             self._lag_warn_threshold_s = 0.5
 
+        def _watch_app_focus(self, focus: bool) -> None:
+            """Windows 窗口切换时保留控件焦点，避免额外的输入框失焦/重聚焦。"""
+            if _sys.platform == "win32":
+                # 仍更新窗口焦点样式，但不主动切换输入法或抢回输入框焦点。
+                self.screen.update_node_styles()
+                return
+            super()._watch_app_focus(focus)
+
         async def _check_bindings(self, key: str, priority: bool = False) -> bool:
             """在 Textual 查找绑定前记录书签快捷键。"""
             normalized = key.lower()

@@ -234,7 +234,7 @@ sequenceDiagram
     SM->>SM: 注册 done_callback
     SM->>SA: asyncio.create_task(_run_subagent())
     
-    Note over SA: 🔒 严格隔离<br/>— 工具子集 (无 message/spawn)<br/>— max_iterations = 15<br/>— fail_on_tool_error = True<br/>— 独立 ContextBuilder + Runner<br/>— 与主 Agent 并行运行
+    Note over SA: 🔒 严格隔离<br/>— 工具子集 (无 message/spawn)<br/>— max_iterations = 15<br/>— 工具错误默认可恢复（严格失败可显式启用）<br/>— 独立 ContextBuilder + Runner<br/>— 与主 Agent 并行运行
 
     SA->>SA: 独立 build_system_prompt()
     SA->>SA: 独立 run_stream() 循环

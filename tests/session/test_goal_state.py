@@ -118,7 +118,7 @@ def test_runner_wall_llm_timeout_uses_metadata_override(tmp_path, monkeypatch):
             "cli:test",
             metadata={GOAL_STATE_KEY: {"status": "active", "objective": "x"}},
         )
-        == 900.0
+        == 1200.0
     )
     assert runner_wall_llm_timeout_s(sm, "cli:test", metadata={}) is None
 
@@ -140,4 +140,4 @@ def test_runner_wall_llm_timeout_rejects_disabled_or_invalid_long_goal_value(
     meta = {GOAL_STATE_KEY: {"status": "active", "objective": "z"}}
     for value in ("0", "-1", "invalid"):
         monkeypatch.setenv("NANOBOT_LONG_GOAL_LLM_TIMEOUT_S", value)
-        assert runner_wall_llm_timeout_s(sm, "c:d", metadata=meta) == 900.0
+        assert runner_wall_llm_timeout_s(sm, "c:d", metadata=meta) == 1200.0

@@ -18,7 +18,7 @@ GOAL_STATE_KEY = "goal_state"
 _LEGACY_GOAL_STATE_SESSION_KEY = "thread_goal"
 _MAX_OBJECTIVE_IN_RUNTIME = 4000
 _MAX_OBJECTIVE_WS = 600
-_DEFAULT_LONG_GOAL_LLM_TIMEOUT_S = 900.0
+_DEFAULT_LONG_GOAL_LLM_TIMEOUT_S = 1200.0
 
 
 def _session_goal_raw(metadata: Mapping[str, Any] | None) -> Any:
@@ -147,7 +147,7 @@ def runner_wall_llm_timeout_s(
     Sustained-goal turns use a longer but finite wall-clock cap so non-terminal
     provider events cannot hold the session lock forever. ``None`` means use the
     ordinary ``NANOBOT_LLM_TIMEOUT_S`` default. Override the long-goal cap with
-    ``NANOBOT_LONG_GOAL_LLM_TIMEOUT_S``; invalid/non-positive values fall back to 900s.
+    ``NANOBOT_LONG_GOAL_LLM_TIMEOUT_S``; invalid/non-positive values fall back to 1200s.
     """
     meta: Mapping[str, Any] | None = metadata
     if meta is None and session_key:
