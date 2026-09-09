@@ -32,6 +32,7 @@ from nanobot.agent.context_governance import (
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
+from nanobot.fork.agent.context_usage import accumulate_usage, with_context_usage
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.utils.helpers import (
@@ -447,6 +448,7 @@ class AgentRunner:
                 self._log_event(
                     spec,
                     "runner.context.governance",
+                    context_scope="local_model_copy",
                     iteration=iteration,
                     before=before_context,
                     after=after_context,
@@ -1051,6 +1053,8 @@ class AgentRunner:
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
             prompt_peak_tokens=prompt_peak_tokens,
+            context_input_tokens=usage.get("context_input_tokens", 0),
+            context_input_estimated=usage.get("context_input_estimated", 0),
             governance_saved_total=governance_saved_total,
             compacted_tool_results=len(compacted_tool_call_ids),
             digested_tool_results=sum(
@@ -1573,10 +1577,16 @@ class AgentRunner:
         if total > 0:
             usage["total_tokens"] = total
             usage.setdefault("provider_tokens", total)
-            return usage
-        if response.finish_reason == "error":
+        elif response.finish_reason == "error":
             return {}
-        return self._estimate_response_usage(spec, messages, response)
+        else:
+            usage = self._estimate_response_usage(spec, messages, response)
+        return with_context_usage(
+            usage, response.provider_diagnostics or {},
+            lambda: estimate_prompt_tokens_chain(
+                self.provider, spec.model, messages, spec.tools.get_definitions(),
+            )[0],
+        )
 
     def _estimate_response_usage(
         self,
@@ -1627,14 +1637,12 @@ class AgentRunner:
 
     @staticmethod
     def _accumulate_usage(target: dict[str, int], addition: dict[str, int]) -> None:
-        for key, value in addition.items():
-            target[key] = target.get(key, 0) + value
+        accumulate_usage(target, addition)
 
     @staticmethod
     def _merge_usage(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
         merged = dict(left)
-        for key, value in right.items():
-            merged[key] = merged.get(key, 0) + value
+        accumulate_usage(merged, right)
         return merged
 
     async def _execute_tools(

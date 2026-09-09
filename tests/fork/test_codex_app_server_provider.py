@@ -1307,6 +1307,7 @@ async def test_stdio_protocol_continues_tool_result_and_usage_is_incremental(
     )
     assert first.finish_reason == "tool_calls"
     assert first.usage["total_tokens"] == 10
+    assert first.provider_diagnostics["context_input_tokens"] == 8
 
     messages.extend(
         [
@@ -1331,6 +1332,7 @@ async def test_stdio_protocol_continues_tool_result_and_usage_is_incremental(
     assert second.content == "done"
     assert second.usage["total_tokens"] == 8
     assert first.usage["total_tokens"] + second.usage["total_tokens"] == 18
+    assert second.provider_diagnostics["context_input_tokens"] == 5
     assert provider._turns == {}
 
 

@@ -51,6 +51,7 @@ from nanobot.bus.runtime_events import (
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.fork.agent.context_usage import context_input_tokens
 from nanobot.fork.agent.learning import (
     PATTERN_THRESHOLD,
     PatternStore,
@@ -369,6 +370,8 @@ class AgentLoop:
             fail_on_tool_error=fail_on_tool_error,
             data_dir=_data,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
+            context_window_tokens=self.context_window_tokens,
+            context_block_limit=self.context_block_limit,
         )
         self._unified_session = unified_session
         self._max_messages = replay_max_messages_for_context(self.context_window_tokens)
@@ -537,7 +540,7 @@ class AgentLoop:
         self.model = model
         self.context_window_tokens = context_window_tokens
         self.runner.provider = provider
-        self.subagents.set_provider(provider, model)
+        self.subagents.set_provider(provider, model, context_window_tokens=context_window_tokens)
         self.consolidator.set_provider(provider, model, context_window_tokens)
         self._sync_replay_max_messages()
         self._provider_signature = snapshot.signature
@@ -958,11 +961,13 @@ class AgentLoop:
             )
 
         # Compute pressure.
-        prompt_tokens = usage.get("prompt_tokens", 0) if usage else 0
+        prompt_tokens = context_input_tokens(usage)
         cw = self.context_window_tokens
         if cw > 0 and prompt_tokens > 0:
             pct = prompt_tokens * 100 // cw
             detail = f"{prompt_tokens // 1000}K/{cw // 1000}K"
+            if usage.get("context_input_estimated"):
+                detail += " estimated"
         else:
             pct = 0
             detail = ""

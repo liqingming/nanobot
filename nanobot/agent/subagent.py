@@ -25,7 +25,7 @@ from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
 from nanobot.fork.agent.execution_scope import run_isolated_subagent
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import LLMProvider, resolve_provider_context_window_tokens
 from nanobot.security.workspace_access import (
     WorkspaceScope,
     bind_workspace_scope,
@@ -96,12 +96,21 @@ class SubagentManager:
         fail_on_tool_error: bool | None = None,
         data_dir: Path | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
+        context_window_tokens: int | None = None,
+        context_block_limit: int | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
+        self._configured_context_window = (
+            defaults.context_window_tokens if context_window_tokens is None else context_window_tokens
+        )
+        self.context_window_tokens = resolve_provider_context_window_tokens(
+            provider, self.model, self._configured_context_window,
+        )
+        self.context_block_limit = context_block_limit
         self.tools_config = tools_config or ToolsConfig()
         self.max_tool_result_chars = max_tool_result_chars
         self.data_dir = data_dir
@@ -159,10 +168,17 @@ class SubagentManager:
         ToolLoader().load(ctx, registry, scope="subagent")
         return registry
 
-    def set_provider(self, provider: LLMProvider, model: str) -> None:
+    def set_provider(
+        self, provider: LLMProvider, model: str, *, context_window_tokens: int | None = None,
+    ) -> None:
         self.provider = provider
         self.model = model
         self.runner.provider = provider
+        if context_window_tokens is not None:
+            self._configured_context_window = context_window_tokens
+        self.context_window_tokens = resolve_provider_context_window_tokens(
+            provider, model, self._configured_context_window,
+        )
 
     async def spawn(
         self,
@@ -263,6 +279,8 @@ class SubagentManager:
                     temperature=temperature,
                     max_iterations=self.max_iterations,
                     max_tool_result_chars=self.max_tool_result_chars,
+                    context_window_tokens=self.context_window_tokens,
+                    context_block_limit=self.context_block_limit,
                     hook=_SubagentHook(task_id, status),
                     max_iterations_message="Task completed but no final response was generated.",
                     finalize_on_max_iterations=False,

@@ -25,6 +25,10 @@ from loguru import logger
 
 from nanobot.config.paths import get_workspace_cache_dir, is_default_workspace
 from nanobot.fork.agent.execution_scope import current_execution_id
+from nanobot.fork.providers.codex_context_checkpoint import (
+    ContextCheckpoint,
+    pending_checkpoint_messages,
+)
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 from nanobot.providers.openai_codex_provider import (
     OpenAICodexProvider as LegacyOpenAICodexProvider,
@@ -228,6 +232,11 @@ class _ToolResultLedger:
                 item.get("signature") for item in self.entries[self._replay_index + 1 :]
             }
             if signature not in remaining_signatures:
+                if any(item.get("signature") == signature
+                       for item in self.entries[:self._replay_index]):
+                    raise CodexIdempotencyLedgerError(
+                        "Tool signature repeated again during the same recovery."
+                    )
                 return None
             raise CodexIdempotencyLedgerError(
                 "Tool replay order diverged during Codex bridge recovery. "
@@ -439,6 +448,9 @@ class _CodexAppServerTurn:
         self._closed = False
         self._last_usage: dict[str, int] = {}
         self._reported_usage: dict[str, int] = {}
+        self._context_input_tokens: int | None = None
+        self.context_checkpoint = ContextCheckpoint()
+        self.recovery_replay_index: int | None = None
         self._submitted_tool_results = False
         self._streamed_output = False
         self._native_file_changes: dict[str, str] = {}
@@ -664,6 +676,10 @@ class _CodexAppServerTurn:
                 continue
             if method == "thread/tokenUsage/updated":
                 self._last_usage = _map_token_usage(params)
+                token_usage = params.get("tokenUsage")
+                last = token_usage.get("last") if isinstance(token_usage, dict) else None
+                tokens = last.get("inputTokens") if isinstance(last, dict) else None
+                self._context_input_tokens = tokens if isinstance(tokens, int) and tokens >= 0 else None
                 continue
             if method == "item/commandExecution/requestApproval" and "id" in message:
                 # Any approval request means the command needs permissions beyond the
@@ -813,6 +829,8 @@ class _CodexAppServerTurn:
 
     def _provider_diagnostics(self) -> dict[str, Any]:
         diagnostics: dict[str, Any] = {"transport": "codex_app_server"}
+        if self._context_input_tokens is not None:
+            diagnostics["context_input_tokens"] = self._context_input_tokens
         if self._native_file_changes:
             status_counts: dict[str, int] = {}
             for status in self._native_file_changes.values():
@@ -1038,6 +1056,14 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     root_override=self._idempotency_dir,
                 )
                 await asyncio.to_thread(ledger.record_messages, turn_messages)
+                bridge = self._turns.get(key)
+                if bridge is not None:
+                    pending_ids = set(bridge._pending_tools) - _tool_results_by_id(turn_messages).keys()
+                    if pending_ids:
+                        await asyncio.to_thread(
+                            ledger.record_messages,
+                            pending_checkpoint_messages(messages, pending_ids),
+                        )
             except Exception as exc:
                 bridge = self._turns.get(key)
                 if bridge is not None:
@@ -1060,9 +1086,33 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
             command_refresh_attempts = 0
             replayed_results = 0
             active_messages = messages
+            context_settings = (model or self.default_model, reasoning_effort, tools, tool_choice)
+            context_rebased = False
+            context_sync = "append" if self._turns.get(key) is not None else "start"
             while True:
                 bridge = self._turns.get(key)
                 try:
+                    if bridge is not None and bridge.context_checkpoint.needs_rebase(
+                        active_messages, context_settings,
+                    ):
+                        # 只在工具已落盘、当前调用尚未续传的边界重建；不清账本、不重跑工具。
+                        pending = set(bridge._pending_tools)
+                        results = _tool_results_by_id(active_messages)
+                        recorded = {entry["call_id"] for entry in ledger.entries}
+                        if not pending or not pending <= results.keys() or not pending <= recorded:
+                            raise CodexIdempotencyLedgerError(
+                                "Cannot rebase Codex context without checkpointed pending results."
+                            )
+                        if bridge._native_file_changes or bridge._native_command_executions:
+                            raise CodexIdempotencyLedgerError(
+                                "Cannot safely rebase Codex context after native side effects; "
+                                "native operations are not covered by the dynamic-tool ledger."
+                            )
+                        await self._finish_turn(key, bridge, drop_lock=False)
+                        bridge = None
+                        recovering = strict_recovery = True
+                        native_image_recovery = False
+                        context_rebased = True
                     if bridge is None:
                         await self._close_stale_session_turns(key)
                         if self._app_server_command is None:
@@ -1087,7 +1137,11 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                             recovery=recovering,
                         )
                     else:
+                        if bridge.recovery_replay_index is not None:
+                            strict_recovery = True
+                            ledger._replay_index = bridge.recovery_replay_index
                         await bridge.submit_tool_results(messages)
+                    bridge.context_checkpoint.capture(active_messages, context_settings)
                     response, replay_count = await self._next_response_with_replay(
                         bridge,
                         ledger,
@@ -1098,7 +1152,14 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                         on_tool_call_delta=on_tool_call_delta,
                     )
                     replayed_results += replay_count
+                    if strict_recovery:
+                        bridge.recovery_replay_index = ledger._replay_index
                     diagnostics = dict(response.provider_diagnostics or {})
+                    diagnostics["context_sync"] = (
+                        "rebased" if context_rebased else "recovered" if recovering else context_sync
+                    )
+                    if context_rebased:
+                        diagnostics["context_rebased"] = True
                     if recovery_attempts:
                         diagnostics["bridge_recovery_attempts"] = recovery_attempts
                     if command_refresh_attempts:

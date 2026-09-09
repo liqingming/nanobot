@@ -84,6 +84,7 @@ from nanobot.config.paths import (  # noqa: E402
     is_default_workspace,
 )
 from nanobot.config.schema import Config  # noqa: E402
+from nanobot.fork.agent.context_usage import context_input_tokens  # noqa: E402
 from nanobot.utils.evaluator import evaluate_response  # noqa: E402
 from nanobot.utils.helpers import safe_filename, sync_workspace_templates  # noqa: E402
 from nanobot.utils.oauth_compat import call_with_optional_proxy  # noqa: E402
@@ -2647,11 +2648,9 @@ def agent(
                 tui.stop_thinking()
                 usage = agent_loop._last_usage
                 if usage and agent_loop.context_window_tokens:
-                    # Providers normalize prompt_tokens as the complete request
-                    # input. Cache fields are a subset/breakdown, never an
-                    # additional amount to add to context usage.
+                    # 整轮消耗仍累计；ctx 仅使用最近一次上下文输入，不叠加缓存。
                     tui.update_context_usage(
-                        usage.get("prompt_tokens", 0),
+                        context_input_tokens(usage),
                         agent_loop.context_window_tokens,
                     )
                 # Refresh the todo bar unless this turn never produced a fresh
