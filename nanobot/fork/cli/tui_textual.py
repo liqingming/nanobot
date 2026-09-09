@@ -58,6 +58,7 @@ from rich.text import Text
 
 from nanobot import __logo__, __version__
 from nanobot.cli.markdown import terminal_markdown
+from nanobot.fork.cli.ide_context import format_ide_context_display
 from nanobot.fork.cli.tui_base import TUIBase, input_history_path, recent_complete_turns
 from nanobot.fork.cli.tui_keys import (
     EnterAction,
@@ -1382,6 +1383,17 @@ if _TEXTUAL_AVAILABLE:
         #popup.visible {
             display: block;
         }
+        #ide-context {
+            height: auto;
+            max-height: 3;
+            color: $text-muted;
+            background: #0c0c0c;
+            padding: 0 1;
+            display: none;
+        }
+        #ide-context.visible {
+            display: block;
+        }
         #input {
             height: auto;
             max-height: 6;
@@ -1420,6 +1432,7 @@ if _TEXTUAL_AVAILABLE:
         Screen.glass-skin #topic-bar,
         Screen.glass-skin #live,
         Screen.glass-skin #input,
+        Screen.glass-skin #ide-context,
         Screen.glass-skin TextArea,
         Screen.glass-skin #status,
         Screen.glass-skin #todo-bar {
@@ -1551,6 +1564,7 @@ if _TEXTUAL_AVAILABLE:
             with Horizontal(id="sep-row"):
                 yield Static("[dim cyan]" + "─" * 80 + "[/dim cyan]", id="sep", markup=True)
                 yield Static("", id="topic-bar")
+            yield Static("", id="ide-context", markup=False)
             yield _ComposerInput(self._tui, placeholder="You: ", id="input")
             yield Static("", id="status")
 
@@ -1561,6 +1575,7 @@ if _TEXTUAL_AVAILABLE:
             self._write_welcome()
             self.update_topic_bar(self._tui._workspace_label, self._tui._topic)
             self._start_lag_watchdog()
+            self._tui.set_ide_context(self._tui._ide_context_labels)
             # After the first full render, re-focus + full layout refresh so
             # Windows Terminal updates its IME candidate window position to the
             # actual input cursor location instead of defaulting to top-left.
@@ -2125,6 +2140,7 @@ class TextualTUI(TUIBase):
         self._question_on_complete: Callable[[dict[str, str] | None], Awaitable[None]] | None = None
 
         # Callbacks
+        self._ide_context_labels: list[str] = []
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._on_pre_submit: Callable[[str], None] | None = None
         self._on_cancel: Callable[[], Awaitable[None]] | None = None
@@ -2423,6 +2439,8 @@ class TextualTUI(TUIBase):
 
     def _write_user(self, text: str, ts: str, *, message_id: str | None = None) -> None:
         """Write a user message block; records line range for gray background."""
+        # 实时回显、排队发送及历史分页共用此显示入口，复制也使用折叠后的文本。
+        text = format_ide_context_display(text)
         try:
             out = self._app.query_one("#output", _OutputLog)
             start = len(out.lines)
@@ -2561,6 +2579,20 @@ class TextualTUI(TUIBase):
         self._app.exit()
 
     # ── TUIBase: callbacks ─────────────────────────────────────────────────
+
+    def set_ide_context(self, labels: list[str]) -> None:
+        """仅显示待发送附件，不修改输入框、不触发提交。"""
+        self._ide_context_labels = list(labels)
+
+        def update() -> None:
+            bar = self._app.query_one("#ide-context", Static)
+            current = self._ide_context_labels
+            bar.update("IDE 待发送：" + "；".join(
+                f"{i}. {label}" for i, label in enumerate(current, 1)
+            ) + "  (/ide show/remove/clear)")
+            bar.set_class(bool(current), "visible")
+
+        self._app._safe_call(update)
 
     def set_on_submit(self, callback: Callable[[str], Awaitable[None]]) -> None:
         self._on_submit = callback

@@ -438,6 +438,9 @@ def test_resolve_cli_session_key_uses_display_name_or_legacy_key() -> None:
         "/rename 批量修改github仓库",
         "/commit_memory show",
         "/todos clear",
+        "/ide",
+        "/ide on",
+        "/ide remove 1",
         "/resume 批量修改github仓库",
     ],
 )

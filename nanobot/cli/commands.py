@@ -738,6 +738,8 @@ def _is_cli_local_command(text: str) -> bool:
         or command == "/model"
         or command == "/skills"
         or command == "/system-prompt"
+        or command == "/ide"
+        or command.startswith("/ide ")
         or command == "/skin"
         or command.startswith("/skin ")
         or command == "/clear"
@@ -1061,6 +1063,7 @@ def _tui_command_palette() -> list[tuple[str, str, str]]:
         ("/rename", "Rename the current CLI session.", "edit"),
         ("/system-prompt", "Show the current topic's rendered system rules.", "submit"),
         ("/skin", "Switch the Windows Terminal background image.", "edit"),
+        ("/ide", "管理 Rider 代码上下文：on/off/clear/show/remove。", "edit"),
         ("/clear", "Clear context and start an unnamed empty session.", "submit"),
         ("/resume", "Show saved CLI sessions and switch topics.", "submit"),
         ("/bookmarks", "Show bookmarks for the current topic.", "submit"),
@@ -2398,6 +2401,10 @@ def agent(
             fresh_session = agent_loop.sessions.get_or_create(f"{cli_channel}:{fresh_chat_id}")
             _mark_cli_session_unnamed(fresh_session)
             topic_state: dict[str, str] = {"chat_id": fresh_chat_id}
+            from nanobot.fork.cli.ide_integration import IDEIntegration
+
+            ide = IDEIntegration(agent_loop.workspace, tui)
+            ide.pending.switch(fresh_session.key)
             tui.set_input_history_topic(fresh_session.key)
 
             def _load_topic(name: str) -> None:
@@ -2571,7 +2578,9 @@ def agent(
                 if not is_processing and not _is_cli_local_command(text):
                     _pending_transcript_ids["user"] = uuid.uuid4().hex
                     _pending_transcript_ids["assistant"] = uuid.uuid4().hex
-                    tui.add_user_echo(text, message_id=_pending_transcript_ids["user"])
+                    tui.add_user_echo(
+                        ide.pending.preview(text), message_id=_pending_transcript_ids["user"]
+                    )
                     tui.stream_start()
                     _pre_submitted[0] = True
 
@@ -2669,6 +2678,7 @@ def agent(
                     agent_loop.clear_session_learning(old_key)
                 _todo_bar_waiting_for_new_plan[0] = False
                 topic_state["chat_id"] = session_key[len(prefix):]
+                ide.pending.switch(session_key)
                 tui.reset_history()
                 _load_topic(topic_state["chat_id"])
 
@@ -2707,6 +2717,9 @@ def agent(
                     return
                 if _is_exit_command(text):
                     tui.exit()
+                    return
+
+                if await ide.command(text):
                     return
 
                 # ── 话题管理命令 ──────────────────────────────────────────────
@@ -2945,6 +2958,8 @@ def agent(
                     return
                 # ─────────────────────────────────────────────────────────────
 
+                # 在提交时冻结附件，而非等排队发送时再取，避免下一条问题混入新选区。
+                user_input = ide.pending.consume(user_input)
                 if is_processing:
                     pending_queue.append(user_input)
                     tui.add_system("Message queued — will send when nanobot finishes.")
@@ -3169,6 +3184,7 @@ def agent(
             except (KeyboardInterrupt, EOFError):
                 pass
             finally:
+                await ide.bridge.close()
                 agent_loop.stop()
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
