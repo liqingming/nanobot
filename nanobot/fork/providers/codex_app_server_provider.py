@@ -29,6 +29,11 @@ from nanobot.fork.providers.codex_context_checkpoint import (
     ContextCheckpoint,
     pending_checkpoint_messages,
 )
+from nanobot.fork.providers.codex_native_context import (
+    NativeCompactionState,
+    check_native_payload,
+    native_input_budget,
+)
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 from nanobot.providers.openai_codex_provider import (
     OpenAICodexProvider as LegacyOpenAICodexProvider,
@@ -449,6 +454,7 @@ class _CodexAppServerTurn:
         self._last_usage: dict[str, int] = {}
         self._reported_usage: dict[str, int] = {}
         self._context_input_tokens: int | None = None
+        self.native_compaction = NativeCompactionState()
         self.context_checkpoint = ContextCheckpoint()
         self.recovery_replay_index: int | None = None
         self._submitted_tool_results = False
@@ -515,6 +521,7 @@ class _CodexAppServerTurn:
             name for tool in selected_tools or [] if (name := _tool_schema_name(tool)) is not None
         }
         config = dict(_THREAD_CONFIG_OVERRIDES)
+        config.update(self.native_compaction.config())
         disabled_skills = await self._unsupported_skill_overrides(cwd, selected_tools)
         if disabled_skills:
             config["skills"] = {"config": disabled_skills}
@@ -540,6 +547,7 @@ class _CodexAppServerTurn:
         thread_id = thread.get("id") if isinstance(thread, dict) else None
         if not isinstance(thread_id, str) or not thread_id:
             raise CodexAppServerError("Codex app-server did not return a thread id.")
+        self.native_compaction.thread_id = thread_id
         turn_params: dict[str, Any] = {"threadId": thread_id, "input": turn_input}
         if reasoning_effort:
             turn_params["effort"] = reasoning_effort
@@ -674,7 +682,13 @@ class _CodexAppServerTurn:
                         self._streamed_output = True
                         await on_thinking_delta(delta)
                 continue
+            if self.native_compaction.observe(method, params):
+                # 压缩前的 last 不得继续冒充压缩后的窗口；等待新的 usage 通知。
+                self._context_input_tokens = None
+                continue
             if method == "thread/tokenUsage/updated":
+                if params.get("threadId") not in {None, self.native_compaction.thread_id}:
+                    continue
                 self._last_usage = _map_token_usage(params)
                 token_usage = params.get("tokenUsage")
                 last = token_usage.get("last") if isinstance(token_usage, dict) else None
@@ -829,6 +843,8 @@ class _CodexAppServerTurn:
 
     def _provider_diagnostics(self) -> dict[str, Any]:
         diagnostics: dict[str, Any] = {"transport": "codex_app_server"}
+        if self.native_compaction.budget > 0:
+            diagnostics.update(self.native_compaction.diagnostics())
         if self._context_input_tokens is not None:
             diagnostics["context_input_tokens"] = self._context_input_tokens
         if self._native_file_changes:
@@ -993,6 +1009,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
     """OpenAI Codex provider using the official app-server transport stack."""
 
     supports_stream_recover_callback = True
+    supports_native_context_compaction = True
 
     def __init__(
         self,
@@ -1050,6 +1067,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         async with lock:
             turn_messages = _current_turn_messages(messages)
             try:
+                native_budget = native_input_budget(self, request_context)
                 ledger = await asyncio.to_thread(
                     _idempotency_ledger,
                     key,
@@ -1086,7 +1104,9 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
             command_refresh_attempts = 0
             replayed_results = 0
             active_messages = messages
-            context_settings = (model or self.default_model, reasoning_effort, tools, tool_choice)
+            context_settings = (
+                model or self.default_model, reasoning_effort, tools, tool_choice, native_budget,
+            )
             context_rebased = False
             context_sync = "append" if self._turns.get(key) is not None else "start"
             while True:
@@ -1114,6 +1134,9 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                         native_image_recovery = False
                         context_rebased = True
                     if bridge is None:
+                        check_native_payload(
+                            self, model or self.default_model, active_messages, tools, native_budget,
+                        )
                         await self._close_stale_session_turns(key)
                         if self._app_server_command is None:
                             self._app_server_command = _resolve_codex_app_server_command()
@@ -1123,6 +1146,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                             rpc_timeout_s=self._rpc_timeout_s,
                             event_timeout_s=self._event_timeout_s,
                         )
+                        bridge.native_compaction.budget = native_budget
                         self._turns[key] = bridge
                         if strict_recovery:
                             ledger.begin_recovery()
@@ -1140,7 +1164,16 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                         if bridge.recovery_replay_index is not None:
                             strict_recovery = True
                             ledger._replay_index = bridge.recovery_replay_index
-                        await bridge.submit_tool_results(messages)
+                        pending_messages = [
+                            message for message in active_messages
+                            if message.get("role") == "tool"
+                            and message.get("tool_call_id") in bridge._pending_tools
+                        ]
+                        check_native_payload(
+                            self, model or self.default_model, pending_messages, [],
+                            max(1, native_budget // 5) if native_budget > 0 else 0,
+                        )
+                        await bridge.submit_tool_results(active_messages)
                     bridge.context_checkpoint.capture(active_messages, context_settings)
                     response, replay_count = await self._next_response_with_replay(
                         bridge,
@@ -1186,6 +1219,10 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     submitted = bridge is not None and bridge.submitted_tool_results
                     streamed = bridge is not None and bridge.streamed_output
                     stderr_tail = bridge.stderr_tail if bridge is not None else None
+                    native_unsafe = bridge is not None and bridge.native_compaction.budget > 0 and (
+                        bridge.native_compaction.in_progress
+                        or bool(bridge._native_file_changes or bridge._native_command_executions)
+                    )
                     if bridge is not None:
                         await self._finish_turn(key, bridge, drop_lock=False)
                     can_refresh_command = (
@@ -1209,6 +1246,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     can_correct_native_tool = (
                         isinstance(exc, CodexAppServerError)
                         and exc.code == "native_tool_blocked"
+                        and not native_unsafe
                         and native_tool_corrections < DEFAULT_NATIVE_TOOL_CORRECTION_ATTEMPTS
                         and (not streamed or on_stream_recover is not None)
                     )
@@ -1238,6 +1276,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                         continue
                     can_recover = (
                         submitted
+                        and not native_unsafe
                         and ledger.has_entries
                         and _is_recoverable_bridge_error(exc)
                         and recovery_attempts < DEFAULT_CODEX_RECOVERY_ATTEMPTS
@@ -1264,13 +1303,18 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                         )
                         continue
                     self._turn_locks.pop(key, None)
-                    return _app_server_error_response(
+                    response = _app_server_error_response(
                         exc,
                         retry_allowed=(
-                            not submitted and not isinstance(exc, CodexIdempotencyLedgerError)
+                            not submitted and not native_unsafe
+                            and not isinstance(exc, CodexIdempotencyLedgerError)
                         ),
                         stderr_tail=stderr_tail,
                     )
+                    if bridge is not None and native_budget > 0:
+                        response.provider_diagnostics.update(bridge.native_compaction.diagnostics())
+                        response.provider_diagnostics["native_recovery_suppressed"] = native_unsafe
+                    return response
 
     async def _next_response_with_replay(
         self,

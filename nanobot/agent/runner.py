@@ -33,6 +33,7 @@ from nanobot.agent.context_governance import (
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
 from nanobot.fork.agent.context_usage import accumulate_usage, with_context_usage
+from nanobot.fork.agent.native_context import NativeContextPreparation, uses_native_context
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.utils.helpers import (
@@ -408,6 +409,10 @@ class AgentRunner:
             inflight_start_index=len(spec.initial_messages),
         )
 
+        native_context = uses_native_context(self.provider)
+        context_preparation = (
+            NativeContextPreparation(self.context_governor) if native_context else self.context_governor
+        )
         for iteration in range(spec.max_iterations):
             self._log_event(
                 spec,
@@ -430,7 +435,7 @@ class AgentRunner:
                 )
                 tools_for_model = active_governance_config.tools.get_definitions()
                 before_context = self.context_governor.context_metrics(messages, tools_for_model)
-                messages_for_model = self.context_governor.prepare_for_model(
+                messages_for_model = context_preparation.prepare_for_model(
                     active_governance_config,
                     messages,
                     compacted_tool_call_ids,
@@ -448,7 +453,7 @@ class AgentRunner:
                 self._log_event(
                     spec,
                     "runner.context.governance",
-                    context_scope="local_model_copy",
+                    context_scope="native_checkpoint_copy" if native_context else "local_model_copy",
                     iteration=iteration,
                     before=before_context,
                     after=after_context,
@@ -489,6 +494,7 @@ class AgentRunner:
             response = await self._request_model(spec, messages_for_model, hook, context)
             if (
                 LLMProvider.is_context_length_response(response)
+                and not native_context
                 and not context.streamed_content
             ):
                 estimate, source = estimate_prompt_tokens_chain(
@@ -1117,6 +1123,12 @@ class AgentRunner:
                 "session_key": spec.session_key or "default",
                 "turn_id": spec.turn_id,
             }
+            if uses_native_context(self.provider):
+                kwargs["request_context"]["native_context"] = {
+                    "context_window_tokens": spec.context_window_tokens,
+                    "context_block_limit": spec.context_block_limit,
+                    "max_tokens": spec.max_tokens,
+                }
         return kwargs
 
     @staticmethod
