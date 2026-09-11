@@ -9,6 +9,7 @@ from nanobot.agent.memory import (
     Consolidator,
     MemoryStore,
 )
+from nanobot.fork.agent.summary_transaction import SummaryTransactionError
 from nanobot.providers.base import LLMResponse
 from nanobot.session.manager import Session
 from nanobot.utils.prompt_templates import render_template
@@ -48,6 +49,12 @@ def consolidator(store, mock_provider):
     )
 
 
+@pytest.fixture(autouse=True)
+def valid_archive_budget(consolidator):
+    # 小窗口用于边界算法测试；显式去掉测试安全预留以保留真实输入空间。
+    consolidator._SAFETY_BUFFER = 0
+
+
 def _tool_round(call_id: str) -> list[dict]:
     return [
         {
@@ -68,7 +75,9 @@ class TestConsolidatorSummarize:
             content=(
                 "<continuation>\n- Auth bug fixed.\n</continuation>\n"
                 "<memory-candidates>\n- [durable] Auth race condition fixed.\n</memory-candidates>"
-            )
+            ),
+            finish_reason="stop",
+            tool_calls=[],
         )
         messages = [
             {"role": "user", "content": "fix the auth bug"},
@@ -204,13 +213,13 @@ class TestConsolidatorArchiveErrorHandling:
 class TestConsolidatorTokenBudget:
     async def test_prompt_below_threshold_does_not_consolidate(self, consolidator):
         """No consolidation when tokens are within budget."""
-        session = MagicMock()
+        session = Session(key="test:key")
         session.last_consolidated = 0
         session.messages = [{"role": "user", "content": "hi"}]
         session.key = "test:key"
         consolidator.sessions._session_cache[session.key] = session
         consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(100, "tiktoken"))
-        consolidator.archive = AsyncMock(return_value=True)
+        consolidator.archive = AsyncMock(return_value="有效续接摘要")
         await consolidator.maybe_consolidate_by_tokens(session)
         consolidator.archive.assert_not_called()
 
@@ -324,6 +333,7 @@ class TestConsolidatorTokenBudget:
         consolidator,
     ):
         """Replay-window consolidation must not cut into the latest user turn."""
+        consolidator._SAFETY_BUFFER = 0
         session = Session(key="test:replay-tool-boundary")
         session.add_message("user", "old")
         session.add_message("assistant", "old answer")
@@ -355,6 +365,7 @@ class TestConsolidatorTokenBudget:
         consolidator,
     ):
         """Do not extend to an older long turn when the hard window has a newer user."""
+        consolidator._SAFETY_BUFFER = 0
         session = Session(key="test:replay-newer-user")
         session.add_message("user", "old")
         session.add_message("assistant", "old answer")
@@ -385,7 +396,7 @@ class TestConsolidatorTokenBudget:
     async def test_large_chunk_archived_without_cap(self, consolidator):
         """Without chunk cap, the full range from pick_consolidation_boundary is archived."""
         consolidator._SAFETY_BUFFER = 0
-        session = MagicMock()
+        session = Session(key="test:key")
         session.last_consolidated = 0
         session.key = "test:key"
         session.messages = [
@@ -401,7 +412,7 @@ class TestConsolidatorTokenBudget:
         )
         # Use real pick_consolidation_boundary — it will find boundary at idx=50
         # (user message at 50, token budget met)
-        consolidator.archive = AsyncMock(return_value=True)
+        consolidator.archive = AsyncMock(return_value="有效续接摘要")
 
         await consolidator.maybe_consolidate_by_tokens(session)
 
@@ -410,13 +421,10 @@ class TestConsolidatorTokenBudget:
         assert archived_chunk[0]["content"] == "m0"
         assert session.last_consolidated > 0
 
-    async def test_raw_archive_fallback_advances_last_consolidated(self, consolidator):
-        """When archive() falls back to raw-archive (LLM failed), the cursor
-        must still advance. Otherwise the same chunk gets raw-archived again
-        on every subsequent maybe_consolidate_by_tokens() call, spamming
-        duplicate [RAW] entries into history.jsonl."""
+    async def test_raw_archive_fallback_preserves_last_consolidated(self, consolidator):
+        """原文归档不是摘要覆盖，失败必须保留原游标。"""
         consolidator._SAFETY_BUFFER = 0
-        session = MagicMock()
+        session = Session(key="test:key")
         session.last_consolidated = 0
         session.key = "test:key"
         session.messages = [
@@ -431,18 +439,17 @@ class TestConsolidatorTokenBudget:
         # LLM consolidation fails — archive() returns None (raw_archive fired).
         consolidator.archive = AsyncMock(return_value=None)
 
-        await consolidator.maybe_consolidate_by_tokens(session)
+        with pytest.raises(SummaryTransactionError):
+            await consolidator.maybe_consolidate_by_tokens(session)
 
         consolidator.archive.assert_awaited_once()
-        # The chunk is considered "materialized" (as a raw-archive breadcrumb),
-        # so last_consolidated must have moved past it.
-        assert session.last_consolidated == 50
+        assert session.last_consolidated == 0
 
     async def test_raw_archive_fallback_breaks_round_loop(self, consolidator):
         """A degraded LLM should not trigger more archive() calls within the
         same maybe_consolidate_by_tokens invocation — bail after one fallback."""
         consolidator._SAFETY_BUFFER = 0
-        session = MagicMock()
+        session = Session(key="test:key")
         session.last_consolidated = 0
         session.key = "test:key"
         session.messages = [
@@ -457,7 +464,8 @@ class TestConsolidatorTokenBudget:
         )
         consolidator.archive = AsyncMock(return_value=None)
 
-        await consolidator.maybe_consolidate_by_tokens(session)
+        with pytest.raises(SummaryTransactionError):
+            await consolidator.maybe_consolidate_by_tokens(session)
 
         # Exactly one fallback per call — not _MAX_CONSOLIDATION_ROUNDS.
         assert consolidator.archive.await_count == 1
@@ -465,7 +473,7 @@ class TestConsolidatorTokenBudget:
     async def test_boundary_respected_when_no_intermediate_user_turn(self, consolidator):
         """When boundary points past a long tool chain, the full chunk is archived."""
         consolidator._SAFETY_BUFFER = 0
-        session = MagicMock()
+        session = Session(key="test:key")
         session.last_consolidated = 0
         session.key = "test:key"
         session.messages = [
@@ -479,7 +487,7 @@ class TestConsolidatorTokenBudget:
         consolidator.estimate_session_prompt_tokens = MagicMock(
             side_effect=[(1200, "tiktoken"), (400, "tiktoken")]
         )
-        consolidator.archive = AsyncMock(return_value=True)
+        consolidator.archive = AsyncMock(return_value="有效续接摘要")
 
         await consolidator.maybe_consolidate_by_tokens(session)
 
@@ -502,7 +510,7 @@ class TestCompactIdleSession:
             provider=mock_provider,
             model="test-model",
             sessions=sessions,
-            context_window_tokens=1000,
+            context_window_tokens=10000,
             build_messages=MagicMock(return_value=[]),
             get_tool_definitions=MagicMock(return_value=[]),
             max_completion_tokens=100,
@@ -641,14 +649,15 @@ class TestCompactIdleSession:
         sessions.save(session)
 
         result = await real_consolidator.compact_idle_session("cli:nothing", max_suffix=4)
-        assert result == "(nothing)"
+        assert result is None
 
         reloaded = sessions.get_or_create("cli:nothing")
         assert "_last_summary" not in reloaded.metadata
+        assert len(reloaded.messages) == 20
 
     @pytest.mark.asyncio
-    async def test_llm_failure_still_truncates(self, real_consolidator, mock_provider, store):
-        """LLM raises RuntimeError → raw_archive fires, session still truncated, returns None."""
+    async def test_llm_failure_preserves_history(self, real_consolidator, mock_provider, store):
+        """模型失败仅记录原文线索，不移除消息。"""
         mock_provider.chat_with_retry.side_effect = RuntimeError("LLM unavailable")
         sessions = real_consolidator.sessions
         session = sessions.get_or_create("cli:fail")
@@ -664,9 +673,8 @@ class TestCompactIdleSession:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert any("[RAW]" in e["content"] for e in entries)
 
-        # Session should still be truncated
         reloaded = sessions.get_or_create("cli:fail")
-        assert len(reloaded.messages) <= 4
+        assert len(reloaded.messages) == 20
 
     @pytest.mark.asyncio
     async def test_respects_last_consolidated(self, real_consolidator, mock_provider):
@@ -902,26 +910,21 @@ class TestRawArchiveTruncation:
         assert len(entries[0]["content"]) < 200
 
 
-class TestArchiveTruncation:
-    """archive() must truncate formatted text before sending to consolidation LLM."""
+class TestArchiveInputSafety:
+    """完整输入放不下时拒绝摘要，不把截断的片段当成全部覆盖。"""
 
-    async def test_archive_truncates_large_formatted_text(self, consolidator, mock_provider, store):
-        """Large formatted text should be truncated to token budget before LLM call."""
-        # context_window_tokens=1000, max_completion_tokens=100, _SAFETY_BUFFER=1024
-        # budget = 1000 - 100 - 1024 = -124 → fallback via truncate_text(budget*4)
+    async def test_archive_rejects_large_formatted_text(self, consolidator, mock_provider, store):
+        """大段原文无法完整放入时，不调用模型。"""
         big_messages = [{"role": "user", "content": "x" * 100_000}]
         mock_provider.chat_with_retry.return_value = MagicMock(
             content="Summary of large input.", finish_reason="stop"
         )
         await consolidator.archive(big_messages)
 
-        call_args = mock_provider.chat_with_retry.call_args
-        user_content = call_args.kwargs["messages"][1]["content"]
-        # Should be significantly shorter than 100K
-        assert len(user_content) < 50_000
+        mock_provider.chat_with_retry.assert_not_awaited()
 
-    async def test_archive_truncates_with_small_token_budget(self, consolidator, mock_provider, store):
-        """Small context window: truncation uses actual tokenizer count."""
+    async def test_archive_rejects_with_small_token_budget(self, consolidator, mock_provider, store):
+        """小窗口不截断输入绕过预算。"""
         consolidator.context_window_tokens = 500
         big_messages = [{"role": "user", "content": "word " * 50_000}]
         mock_provider.chat_with_retry.return_value = MagicMock(
@@ -929,11 +932,7 @@ class TestArchiveTruncation:
         )
         await consolidator.archive(big_messages)
 
-        sent_messages = mock_provider.chat_with_retry.call_args.kwargs["messages"]
-        user_content = sent_messages[1]["content"]
-        # budget = 500 - 100 - 1024 = negative, fallback char-based
-        # Should be truncated
-        assert len(user_content) < 250_000
+        mock_provider.chat_with_retry.assert_not_awaited()
 
     async def test_oversized_summary_is_capped_before_append(self, consolidator, mock_provider, store):
         """A pathologically large LLM summary must not land full-length in
@@ -948,8 +947,8 @@ class TestArchiveTruncation:
         entry = store.read_unprocessed_history(since_cursor=0)[0]
         assert len(entry["content"]) <= _ARCHIVE_SUMMARY_MAX_CHARS + 50
 
-    async def test_archive_truncates_via_tiktoken_with_positive_budget(self, consolidator, mock_provider, store):
-        """Positive token budget should use tiktoken for precise truncation."""
+    async def test_archive_rejects_oversized_tokens_with_positive_budget(self, consolidator, mock_provider, store):
+        """正预算仍要验证全部 token，而不是先截断。"""
         consolidator.context_window_tokens = 10_000
         consolidator._SAFETY_BUFFER = 0
         # budget = 10000 - 100 - 0 = 9900 tokens
@@ -959,8 +958,4 @@ class TestArchiveTruncation:
         )
         await consolidator.archive(big_messages)
 
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        sent_content = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
-        token_count = len(enc.encode(sent_content))
-        assert token_count <= 9_900
+        mock_provider.chat_with_retry.assert_not_awaited()

@@ -7,7 +7,7 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-from nanobot.providers.base import provider_input_token_budget
+from nanobot.fork.agent.context_budget import resolve_context_budget
 from nanobot.utils.helpers import estimate_prompt_tokens_chain
 
 
@@ -15,19 +15,14 @@ def native_input_budget(provider: Any, context: dict[str, Any] | None) -> int:
     settings = (context or {}).get("native_context")
     if not isinstance(settings, dict):
         return 0
-    window = settings.get("context_window_tokens")
-    if type(window) is not int or window <= 0:
+    budget = resolve_context_budget(
+        provider, settings.get("context_window_tokens"), settings.get("max_tokens"),
+        settings.get("context_block_limit"),
+    ).input_tokens
+    if budget is None:
         return 0
-    output = settings.get("max_tokens")
-    if type(output) is not int:
-        output = getattr(getattr(provider, "generation", None), "max_tokens", 4096)
-    output = output if type(output) is int else 4096
-    budget = provider_input_token_budget(provider, window, output)
     if budget <= 0:
         raise ValueError("Codex native context has no input budget after output reservation.")
-    limit = settings.get("context_block_limit")
-    if type(limit) is int and limit > 0:
-        budget = min(budget, limit)
     return budget
 
 

@@ -52,6 +52,9 @@ mode = sys.argv[1]
 state_path = Path(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
 
 def send(message):
+    if message.get("method", "").startswith(("item/", "turn/")) or message.get("method") == "thread/tokenUsage/updated":
+        message.setdefault("params", {}).setdefault("threadId", "thread-1")
+        message["params"].setdefault("turnId", "turn-1")
     print(json.dumps(message, separators=(",", ":")), flush=True)
 
 for raw_line in sys.stdin:
@@ -91,6 +94,8 @@ for raw_line in sys.stdin:
             config.get("web_search") == "disabled"
             and config.get("mcp_servers") == {}
             and config.get("plugins") == {}
+            and config.get("agents") == {"enabled": False}
+            and config.get("features", {}).get("multi_agent") is False
             and full
             and params.get("approvalPolicy") == "never"
         )

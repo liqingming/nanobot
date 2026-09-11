@@ -67,6 +67,7 @@ _DISABLED_FEATURES = (
 )
 _THREAD_CONFIG_OVERRIDES: dict[str, Any] = {
     "web_search": "disabled",
+    "agents": {"enabled": False},
     "mcp_servers": {},
     "plugins": {},
     "features": {feature: False for feature in _DISABLED_FEATURES},
@@ -85,7 +86,10 @@ _NATIVE_TOOL_GUARD = (
     "\n\nThe host application owns dynamic tool execution. Native Codex commands and file "
     "changes are supported inside the configured workspace sandbox. For every other "
     "capability, use only the dynamic tools provided by the client; do not use other "
-    "native Codex tools."
+    "native Codex tools. For subagents use the Nanobot spawn tool (fresh context), "
+    "then subagent_control for status, wait, or cancel using the returned task id. "
+    "Never use native collaboration tools. If the host tools are unavailable, report "
+    "the blocker; do not substitute native agents or invent worker ids."
 )
 _NATIVE_TOOL_CORRECTION = (
     "The previous Codex turn attempted to use a native Codex tool, which the host "
@@ -220,7 +224,27 @@ class _ToolResultLedger:
             return self._entry_result(entry), bool(entry.get("success"))
         return None
 
-    def cached_result(self, call: ToolCallRequest) -> tuple[Any, bool] | None:
+    def cached_result(
+        self, call: ToolCallRequest, *, checkpoint_continuation: bool = False,
+    ) -> tuple[Any, bool] | None:
+        # 正常检查点续行允许重新观察已变化的宿主状态；不能返回旧 running 回执。
+        # 只放行已知无副作用的操作和全新调用 ID，不猜测 exec/read_file 等工具的语义。
+        # 故障恢复绝不传入此标记，取消/未知操作仍遵守原有顺序保护。
+        if (
+            checkpoint_continuation
+            and isinstance(call.arguments, dict)
+            and (
+                (call.name == "subagent_control"
+                 and call.arguments.get("action") in {"list", "status"})
+                or (call.name == "write_stdin"
+                    and call.arguments.get("chars") in (None, "")
+                    and call.arguments.get("close_stdin", False) is False
+                    and call.arguments.get("terminate", False) is False)
+            )
+            and call.id
+            and not any(entry.get("call_id") == call.id for entry in self.entries)
+        ):
+            return None
         signature = _tool_signature(
             call.name,
             _canonical_tool_arguments(call.arguments),
@@ -457,6 +481,7 @@ class _CodexAppServerTurn:
         self.native_compaction = NativeCompactionState()
         self.context_checkpoint = ContextCheckpoint()
         self.recovery_replay_index: int | None = None
+        self.checkpoint_continuation = False
         self._submitted_tool_results = False
         self._streamed_output = False
         self._native_file_changes: dict[str, str] = {}
@@ -464,6 +489,9 @@ class _CodexAppServerTurn:
         self._native_command_executions: dict[str, str] = {}
         self._native_command_approvals_declined = 0
         self._dynamic_tool_names: set[str] = set()
+        self._turn_id: str | None = None
+        self._unsafe_protocol_event = False
+        self._steered_input = False
         self._stderr_lines: deque[str] = deque(maxlen=24)
         self._stderr_task: asyncio.Task[None] | None = None
 
@@ -551,7 +579,12 @@ class _CodexAppServerTurn:
         turn_params: dict[str, Any] = {"threadId": thread_id, "input": turn_input}
         if reasoning_effort:
             turn_params["effort"] = reasoning_effort
-        await self._rpc("turn/start", turn_params)
+        result = await self._rpc("turn/start", turn_params)
+        turn = result.get("turn") if isinstance(result, dict) else None
+        turn_id = turn.get("id") if isinstance(turn, dict) else None
+        if not isinstance(turn_id, str) or not turn_id:
+            raise CodexAppServerError("Codex app-server did not return a turn id.")
+        self._turn_id = turn_id
 
     async def _unsupported_skill_overrides(
         self,
@@ -592,6 +625,25 @@ class _CodexAppServerTurn:
                 len(overrides),
             )
         return overrides
+
+    async def steer(self, messages: list[dict[str, Any]]) -> None:
+        """在待处理工具边界追加输入，保留原生执行历史，不重建或回放。"""
+        inputs = [
+            item for message in messages if message.get("role") == "user"
+            for item in _content_to_user_inputs(message.get("content"))
+        ]
+        if not inputs:
+            raise CodexIdempotencyLedgerError("Cannot steer Codex without new user input.")
+        # 发出后即视为可能已接收；断线不能自动重建并重复注入。
+        self._steered_input = True
+        result = await self._rpc("turn/steer", {
+            "threadId": self.native_compaction.thread_id,
+            "expectedTurnId": self._turn_id,
+            "input": inputs,
+        })
+        if not self._turn_id or result.get("turnId") != self._turn_id:
+            self._unsafe_protocol_event = True
+            raise CodexIdempotencyLedgerError("Codex steer acknowledgement turn mismatch.")
 
     async def submit_tool_results(self, messages: list[dict[str, Any]]) -> None:
         if not self._pending_tools:
@@ -648,6 +700,33 @@ class _CodexAppServerTurn:
         )
         self._pending_tools.pop(call_id, None)
 
+    def _check_event_owner(self, method: Any, params: dict[str, Any]) -> None:
+        """先核验归属，再处理工具、流、用量、压缩或完成；未知归属安全停止。"""
+        if not isinstance(method, str) or not (
+            method.startswith(("item/", "turn/")) or method == "thread/tokenUsage/updated"
+        ):
+            return
+        expected_thread = self.native_compaction.thread_id
+        expected_turn = self._turn_id
+        actual_thread = params.get("threadId")
+        turn = params.get("turn")
+        actual_turn = params.get("turnId")
+        if actual_turn is None and isinstance(turn, dict):
+            actual_turn = turn.get("id")
+        if (
+            expected_thread is None or expected_turn is None
+            or actual_thread != expected_thread or actual_turn != expected_turn
+            or (isinstance(turn, dict) and turn.get("id") != expected_turn)
+        ):
+            self._unsafe_protocol_event = True
+            raise CodexAppServerError(
+                "Codex event ownership mismatch: "
+                f"method={method} expected_thread={expected_thread} actual_thread={actual_thread} "
+                f"expected_turn={expected_turn} actual_turn={actual_turn}.",
+                code="event_owner_mismatch",
+                retryable=False,
+            )
+
     async def next_response(
         self,
         *,
@@ -663,6 +742,7 @@ class _CodexAppServerTurn:
             method = message.get("method")
             raw_params = message.get("params")
             params = raw_params if isinstance(raw_params, dict) else {}
+            self._check_event_owner(method, params)
             if method == "item/agentMessage/delta":
                 delta = params.get("delta")
                 if isinstance(delta, str) and delta:
@@ -736,6 +816,9 @@ class _CodexAppServerTurn:
                         provider_diagnostics=diagnostics,
                     )
                 if item_type in _NATIVE_TOOL_ITEM_TYPES:
+                    # 协作通知不是执行前审批：子线程可能已经启动，禁止纠偏重放。
+                    if item_type == "collabAgentToolCall":
+                        self._unsafe_protocol_event = True
                     raise CodexAppServerError(
                         f"Codex app-server attempted a native tool outside nanobot: {item_type}.",
                         code="native_tool_blocked",
@@ -1108,6 +1191,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                 model or self.default_model, reasoning_effort, tools, tool_choice, native_budget,
             )
             context_rebased = False
+            checkpoint_continuation = False
             context_sync = "append" if self._turns.get(key) is not None else "start"
             while True:
                 bridge = self._turns.get(key)
@@ -1123,16 +1207,28 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                             raise CodexIdempotencyLedgerError(
                                 "Cannot rebase Codex context without checkpointed pending results."
                             )
-                        if bridge._native_file_changes or bridge._native_command_executions:
-                            raise CodexIdempotencyLedgerError(
-                                "Cannot safely rebase Codex context after native side effects; "
-                                "native operations are not covered by the dynamic-tool ledger."
+                        if bridge.context_checkpoint.can_append(active_messages, context_settings):
+                            # 前缀与配置稳定时只注入新增消息，不重建并重新计量全量历史。
+                            suffix = active_messages[len(bridge.context_checkpoint.messages):]
+                            # 先核验全部新增输入预算，再发送 steer；结果尚未提交，不触发重复执行。
+                            check_native_payload(
+                                self, model or self.default_model, suffix, [],
+                                max(1, native_budget // 5) if native_budget > 0 else 0,
                             )
-                        await self._finish_turn(key, bridge, drop_lock=False)
-                        bridge = None
-                        recovering = strict_recovery = True
-                        native_image_recovery = False
-                        context_rebased = True
+                            await bridge.steer(suffix)
+                            context_sync = "steered"
+                        else:
+                            if bridge._native_file_changes or bridge._native_command_executions:
+                                raise CodexIdempotencyLedgerError(
+                                    "Cannot safely rebase Codex context after native side effects; "
+                                    "native operations are not covered by the dynamic-tool ledger."
+                                )
+                            await self._finish_turn(key, bridge, drop_lock=False)
+                            bridge = None
+                            recovering = strict_recovery = True
+                            native_image_recovery = False
+                            context_rebased = True
+                            checkpoint_continuation = True
                     if bridge is None:
                         check_native_payload(
                             self, model or self.default_model, active_messages, tools, native_budget,
@@ -1147,6 +1243,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                             event_timeout_s=self._event_timeout_s,
                         )
                         bridge.native_compaction.budget = native_budget
+                        bridge.checkpoint_continuation = checkpoint_continuation
                         self._turns[key] = bridge
                         if strict_recovery:
                             ledger.begin_recovery()
@@ -1193,6 +1290,8 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     )
                     if context_rebased:
                         diagnostics["context_rebased"] = True
+                    if bridge.checkpoint_continuation:
+                        diagnostics["checkpoint_continuation"] = True
                     if recovery_attempts:
                         diagnostics["bridge_recovery_attempts"] = recovery_attempts
                     if command_refresh_attempts:
@@ -1219,8 +1318,10 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     submitted = bridge is not None and bridge.submitted_tool_results
                     streamed = bridge is not None and bridge.streamed_output
                     stderr_tail = bridge.stderr_tail if bridge is not None else None
-                    native_unsafe = bridge is not None and bridge.native_compaction.budget > 0 and (
-                        bridge.native_compaction.in_progress
+                    native_unsafe = bridge is not None and (
+                        bridge._unsafe_protocol_event
+                        or bridge._steered_input
+                        or bridge.native_compaction.in_progress
                         or bool(bridge._native_file_changes or bridge._native_command_executions)
                     )
                     if bridge is not None:
@@ -1252,6 +1353,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     )
                     if can_correct_native_tool:
                         native_tool_corrections += 1
+                        checkpoint_continuation = False
                         recovering = False
                         strict_recovery = False
                         native_image_recovery = False
@@ -1284,6 +1386,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     )
                     if can_recover:
                         recovery_attempts += 1
+                        checkpoint_continuation = False
                         recovering = True
                         strict_recovery = True
                         native_image_recovery = False
@@ -1311,9 +1414,11 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                         ),
                         stderr_tail=stderr_tail,
                     )
-                    if bridge is not None and native_budget > 0:
-                        response.provider_diagnostics.update(bridge.native_compaction.diagnostics())
+                    if bridge is not None:
+                        if native_budget > 0:
+                            response.provider_diagnostics.update(bridge.native_compaction.diagnostics())
                         response.provider_diagnostics["native_recovery_suppressed"] = native_unsafe
+                        response.provider_diagnostics["unsafe_protocol_event"] = bridge._unsafe_protocol_event
                     return response
 
     async def _next_response_with_replay(
@@ -1363,7 +1468,9 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                     "Unexpected batched tool calls during Codex bridge recovery."
                 )
             call = response.tool_calls[0]
-            cached = ledger.cached_result(call)
+            cached = ledger.cached_result(
+                call, checkpoint_continuation=bridge.checkpoint_continuation,
+            )
             if cached is None:
                 response.usage = _sum_usage(replay_usage, response.usage)
                 if on_tool_call_delta is not None:
@@ -1478,6 +1585,8 @@ def _resolve_codex_app_server_command() -> list[str]:
         [
             "-c",
             'web_search="disabled"',
+            "-c",
+            "agents.enabled=false",
             "-c",
             "mcp_servers={}",
             "-c",

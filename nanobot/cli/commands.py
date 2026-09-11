@@ -2374,6 +2374,7 @@ def agent(
         # Interactive mode — split-pane TUI (output pane + persistent input line)
         from nanobot.bus.events import InboundMessage
         from nanobot.config.paths import get_cli_history_path
+        from nanobot.fork.agent.input_evidence import ReceivedInput, capture_input
         from nanobot.fork.cli.tui_factory import create_tui
 
         if ":" in session_id:
@@ -2521,7 +2522,7 @@ def agent(
 
             bus_task = asyncio.create_task(agent_loop.run())
             is_processing = False
-            pending_queue: list[str] = []
+            pending_queue: list[tuple[str, ReceivedInput]] = []
             _pre_submitted: list[bool] = [False]
             _pending_transcript_ids: dict[str, str] = {}
             _turn_cancelled: list[bool] = [False]
@@ -2585,7 +2586,13 @@ def agent(
                     tui.stream_start()
                     _pre_submitted[0] = True
 
-            async def _send_message(text: str) -> None:
+            def _capture_submission(text: str) -> ReceivedInput:
+                return capture_input(InboundMessage(
+                    channel=cli_channel, sender_id="user",
+                    chat_id=topic_state["chat_id"], content=text,
+                ), "cli_interactive")
+
+            async def _send_message(text: str, original_input: ReceivedInput | None = None) -> None:
                 nonlocal is_processing
                 _turn_cancelled[0] = False
                 request_id = uuid.uuid4().hex
@@ -2623,7 +2630,7 @@ def agent(
                 # bus receives the message and the LLM starts responding.
                 await asyncio.sleep(0.015)
                 _set_activity_phase("agent_processing")
-                await bus.publish_inbound(InboundMessage(
+                await bus.publish_inbound(capture_input(InboundMessage(
                     channel=cli_channel,
                     sender_id="user",
                     chat_id=topic_state["chat_id"],
@@ -2634,7 +2641,7 @@ def agent(
                         "_assistant_transcript_id": _pending_transcript_ids.get("assistant"),
                         "_turn_request_id": request_id,
                     },
-                ))
+                ), original=original_input))
 
             async def _turn_complete() -> None:
                 nonlocal is_processing
@@ -2663,7 +2670,7 @@ def agent(
                 except Exception:
                     pass
                 if pending_queue:
-                    await _send_message(pending_queue.pop(0))
+                    await _send_message(*pending_queue.pop(0))
 
             async def _switch_topic(session_key: str) -> None:
                 """Switch to a persisted session key, keeping its display name separate."""
@@ -2857,7 +2864,9 @@ def agent(
                         tui.add_system("当前还在处理消息，请稍后再 /continue。")
                         return
                     await asyncio.sleep(0)
-                    await _send_message("请继续上次中断的任务。")
+                    await _send_message(
+                        "请继续上次中断的任务。", original_input=_capture_submission(user_input),
+                    )
                     return
 
                 if text == "/commit_memory" or text.startswith("/commit_memory "):
@@ -2958,13 +2967,14 @@ def agent(
                 # ─────────────────────────────────────────────────────────────
 
                 # 在提交时冻结附件，而非等排队发送时再取，避免下一条问题混入新选区。
+                original_input = _capture_submission(user_input)
                 user_input = ide.pending.consume(user_input)
                 if is_processing:
-                    pending_queue.append(user_input)
+                    pending_queue.append((user_input, original_input))
                     tui.add_system("Message queued — will send when nanobot finishes.")
                 else:
                     await asyncio.sleep(0)
-                    await _send_message(user_input)
+                    await _send_message(user_input, original_input=original_input)
 
             tui.set_on_submit(_on_submit)
             tui.set_on_pre_submit(_pre_submit)

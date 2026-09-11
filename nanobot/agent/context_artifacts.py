@@ -8,6 +8,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from nanobot.fork.agent.recovery_packet import (
+    ACTIVE_STATES,
+    RecoveryPacketError,
+    critical_list,
+    critical_text,
+    render_recovery_context,
+    retain_decisions,
+)
 from nanobot.session.goal_state import goal_state_raw, parse_goal_state
 
 CONTEXT_STATE_KEY = "_context_state"
@@ -73,6 +81,9 @@ class EvidenceRef:
     locator: str
     sha256: str
     trust: str = "runtime"
+    read_scope: dict[str, Any] = field(default_factory=dict)
+    source_snapshot: dict[str, Any] = field(default_factory=dict)
+    input_source: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -87,20 +98,25 @@ class ToolDigest:
     result_sha256: str
     original_chars: int
     truncated: bool = False
+    artifact_locator: str | None = None
 
     def prompt_text(self, *, hard: bool = False) -> str:
         evidence = ", ".join(self.evidence_ids) or "none"
+        snapshot = (
+            f"\nsnapshot: {self.artifact_locator} (historical output; re-read source for freshness)"
+            if self.artifact_locator else ""
+        )
         if hard:
             return (
                 f"[ToolDigest {self.digest_id} status={self.status}; "
-                f"evidence={evidence}; raw result compacted.]"
+                f"evidence={evidence}; raw result compacted.]{snapshot}"
             )
         target = f"\ntarget: {self.target}" if self.target else ""
         return (
             f"[ToolDigest {self.digest_id} tool={self.tool_name} status={self.status}]"
             f"\noperation: {self.operation}{target}\n"
             f"evidence: {evidence}\n"
-            f"raw: {self.original_chars} chars, sha256={self.result_sha256[:16]}"
+            f"raw: {self.original_chars} chars, sha256={self.result_sha256[:16]}{snapshot}"
         )
 
 
@@ -131,9 +147,18 @@ class ContextState:
         for item in raw.get("decisions", []) if isinstance(raw.get("decisions"), list) else []:
             if not isinstance(item, dict):
                 continue
-            statement = _clean_text(item.get("statement"), 1000)
-            decision_id = _clean_text(item.get("decision_id"), 120)
+            active = item.get("state") in ACTIVE_STATES
+            statement = (
+                critical_text(item.get("statement")) if active
+                else _clean_text(item.get("statement"), 1000)
+            )
+            decision_id = (
+                critical_text(item.get("decision_id"), 120) if active
+                else _clean_text(item.get("decision_id"), 120)
+            )
             if not statement or not decision_id:
+                if active:
+                    raise RecoveryPacketError("活跃约束缺少内容或标识，拒绝静默丢弃。")
                 continue
             decisions.append(DecisionEntry(
                 decision_id=decision_id,
@@ -141,7 +166,9 @@ class ContextState:
                 statement=statement,
                 source=_clean_text(item.get("source"), 40) or "assistant",
                 confidence=_clean_text(item.get("confidence"), 40) or "inferred",
-                evidence_ids=_clean_list(item.get("evidence_ids"), item_limit=120, max_items=20),
+                evidence_ids=critical_list(item.get("evidence_ids")) if active else _clean_list(
+                    item.get("evidence_ids"), item_limit=120, max_items=20
+                ),
             ))
         digests: dict[str, ToolDigest] = {}
         raw_digests = raw.get("tool_digests")
@@ -169,6 +196,7 @@ class ContextState:
                         else 0
                     ),
                     truncated=bool(item.get("truncated", False)),
+                    artifact_locator=critical_text(item.get("artifact_locator")) or None,
                 )
         evidence: dict[str, EvidenceRef] = {}
         raw_evidence = raw.get("evidence")
@@ -183,9 +211,12 @@ class ContextState:
                     evidence_id=evidence_id,
                     tool_call_id=_clean_text(item.get("tool_call_id"), 200),
                     kind=_clean_text(item.get("kind"), 80) or "tool_result",
-                    locator=_clean_text(item.get("locator"), 1000),
+                    locator=critical_text(item.get("locator")),
                     sha256=_clean_text(item.get("sha256"), 128),
                     trust=_clean_text(item.get("trust"), 80) or "runtime",
+                    read_scope=dict(item["read_scope"]) if isinstance(item.get("read_scope"), dict) else {},
+                    source_snapshot=dict(item["source_snapshot"]) if isinstance(item.get("source_snapshot"), dict) else {},
+                    input_source=dict(item["input_source"]) if isinstance(item.get("input_source"), dict) else {},
                 )
         completions = []
         for item in raw.get("completion_stubs", []) if isinstance(raw.get("completion_stubs"), list) else []:
@@ -203,13 +234,20 @@ class ContextState:
             ))
         return cls(
             revision=int(raw.get("revision", 0)) if isinstance(raw.get("revision", 0), int) else 0,
-            decisions=decisions[-_MAX_DECISIONS:],
+            decisions=retain_decisions(decisions, _MAX_DECISIONS),
             tool_digests=digests,
             evidence=evidence,
             completion_stubs=completions[-_MAX_COMPLETIONS:],
         )
 
     def to_metadata(self) -> dict[str, Any]:
+        referenced = {
+            evidence_id for item in self.decisions if item.state in ACTIVE_STATES
+            for evidence_id in item.evidence_ids
+        } | {
+            evidence_id for item in self.tool_digests.values() for evidence_id in item.evidence_ids
+        }
+        recent_evidence = set(list(self.evidence)[-_MAX_EVIDENCE:])
         return {
             "schema_version": self.schema_version,
             "revision": self.revision,
@@ -222,13 +260,14 @@ class ContextState:
                     "confidence": item.confidence,
                     "evidence_ids": item.evidence_ids,
                 }
-                for item in self.decisions[-_MAX_DECISIONS:]
+                for item in retain_decisions(self.decisions, _MAX_DECISIONS)
             ],
             "tool_digests": {
                 key: asdict(value) for key, value in list(self.tool_digests.items())[-_MAX_DIGESTS:]
             },
             "evidence": {
-                key: asdict(value) for key, value in list(self.evidence.items())[-_MAX_EVIDENCE:]
+                key: asdict(value) for key, value in self.evidence.items()
+                if key in referenced or key in recent_evidence or value.kind == "input_snapshot"
             },
             "completion_stubs": [asdict(item) for item in self.completion_stubs[-_MAX_COMPLETIONS:]],
         }
@@ -326,9 +365,9 @@ def task_contract_from_metadata(
     goal = parse_goal_state(goal_state_raw(metadata))
     if not isinstance(goal, dict) or goal.get("status") != "active":
         return None
-    objective = _clean_text(goal.get("objective"), 4000)
+    objective = critical_text(goal.get("objective"))
     if not objective:
-        return None
+        raise RecoveryPacketError("活跃任务缺少目标，不能按无任务状态继续。")
     started = _clean_text(goal.get("started_at"), 80) or hashlib.sha256(
         objective.encode("utf-8")
     ).hexdigest()[:16]
@@ -336,6 +375,8 @@ def task_contract_from_metadata(
         task_id=f"goal:{started}",
         status="waiting_user" if goal.get("awaiting_user_input") else "active",
         objective=objective,
+        constraints=critical_list(goal.get("constraints")),
+        acceptance_criteria=critical_list(goal.get("acceptance_criteria")),
         workspace_scope=str(workspace) if workspace else None,
     )
 
@@ -347,71 +388,14 @@ def render_active_context(
     legacy_summary: str | None = None,
     todos: list[dict[str, Any]] | None = None,
     resume_request: bool = False,
+    source_verifier: Any = None,
+    input_verifier: Any = None,
 ) -> str:
-    contract = task_contract_from_metadata(metadata, workspace=workspace)
-    state = ContextState.from_metadata(metadata)
-    active_decisions = [
-        item for item in state.decisions
-        if item.state in {"accepted", "active", "blocked", "waiting_user"}
-    ][-_MAX_DECISIONS:]
-    summary = _clean_text(legacy_summary, 5000)
-    unresolved_todos = [
-        item for item in (todos or [])
-        if isinstance(item, dict) and item.get("status") in {"pending", "in_progress"}
-    ]
-    completed_goal = parse_goal_state(goal_state_raw(metadata)) if resume_request else None
-    if not isinstance(completed_goal, dict) or completed_goal.get("status") != "completed":
-        completed_goal = None
-    if (
-        contract is None
-        and not active_decisions
-        and not summary
-        and not resume_request
-    ):
-        return ""
-    lines = [_ACTIVE_CONTEXT_OPEN, f"schema: {_SCHEMA_VERSION}"]
-    if workspace:
-        lines.append(f"environment.workspace: {_clean_text(workspace, 1000)}")
-    if contract:
-        lines.extend([
-            f"task.id: {contract.task_id}",
-            f"task.status: {contract.status}",
-            "task.objective:",
-            contract.objective,
-        ])
-    if active_decisions:
-        lines.append("active_decisions:")
-        lines.extend(
-            f"- {item.decision_id}: {item.statement} "
-            f"(source={item.source}, confidence={item.confidence})"
-            for item in active_decisions
-        )
-    if resume_request:
-        lines.append("resume.request: ambiguous")
-        if completed_goal:
-            lines.append("resume.last_goal.status: completed")
-            objective = _clean_text(completed_goal.get("objective"), 2000)
-            recap = _clean_text(completed_goal.get("recap"), 2000)
-            if objective:
-                lines.extend(["resume.last_goal.objective:", objective])
-            if recap:
-                lines.extend(["resume.last_goal.recap:", recap])
-        if unresolved_todos:
-            lines.append("resume.unresolved_todos:")
-            lines.extend(
-                f"- [{item.get('status')}] {_clean_text(item.get('content'), 500)}"
-                for item in unresolved_todos
-            )
-        if contract is None:
-            lines.append(
-                "resume.guard: no active sustained goal; use only the structured unresolved "
-                "items above, otherwise ask the user to choose; do not infer a new objective "
-                "from prose history or search failure."
-            )
-    if summary:
-        lines.extend(["legacy_continuation:", summary])
-    lines.append(_ACTIVE_CONTEXT_CLOSE)
-    return "\n".join(lines)
+    return render_recovery_context(
+        metadata, workspace=workspace, legacy_summary=legacy_summary,
+        todos=todos, resume_request=resume_request, source_verifier=source_verifier,
+        input_verifier=input_verifier,
+    )
 
 
 class ToolDigestBuilder:
@@ -432,6 +416,8 @@ class ToolDigestBuilder:
         status: str = "ok",
         artifact_locator: str | None = None,
     ) -> tuple[ToolDigest, EvidenceRef]:
+        from nanobot.fork.agent.source_evidence import source_from_result
+
         text = result if isinstance(result, str) else json.dumps(
             result, ensure_ascii=False, sort_keys=True, default=str
         )
@@ -446,9 +432,15 @@ class ToolDigestBuilder:
         evidence = EvidenceRef(
             evidence_id=evidence_id,
             tool_call_id=tool_call_id,
-            kind="tool_result",
-            locator=_clean_text(locator, 1000),
+            kind="file_read_snapshot" if tool_name == "read_file" else "tool_result",
+            locator=critical_text(locator),
             sha256=result_hash,
+            trust="tool_output",
+            source_snapshot=source_from_result(result) if tool_name == "read_file" else {},
+            read_scope={
+                "basis": "requested_arguments", "coverage": "returned_content_only",
+                **{key: args[key] for key in ("path", "offset", "limit", "pages") if key in args},
+            } if tool_name == "read_file" else {},
         )
         digest = ToolDigest(
             digest_id=digest_id,
@@ -460,5 +452,6 @@ class ToolDigestBuilder:
             evidence_ids=[evidence_id],
             result_sha256=result_hash,
             original_chars=len(text),
+            artifact_locator=critical_text(artifact_locator) or None,
         )
         return digest, evidence

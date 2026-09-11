@@ -72,6 +72,7 @@ class MyTool(Tool, ContextAware):
     })
 
     READ_ONLY = frozenset({
+        "tool_names",  # 只暴露名称，不暴露可操作的工具注册表
         "subagents",  # observable but replacing it would break the system
         "_current_iteration",  # updated by runner only
         "exec_config",  # inspect allowed (e.g. check sandbox), modify blocked
@@ -145,6 +146,9 @@ class MyTool(Tool, ContextAware):
             "Key values: _current_iteration (current progress), "
             "max_iterations - _current_iteration = remaining iterations.\n"
             "Note: web_config and exec_config are readable but read-only.\n"
+            "To list available tools, check tool_names (read-only); tools is not accessible.\n"
+            "Subagent runtime key: subagents (plural, read-only). "
+            "For task status, prefer subagent_control(action='list' or 'status').\n"
             "\n"
             "When to use:\n"
             "- User asks about your model, settings, or token usage → check that key.\n"
@@ -341,6 +345,11 @@ class MyTool(Tool, ContextAware):
         top = key.split(".")[0]
         if top in self._DENIED_ATTRS or top.startswith("__"):
             return ToolResult.error(f"Error: '{top}' is not accessible")
+        hint = " Use my(action='check') without key to see available runtime keys."
+        if top == "tools":
+            hint += " Use my(action='check', key='tool_names') to list available tool names."
+        if top == "subagent":
+            hint += " The runtime key is 'subagents'; prefer subagent_control(action='list') for task status."
         obj, err = self._resolve_path(key)
         if err:
             # "scratchpad" alias for _runtime_vars
@@ -350,12 +359,12 @@ class MyTool(Tool, ContextAware):
             # Fallback: check _runtime_vars for simple keys stored by modify
             if "." not in key and key in self._runtime_state._runtime_vars:
                 return self._format_value(self._runtime_state._runtime_vars[key], key)
-            return ToolResult.error(f"Error: {err}")
+            return ToolResult.error(f"Error: {err}{hint}")
         # Guard against mock auto-generated attributes
         if "." not in key and not _has_real_attr(self._runtime_state, key):
             if key in self._runtime_state._runtime_vars:
                 return self._format_value(self._runtime_state._runtime_vars[key], key)
-            return ToolResult.error(f"Error: '{key}' not found")
+            return ToolResult.error(f"Error: '{key}' not found.{hint}")
         return self._format_value(obj, key)
 
     def _inspect_all(self) -> str:
@@ -366,7 +375,7 @@ class MyTool(Tool, ContextAware):
             parts.append(self._format_value(getattr(state, k, None), k))
         parts.append(self._format_value(state.model_preset, "model_preset"))
         # Other useful top-level keys shown in description
-        for k in ("workspace", "provider_retry_mode", "max_tool_result_chars", "_current_iteration", "web_config", "exec_config", "workspace_sandbox", "subagents"):
+        for k in ("tool_names", "workspace", "provider_retry_mode", "max_tool_result_chars", "_current_iteration", "web_config", "exec_config", "workspace_sandbox", "subagents"):
             if _has_real_attr(state, k):
                 parts.append(self._format_value(getattr(state, k, None), k))
         # Token usage

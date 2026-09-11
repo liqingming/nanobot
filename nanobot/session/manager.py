@@ -175,6 +175,7 @@ class Session:
         *,
         max_tokens: int = 0,
         extend_to_user: bool = False,
+        preserve_unconsolidated: bool = False,
     ) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input.
 
@@ -188,12 +189,15 @@ class Session:
             max_messages,
             extend_to_user=extend_to_user,
         )
+        if preserve_unconsolidated:
+            start_idx = 0
+            max_tokens = 0
         sliced = unconsolidated[start_idx:]
 
         # Avoid starting mid-turn when possible, except for proactive
         # assistant deliveries that the user may be replying to.
         for i, message in enumerate(sliced):
-            if message.get("role") == "user":
+            if message.get("role") == "user" and not preserve_unconsolidated:
                 start = i
                 if i > 0 and sliced[i - 1].get("_channel_delivery"):
                     start = i - 1
@@ -202,7 +206,7 @@ class Session:
 
         # Drop orphan tool results at the front.
         start = find_legal_message_start(sliced)
-        if start:
+        if start and not preserve_unconsolidated:
             sliced = sliced[start:]
 
         out: list[dict[str, Any]] = []

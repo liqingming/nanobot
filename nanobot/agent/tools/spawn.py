@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.schema import NumberSchema, StringSchema, tool_parameters_schema
+from nanobot.fork.agent.subagent_control import SubagentControlTool  # noqa: F401
 from nanobot.security.workspace_access import current_workspace_scope
 
 if TYPE_CHECKING:
@@ -96,7 +97,12 @@ class SpawnTool(Tool, ContextAware):
             "expected deliverable, and acceptance criteria are explicit in the task text. "
             "Do not spawn for ambiguous work or when the next step depends on evidence not "
             "gathered yet; keep that work in the main agent. "
-            "The subagent will complete the task and report back when done. "
+            "Each task starts fresh with its own system prompt and task, without parent "
+            "conversation history, and reports back when done. Bind only the returned "
+            "task id after creation; use subagent_control to list/status/wait/cancel and "
+            "confirm termination. After binding and independent work, use subagent_control wait "
+            "to let the host await the receipt; do not poll unchanged plans or wait in model thinking. "
+            "Never substitute native Codex collaboration tools. "
             "For deliverables or existing projects, inspect the workspace first "
             "and use a dedicated subdirectory when helpful."
         )

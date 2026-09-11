@@ -15,7 +15,17 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from loguru import logger
 
-from nanobot.providers.base import provider_input_token_budget
+from nanobot.fork.agent.context_budget import resolve_context_budget
+from nanobot.fork.agent.native_context import uses_native_context
+from nanobot.fork.agent.summary_diagnostics import SummaryValidationError, record_summary_failure
+from nanobot.fork.agent.summary_transaction import (
+    SUMMARY_MAX_CHARS,
+    SummarySnapshot,
+    SummaryTransactionError,
+    commit_summary,
+    valid_summary,
+)
+from nanobot.fork.agent.transactional_context import request_summary
 from nanobot.session.manager import Session
 from nanobot.utils.atomic_write import replace_file_with_retry
 from nanobot.utils.gitstore import GitStore
@@ -27,7 +37,6 @@ from nanobot.utils.helpers import (
     recent_message_start_index,
     strip_think,
     truncate_text,
-    truncate_text_to_tokens,
 )
 from nanobot.utils.prompt_templates import render_template
 
@@ -784,7 +793,7 @@ class MemoryStore:
 # that catches any new caller that forgot to set its own cap.
 _RAW_ARCHIVE_MAX_CHARS = 16_000       # fallback dump (LLM failed)
 _ARCHIVE_SUMMARY_MAX_CHARS = 8_000    # LLM-produced long-term candidates
-_CONTINUATION_SUMMARY_MAX_CHARS = 8_000
+_CONTINUATION_SUMMARY_MAX_CHARS = SUMMARY_MAX_CHARS
 _CONTINUATION_OPEN = "<continuation>"
 _CONTINUATION_CLOSE = "</continuation>"
 _CANDIDATES_OPEN = "<memory-candidates>"
@@ -813,12 +822,14 @@ class Consolidator:
         consolidation_ratio: float = 0.5,
         consolidation_trigger_ratio: float = 0.7,
         unified_session: bool = False,
+        context_block_limit: int | None = None,
     ):
         self.store = store
         self.provider = provider
         self.model = model
         self.sessions = sessions
         self.context_window_tokens = context_window_tokens
+        self.context_block_limit = context_block_limit
         self.max_completion_tokens = max_completion_tokens
         self.consolidation_ratio = consolidation_ratio
         self.consolidation_trigger_ratio = max(consolidation_ratio, consolidation_trigger_ratio)
@@ -843,6 +854,7 @@ class Consolidator:
         self.model = model
         self.context_window_tokens = context_window_tokens
         self.max_completion_tokens = provider.generation.max_tokens
+        self._background_probe_cache.clear()
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
@@ -935,13 +947,18 @@ class Consolidator:
             len(chunk),
             replay_max_messages,
         )
+        snapshot = SummarySnapshot.capture(session)
         summary = await self.archive(
             chunk,
             session_key=session.key,
-            prior_continuation=self._summary_text(session.metadata),
+            prior_continuation=self._summary_text(snapshot.metadata),
         )
-        session.last_consolidated = end_idx
-        self.sessions.save(session)
+        if not valid_summary(summary):
+            return None
+        commit_summary(
+            self.sessions, session, snapshot, summary, covered_messages=chunk,
+            end_cursor=end_idx, reason="replay_overflow",
+        )
         return summary
 
     @staticmethod
@@ -953,18 +970,6 @@ class Consolidator:
             if isinstance(text, str) and text.strip():
                 return text.strip()
         return None
-
-    def _persist_last_summary(self, session: Session, summary: str | None) -> None:
-        if isinstance(summary, str) and summary and summary != "(nothing)":
-            entry = {
-                "text": truncate_text(summary, _CONTINUATION_SUMMARY_MAX_CHARS),
-                "last_active": session.updated_at.isoformat(),
-            }
-            session.metadata["_continuation_summary"] = entry
-            # Compatibility mirror for existing sessions and third-party
-            # consumers; prompt construction always prefers the new key.
-            session.metadata["_last_summary"] = entry
-            self.sessions.save(session)
 
     def estimate_session_prompt_tokens(
         self,
@@ -996,19 +1001,10 @@ class Consolidator:
     @property
     def _input_token_budget(self) -> int:
         """Available input token budget for consolidation LLM."""
-        return provider_input_token_budget(
-            self.provider,
-            self.context_window_tokens,
-            self.max_completion_tokens,
-            self._SAFETY_BUFFER,
-        )
-
-    def _truncate_to_token_budget(self, text: str) -> str:
-        """Truncate text so it fits within the consolidation LLM's token budget."""
-        budget = self._input_token_budget
-        if budget <= 0:
-            return truncate_text(text, _RAW_ARCHIVE_MAX_CHARS)
-        return truncate_text_to_tokens(text, budget)
+        return resolve_context_budget(
+            self.provider, self.context_window_tokens, self.max_completion_tokens,
+            self.context_block_limit, self._SAFETY_BUFFER,
+        ).input_tokens or 0
 
     @staticmethod
     def _extract_section(text: str, opening: str, closing: str) -> str:
@@ -1040,35 +1036,45 @@ class Consolidator:
         if not messages:
             return None
         messages_to_summarize = summary_messages if summary_messages is not None else messages
+        stage = "prepare"
+        estimated = budget = response = summary_chars = None
         try:
             formatted = MemoryStore._format_messages(messages_to_summarize)
             if prior_continuation:
                 formatted = (
                     "<existing-continuation>\n"
-                    f"{truncate_text(prior_continuation, _CONTINUATION_SUMMARY_MAX_CHARS)}\n"
+                    f"{prior_continuation}\n"
                     "</existing-continuation>\n\n"
                     "<archived-messages>\n"
                     f"{formatted}\n"
                     "</archived-messages>"
                 )
-            formatted = self._truncate_to_token_budget(formatted)
-            response = await self.provider.chat_with_retry(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": render_template(
-                            "agent/consolidator_archive.md",
-                            strip=True,
-                        ),
-                    },
-                    {"role": "user", "content": formatted},
-                ],
-                tools=None,
-                tool_choice=None,
+            request = [
+                {"role": "system", "content": render_template(
+                    "agent/consolidator_archive.md", strip=True,
+                )},
+                {"role": "user", "content": formatted},
+            ]
+            stage = "input_budget"
+            estimated, _ = estimate_prompt_tokens_chain(self.provider, self.model, request, None)
+            budget = self._input_token_budget
+            # 覆盖事务不能用截断后的输入代表完整原文；连系统指令也计入预算。
+            if not 0 < estimated <= budget:
+                raise SummaryValidationError(
+                    "input_budget_exceeded", "完整摘要输入无法容纳，保留原文等待更小的安全分段。",
+                )
+            stage = "request"
+            response = await request_summary(
+                self.provider, model=self.model, messages=request,
+                max_tokens=self.max_completion_tokens,
             )
-            if response.finish_reason == "error":
-                raise RuntimeError(f"LLM returned error: {response.content}")
+            stage = "response_validation"
+            if response.finish_reason not in ("stop", "end_turn") or (
+                isinstance(response.tool_calls, list) and response.tool_calls
+            ):
+                # 工具输出不执行，也不能当成有效摘要。
+                raise SummaryValidationError("response_incomplete", "摘要请求未完整完成。")
+            stage = "summary_validation"
             response_text = response.content or ""
             continuation = self._extract_section(
                 response_text, _CONTINUATION_OPEN, _CONTINUATION_CLOSE
@@ -1079,7 +1085,18 @@ class Consolidator:
             # Accept old summarizers during a rolling upgrade, but never inject
             # their unstructured output into the long-term history candidate stream.
             if not continuation and response_text.strip():
+                # 仅对完全非结构化旧输出兼容；残缺标签不能冒充续接摘要。
+                if any(tag in response_text for tag in (
+                    _CONTINUATION_OPEN, _CONTINUATION_CLOSE, _CANDIDATES_OPEN, _CANDIDATES_CLOSE,
+                )):
+                    raise SummaryValidationError("continuation_missing", "摘要缺少完整续接部分。")
                 continuation = response_text.strip()
+            summary_chars = len(continuation)
+            if not valid_summary(continuation):
+                raise SummaryValidationError(
+                    "summary_invalid", "摘要为空、无恢复内容或超出恢复预算。",
+                )
+            stage = "candidate_archive"
             if candidates and candidates != "(nothing)":
                 self.store.append_history(
                     candidates,
@@ -1096,10 +1113,22 @@ class Consolidator:
                     max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
                     session_key=session_key,
                 )
-            return continuation or "(nothing)"
-        except Exception:
-            logger.warning("Consolidation LLM call failed, raw-dumping to history")
-            self.store.raw_archive(messages, session_key=session_key)
+            return continuation
+        except Exception as exc:
+            record_summary_failure(
+                self.sessions, session_key=session_key, provider=self.provider, model=self.model,
+                stage=stage, error=exc, estimated_tokens=estimated, input_budget=budget,
+                response=response, summary_chars=summary_chars,
+            )
+            try:
+                self.store.raw_archive(messages, session_key=session_key)
+            except Exception as archive_exc:
+                record_summary_failure(
+                    self.sessions, session_key=session_key, provider=self.provider, model=self.model,
+                    stage="raw_archive", error=archive_exc, estimated_tokens=estimated,
+                    input_budget=budget,
+                )
+                raise
             return None
 
     def _background_probe_upper_bound(self, session: Session, budget: int) -> int | None:
@@ -1133,12 +1162,14 @@ class Consolidator:
         background: bool = False,
         completed_goal: bool = False,
     ) -> None:
-        """Loop: archive old messages until prompt fits within safe budget.
+        """Archive old messages; stop explicitly when a required summary cannot commit.
 
         The budget reserves space for completion tokens and a safety buffer
         so the LLM request never exceeds the context window.
         """
-        if self.context_window_tokens <= 0:
+        # 原生线程自行压缩历史，且没有隔离的无工具摘要协议。
+        # 前台、后台和消息数溢出均保留原文，不进入普通摘要事务。
+        if uses_native_context(self.provider) or self.context_window_tokens <= 0:
             return
 
         lock = self.get_lock(session.key)
@@ -1151,12 +1182,20 @@ class Consolidator:
                 return
 
             budget = self._input_token_budget
+            if budget <= 0:
+                # 没有空间时不归档；实际请求由 runner 的预算门禁明确停止。
+                return
             target = int(budget * self.consolidation_ratio)
             trigger = int(budget * self.consolidation_trigger_ratio)
+            replay_boundary = self._replay_overflow_boundary(session, replay_max_messages)
             last_summary = await self._consolidate_replay_overflow(
-                session,
-                replay_max_messages,
-            ) or self._summary_text(session.metadata)
+                session, replay_max_messages,
+            )
+            if replay_boundary is not None and not valid_summary(last_summary):
+                raise SummaryTransactionError(
+                    "上下文摘要失败，已保留原文；本次请求停止，未裁剪重试。"
+                )
+            last_summary = last_summary or self._summary_text(session.metadata)
             estimated: int | None = (
                 self._background_probe_upper_bound(session, budget) if background else None
             )
@@ -1187,7 +1226,6 @@ class Consolidator:
                 )
                 self._remember_exact_probe(session, estimated)
             if estimated <= 0:
-                self._persist_last_summary(session, last_summary)
                 return
             if estimated < trigger and not completed_goal:
                 unconsolidated_count = len(session.messages) - session.last_consolidated
@@ -1200,7 +1238,6 @@ class Consolidator:
                     source,
                     unconsolidated_count,
                 )
-                self._persist_last_summary(session, last_summary)
                 return
 
             for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
@@ -1234,23 +1271,22 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
+                snapshot = SummarySnapshot.capture(session)
                 summary = await self.archive(
                     chunk,
                     session_key=session.key,
                     prior_continuation=last_summary,
                 )
-                # Advance the cursor either way: on success the chunk was
-                # summarized; on failure archive() already raw-archived it as
-                # a breadcrumb. Re-archiving the same chunk on the next call
-                # would just emit duplicate [RAW] entries.
-                if summary:
-                    last_summary = summary
-                session.last_consolidated = end_idx
-                self.sessions.save(session)
-                if not summary:
-                    # LLM is degraded — stop hammering it this call;
-                    # the next invocation can retry a fresh chunk.
-                    break
+                if not valid_summary(summary):
+                    # 原文归档只是审计线索，不推进覆盖，也不在本轮反复重试。
+                    raise SummaryTransactionError(
+                        "上下文摘要失败，已保留原文；本次请求停止，未裁剪重试。"
+                    )
+                commit_summary(
+                    self.sessions, session, snapshot, summary, covered_messages=chunk,
+                    end_cursor=end_idx, reason="token_budget",
+                )
+                last_summary = summary
 
                 probe_started_at = asyncio.get_running_loop().time()
                 try:
@@ -1272,10 +1308,6 @@ class Consolidator:
                 if estimated <= 0:
                     break
 
-            # Persist the last summary to session metadata so it can be injected
-            # into the runtime context on the next prepare_session() call, aligning
-            # the summary injection strategy with AutoCompact._archive().
-            self._persist_last_summary(session, last_summary)
             if completed_goal:
                 session.metadata.pop("_completed_goal_needs_compaction", None)
                 self.sessions.save(session)
@@ -1292,6 +1324,8 @@ class Consolidator:
         if the LLM failed (raw_archive fallback), or ``""`` if there was
         nothing to archive.
         """
+        if uses_native_context(self.provider):
+            return None
         lock = self.get_lock(session_key)
         async with lock:
             self.sessions.invalidate(session_key)
@@ -1318,7 +1352,7 @@ class Consolidator:
                 self.sessions.save(session)
                 return ""
 
-            last_active = session.updated_at
+            snapshot = SummarySnapshot.capture(session)
             summary: str | None = ""
             if messages_to_remove:
                 # Summarize the retained suffix too, but only remove/raw-dump
@@ -1330,17 +1364,15 @@ class Consolidator:
                     prior_continuation=self._summary_text(session.metadata),
                 )
 
-            if isinstance(summary, str) and summary and summary != "(nothing)":
-                entry = {
-                    "text": truncate_text(summary, _CONTINUATION_SUMMARY_MAX_CHARS),
-                    "last_active": last_active.isoformat(),
-                }
-                session.metadata["_continuation_summary"] = entry
-                session.metadata["_last_summary"] = entry
-
-            session.messages = messages_to_keep
-            session.last_consolidated = 0
-            self.sessions.save(session)
+            if not messages_to_remove:
+                return ""
+            if not valid_summary(summary):
+                return None
+            commit_summary(
+                self.sessions, session, snapshot, summary,
+                covered_messages=messages_to_remove, end_cursor=len(snapshot.messages),
+                retained_messages=messages_to_keep, reason="idle",
+            )
 
             if messages_to_remove:
                 logger.info(

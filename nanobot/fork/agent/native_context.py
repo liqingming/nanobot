@@ -11,9 +11,9 @@ from typing import Any
 
 from nanobot.agent.context_artifacts import ToolDigest
 from nanobot.agent.context_governance import ContextGovernanceConfig, ContextGovernor
+from nanobot.fork.agent.tool_evidence import persist_tool_evidence
 from nanobot.fork.providers.codex_context_checkpoint import ContextCheckpoint
 from nanobot.fork.providers.codex_native_context import native_input_budget
-from nanobot.utils.helpers import maybe_persist_tool_result
 
 
 def uses_native_context(provider: Any) -> bool:
@@ -35,13 +35,14 @@ class NativeContextPreparation:
             config.model, config.context_window_tokens, config.context_block_limit,
             config.max_tokens, config.max_tool_result_chars, config.tools.get_definitions(),
         )
-        if self.source_checkpoint.settings is None or self.source_checkpoint.needs_rebase(
-            messages, settings,
-        ):
-            # 真正的用户插话、设置变化或历史编辑不能被稳定前缀掩盖。
-            # Provider 的检查点/幂等规则仍决定能否重建。
+        if not self.source_checkpoint.can_append(messages, settings):
+            # 设置变化或历史编辑不能被稳定前缀掩盖。
+            # 仅追加的用户消息/回执保留旧投影，由 Provider 同步，不能触发旧结果重新治理。
+            # 初次投影不按固定 64 条删除旧证据；全部纳入已有软/硬预算治理。
+            # 只改本次配置副本，不改变原始历史、调用边界或已发送的稳定前缀。
             projected = self.governor.prepare_for_model(
-                config, messages, compacted_tool_call_ids, tool_digests=tool_digests,
+                replace(config, inflight_start_index=0), messages, compacted_tool_call_ids,
+                tool_digests=tool_digests,
             )
         else:
             suffix = messages[len(self.source_checkpoint.messages):]
@@ -66,13 +67,8 @@ class NativeContextPreparation:
                     if original == compacted:
                         continue
                     call_id = str(original.get("tool_call_id") or "")
-                    locator = self.governor.persisted_result_locator(original.get("content"))
-                    if not locator:
-                        saved = maybe_persist_tool_result(
-                            config.workspace, config.session_key, call_id, original.get("content"),
-                            max_chars=1, data_dir=config.data_dir,
-                        )
-                        locator = self.governor.persisted_result_locator(saved)
+                    # 即使回执自称已保存，也只信任运行时实际验证的快照。
+                    locator = persist_tool_evidence(config, original.get("content"))
                     if locator:
                         replacements[call_id] = {
                             **compacted,

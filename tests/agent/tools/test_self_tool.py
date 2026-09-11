@@ -1132,3 +1132,41 @@ class TestSetContext:
         tool.set_context(RequestContext(channel="feishu", chat_id="oc_abc123"))
         assert tool._channel == "feishu"
         assert tool._chat_id == "oc_abc123"
+
+
+@pytest.mark.parametrize("use_mock", [False, True])
+async def test_unknown_subagent_key_guides_to_real_key_without_alias(use_mock):
+    from types import SimpleNamespace
+
+    state = _make_mock_loop() if use_mock else SimpleNamespace(_runtime_vars={}, subagents={})
+    tool = _make_tool(state)
+    result = await tool.execute(action="check", key="subagent")
+    assert "Error:" in result
+    assert "'subagents'" in result
+    assert "subagent_control(action='list')" in result
+    assert "without key" in result
+    assert "subagent" not in vars(state)
+    assert "Error:" not in await tool.execute(action="check", key="subagents")
+
+
+async def test_unknown_runtime_key_offers_overview_and_preserves_scratchpad():
+    tool = _make_tool()
+    result = await tool.execute(action="check", key="missing_key")
+    assert "Error:" in result
+    assert "my(action='check') without key" in result
+    tool._runtime_state._runtime_vars["subagent"] = "user note"
+    result = await tool.execute(action="check", key="subagent")
+    assert "user note" in result
+    assert "Error:" not in result
+
+
+async def test_tools_query_guides_to_read_only_names_without_exposing_registry():
+    state = _make_mock_loop(tool_names=["exec", "subagent_control"])
+    tool = _make_tool(state)
+    error = await tool.execute(action="check", key="tools")
+    assert "not accessible" in error
+    assert "key='tool_names'" in error
+    assert "subagent_control" in await tool.execute(action="check", key="tool_names")
+    assert "protected" in await tool.execute(action="set", key="tools", value={})
+    assert "read-only" in await tool.execute(action="set", key="tool_names", value=[])
+    assert state.tool_names == ["exec", "subagent_control"]

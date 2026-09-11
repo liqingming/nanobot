@@ -90,6 +90,9 @@ async def test_runner_logs_context_governance_metrics():
     assert fields["saved_total"] == fields["before"]["total"] - fields["after"]["total"]
     assert fields["saved"]["tool_results"] >= 0
     assert fields["digested_tool_results"] == 0
+    assert fields["compaction_owner"] == "nanobot"
+    assert fields["metrics_source"] == "local_estimate"
+    assert fields["budget"]["input_tokens"] is None
     turn_summary = [
         fields for event, fields in events if event == "runner.context.turn_summary"
     ][-1]
@@ -121,6 +124,7 @@ async def test_runner_uses_raw_messages_when_context_governance_fails():
         side_effect=RuntimeError("boom")
     )
     result = await runner.run(AgentRunSpec(
+        context_strategy="legacy",
         initial_messages=initial_messages,
         tools=tools,
         model="test-model",
@@ -153,6 +157,7 @@ def test_snip_history_drops_orphaned_tool_results_from_trimmed_slice(monkeypatch
         model="test-model",
         max_iterations=1,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        max_tokens=0,
         context_window_tokens=2000,
         context_block_limit=100,
     )
@@ -200,6 +205,7 @@ def test_snip_history_reserves_budget_for_tool_definitions(monkeypatch):
         model="test-model",
         max_iterations=1,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        max_tokens=0,
         context_window_tokens=2000,
         context_block_limit=500,
     )
@@ -324,6 +330,7 @@ async def test_runner_drops_orphan_tool_results_before_model_request():
 
     runner = AgentRunner(provider)
     result = await runner.run(AgentRunSpec(
+        context_strategy="legacy",
         initial_messages=[
             {"role": "system", "content": "system"},
             {"role": "user", "content": "old user"},
@@ -360,6 +367,7 @@ async def test_backfill_repairs_model_context_without_shifting_save_turn_boundar
     provider.chat_stream_with_retry = AsyncMock(return_value=response)
 
     loop = AgentLoop(
+        context_strategy="legacy",
         bus=MessageBus(),
         provider=provider,
         workspace=tmp_path,
@@ -466,6 +474,7 @@ async def test_runner_backfill_only_mutates_model_context_not_returned_messages(
 
     runner = AgentRunner(provider)
     result = await runner.run(AgentRunSpec(
+        context_strategy="legacy",
         initial_messages=initial_messages,
         tools=tools,
         model="test-model",
@@ -968,6 +977,7 @@ def test_snip_history_preserves_user_message_after_truncation(monkeypatch):
         model="test-model",
         max_iterations=1,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        max_tokens=0,
         context_window_tokens=2000,
         context_block_limit=100,
     )
@@ -1022,6 +1032,7 @@ def test_snip_history_no_user_at_all_falls_back_gracefully(monkeypatch):
         model="test-model",
         max_iterations=1,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        max_tokens=0,
         context_window_tokens=2000,
         context_block_limit=100,
     )
@@ -1251,6 +1262,7 @@ async def test_runner_trims_and_retries_context_length_error(monkeypatch) -> Non
 
     result = await runner.run(
         AgentRunSpec(
+            context_strategy="legacy",
             initial_messages=initial_messages,
             tools=tools,
             model="test-model",

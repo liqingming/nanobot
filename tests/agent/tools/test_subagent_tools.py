@@ -336,9 +336,9 @@ async def test_drain_pending_blocks_while_subagents_running(tmp_path):
 
     assert injection_callback is not None
 
-    # Now test the callback directly
-    # With sub-agents running and an empty queue, it should block
-    drain_task = asyncio.create_task(injection_callback())
+    # Tool checkpoints return immediately; final-response checkpoints wait for a receipt.
+    assert await asyncio.wait_for(injection_callback(), timeout=1.0) == []
+    drain_task = asyncio.create_task(injection_callback(wait_for_subagents=True))
 
     # Let the task enter the blocking queue wait.
     await asyncio.sleep(0)
@@ -352,8 +352,8 @@ async def test_drain_pending_blocks_while_subagents_running(tmp_path):
         channel="test",
         chat_id="c1",
         content="Sub-agent result",
-        media=None,
-        metadata={},
+        media=[],
+        metadata={"injected_event": "subagent_result", "subagent_task_id": "sub-drain-1"},
     ))
 
     # Should unblock and return results
@@ -473,7 +473,7 @@ async def test_drain_pending_timeout(tmp_path):
         raise asyncio.TimeoutError
 
     with patch("nanobot.agent.loop.asyncio.wait_for", side_effect=_timeout):
-        results = await injection_callback()
+        results = await injection_callback(wait_for_subagents=True)
         assert results == []
 
     # Cleanup

@@ -137,6 +137,8 @@ class AgentDefaults(Base):
     max_tokens: int = 8192
     context_window_tokens: int = 200_000
     context_block_limit: int | None = None
+    # 普通 Provider 默认事务式治理；legacy 仅作为显式迁移回退。
+    context_strategy: Literal["transactional", "legacy"] = "transactional"
     temperature: float = 0.1
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 1000  # fork: bump default 200 → 1000 to accommodate long sustained tasks

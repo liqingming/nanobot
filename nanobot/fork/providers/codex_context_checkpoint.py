@@ -26,6 +26,17 @@ class ContextCheckpoint:
         self.messages = [_fingerprint(message) for message in messages]
         self.settings = _fingerprint(settings)
 
+    def can_append(self, messages: list[dict[str, Any]], settings: Any) -> bool:
+        """只允许稳定前缀后追加普通消息；不能以 steer 偷换设置或高优先级指令。"""
+        return (
+            self.settings is not None
+            and self.settings == _fingerprint(settings)
+            and len(messages) >= len(self.messages)
+            and all(old == _fingerprint(new) for old, new in zip(self.messages, messages))
+            and all(message.get("role") in {"user", "assistant", "tool"}
+                    for message in messages[len(self.messages):])
+        )
+
     def needs_rebase(self, messages: list[dict[str, Any]], settings: Any) -> bool:
         if self.settings is None:
             return False
@@ -33,7 +44,7 @@ class ContextCheckpoint:
             return True
         if any(old != _fingerprint(new) for old, new in zip(self.messages, messages)):
             return True
-        # 续传只能提交工具结果，新增用户指令也必须进入新线程。
+        # 普通续传只提交工具结果；新增指令须由 Provider 显式 steer 或安全重建。
         return any(message.get("role") in {"user", "system", "developer"}
                    for message in messages[len(self.messages):])
 

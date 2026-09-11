@@ -25,6 +25,8 @@ from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
 from nanobot.fork.agent.execution_scope import run_isolated_subagent
+from nanobot.fork.agent.subagent_control import SubagentControlState
+from nanobot.fork.agent.subagent_diagnostics import SubagentDiagnostics
 from nanobot.providers.base import LLMProvider, resolve_provider_context_window_tokens
 from nanobot.security.workspace_access import (
     WorkspaceScope,
@@ -111,6 +113,7 @@ class SubagentManager:
             provider, self.model, self._configured_context_window,
         )
         self.context_block_limit = context_block_limit
+        self.context_strategy = defaults.context_strategy
         self.tools_config = tools_config or ToolsConfig()
         self.max_tool_result_chars = max_tool_result_chars
         self.data_dir = data_dir
@@ -136,6 +139,7 @@ class SubagentManager:
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
+        self._task_control = SubagentControlState(data_dir or workspace)
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
     def _subagent_tools_config(self) -> ToolsConfig:
@@ -192,7 +196,7 @@ class SubagentManager:
         workspace_scope: WorkspaceScope | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
-        task_id = str(uuid.uuid4())[:8]
+        task_id = uuid.uuid4().hex
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
 
@@ -220,7 +224,28 @@ class SubagentManager:
         if session_key:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
 
+        root = workspace_scope.project_path if workspace_scope is not None else self.workspace
+        try:
+            self._task_control.register(
+                task_id, session_key or f"{origin_channel}:{origin_chat_id}", root, bg_task, status,
+            )
+        except BaseException:
+            # 登记必须在子任务第一次获得执行机会前落盘；失败不能留下未登记执行者。
+            bg_task.cancel()
+            self._running_tasks.pop(task_id, None)
+            self._task_statuses.pop(task_id, None)
+            if session_key and (ids := self._session_tasks.get(session_key)):
+                ids.discard(task_id)
+                if not ids:
+                    del self._session_tasks[session_key]
+            raise
+
         def _cleanup(_: asyncio.Task) -> None:
+            try:
+                self._task_control.finish(task_id)
+            except Exception:
+                # 留住控制记录和锁，后续 status/wait 可重试持久化，不虚报清理完成。
+                logger.exception("Failed to persist subagent receipt {}", task_id)
             self._running_tasks.pop(task_id, None)
             self._task_statuses.pop(task_id, None)
             if session_key and (ids := self._session_tasks.get(session_key)):
@@ -246,6 +271,15 @@ class SubagentManager:
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        diagnostics = SubagentDiagnostics(
+            self.data_dir or self.workspace, task_id=task_id,
+            parent_session_key=origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}",
+            model=self.model, provider=self.provider,
+        )
+        started_at = time.monotonic()
+        outcome = "error"
+        result = None
+        diagnostics("run.start", {"max_iterations": self.max_iterations})
 
         async def _on_checkpoint(payload: dict) -> None:
             status.phase = payload.get("phase", status.phase)
@@ -281,6 +315,7 @@ class SubagentManager:
                     max_tool_result_chars=self.max_tool_result_chars,
                     context_window_tokens=self.context_window_tokens,
                     context_block_limit=self.context_block_limit,
+                    context_strategy=self.context_strategy,
                     hook=_SubagentHook(task_id, status),
                     max_iterations_message="Task completed but no final response was generated.",
                     finalize_on_max_iterations=False,
@@ -288,6 +323,8 @@ class SubagentManager:
                     fail_on_tool_error=self.fail_on_tool_error,
                     checkpoint_callback=_on_checkpoint,
                     session_key=sess_key,
+                    event_logger=diagnostics,
+                    turn_id=diagnostics.turn_id,
                     workspace=root,
                     data_dir=self.data_dir,
                     llm_timeout_s=llm_timeout,
@@ -297,6 +334,7 @@ class SubagentManager:
                     reset_workspace_scope(token)
             status.phase = "done"
             status.stop_reason = result.stop_reason
+            outcome = "error" if result.stop_reason in {"error", "tool_error"} else "completed"
 
             if result.stop_reason == "tool_error":
                 status.tool_events = list(result.tool_events)
@@ -316,11 +354,24 @@ class SubagentManager:
                 logger.info("Subagent [{}] completed successfully", task_id)
                 await self._announce_result(task_id, label, task, final_result, origin, "ok", origin_message_id)
 
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
         except Exception as e:
+            outcome = "error"
             status.phase = "error"
             status.error = str(e)
             logger.exception("Subagent [{}] failed", task_id)
             await self._announce_result(task_id, label, task, f"Error: {e}", origin, "error", origin_message_id)
+        finally:
+            diagnostics("run.end", {
+                "outcome": outcome,
+                "stop_reason": result.stop_reason if result is not None else outcome,
+                "usage": result.usage if result is not None else status.usage,
+                "context_safety_failure": result.context_safety_failure if result is not None else False,
+                "iteration": status.iteration,
+                "duration_ms": round((time.monotonic() - started_at) * 1000, 1),
+            })
 
     async def _announce_result(
         self,

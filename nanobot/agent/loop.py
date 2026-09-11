@@ -51,7 +51,9 @@ from nanobot.bus.runtime_events import (
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.fork.agent.context_budget import resolve_context_budget
 from nanobot.fork.agent.context_usage import context_input_tokens
+from nanobot.fork.agent.input_evidence import build_input_evidence, capture_input
 from nanobot.fork.agent.learning import (
     PATTERN_THRESHOLD,
     PatternStore,
@@ -59,9 +61,10 @@ from nanobot.fork.agent.learning import (
     _compress_tool_sequence,
     detect_user_delta,
 )
+from nanobot.fork.agent.native_context import uses_native_context
+from nanobot.fork.agent.summary_transaction import SummaryTransactionError
 from nanobot.providers.base import (
     LLMProvider,
-    provider_input_token_budget,
     resolve_provider_context_window_tokens,
 )
 from nanobot.providers.factory import ProviderSnapshot
@@ -235,6 +238,7 @@ class AgentLoop:
         max_concurrent_subagents: int | None = None,
         context_window_tokens: int | None = None,
         context_block_limit: int | None = None,
+        context_strategy: str = "transactional",
         max_tool_result_chars: int | None = None,
         fail_on_tool_error: bool | None = None,
         provider_retry_mode: str = "standard",
@@ -297,6 +301,7 @@ class AgentLoop:
             provider, self.model, configured_context_window
         )
         self.context_block_limit = context_block_limit
+        self.context_strategy = context_strategy
         self.max_tool_result_chars = (
             max_tool_result_chars
             if max_tool_result_chars is not None
@@ -433,6 +438,7 @@ class AgentLoop:
             consolidation_ratio=consolidation_ratio,
             consolidation_trigger_ratio=consolidation_trigger_ratio,
             unified_session=unified_session,
+            context_block_limit=self.context_block_limit,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
@@ -491,6 +497,7 @@ class AgentLoop:
             max_concurrent_subagents=defaults.max_concurrent_subagents,
             context_window_tokens=context_window_tokens,
             context_block_limit=defaults.context_block_limit,
+            context_strategy=defaults.context_strategy,
             max_tool_result_chars=defaults.max_tool_result_chars,
             fail_on_tool_error=defaults.fail_on_tool_error,
             provider_retry_mode=defaults.provider_retry_mode,
@@ -521,6 +528,7 @@ class AgentLoop:
     def _sync_subagent_runtime_limits(self) -> None:
         """Keep subagent runtime limits aligned with mutable loop settings."""
         self.subagents.max_iterations = self.max_iterations
+        self.subagents.context_strategy = self.context_strategy
 
     def _apply_provider_snapshot(
         self,
@@ -755,9 +763,17 @@ class AgentLoop:
             if text_override is not None:
                 text = text_override
             extra.update(automation_extra)
+            evidence = build_input_evidence(
+                msg, data_dir=self.context.data_dir, session_key=session.key,
+            )
+            state = ContextState.from_metadata(session.metadata)
+            state.evidence[evidence.evidence_id] = evidence
+            state.revision += 1
+            session.metadata[CONTEXT_STATE_KEY] = state.to_metadata()
+            extra["_input_evidence_id"] = evidence.evidence_id
             session.add_message("user", text, **extra)
             self._mark_pending_user_turn(session)
-            self.sessions.save(session)
+            self.sessions.save(session, fsync=True)
             return True
         return False
 
@@ -882,20 +898,11 @@ class AgentLoop:
 
     def _replay_token_budget(self) -> int:
         """Derive a token budget for session history replay from the context window."""
-        if self.context_window_tokens <= 0:
-            return 0
-        max_output = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
-        try:
-            reserved_output = int(max_output)
-        except (TypeError, ValueError):
-            reserved_output = 4096
-        budget = provider_input_token_budget(
-            self.provider,
-            self.context_window_tokens,
-            max(1, reserved_output),
-            1024,
-        )
-        return budget if budget > 0 else max(128, self.context_window_tokens // 2)
+        # 回放只是候选上下文；未知/零预算返回 0 不裁剪，runner 再作明确门禁。
+        return resolve_context_budget(
+            self.provider, self.context_window_tokens,
+            block_limit=self.context_block_limit,
+        ).input_tokens or 0
 
     # ── fork: learning context helpers ────────────────────────────────────
 
@@ -1055,19 +1062,18 @@ class AgentLoop:
                 return
             self._set_runtime_checkpoint(session, payload)
 
-        async def _drain_pending(*, limit: int = _MAX_INJECTIONS_PER_TURN) -> list[dict[str, Any]]:
-            """Drain follow-up messages from the pending queue.
+        async def _drain_pending(
+            *, limit: int = _MAX_INJECTIONS_PER_TURN, wait_for_subagents: bool = False,
+        ) -> list[dict[str, Any]]:
+            """先取已到达消息；正常回复收尾或显式 wait 后允许等待子任务回执。
 
-            When no messages are immediately available but sub-agents
-            spawned in this dispatch are still running, blocks until at
-            least one result arrives (or timeout).  This keeps the runner
-            loop alive so subsequent sub-agent completions are consumed
-            in-order rather than dispatched separately.
+            普通工具后不阻塞绑定/查询；显式等待仍可被真实插话或取消打断。
             """
             if pending_queue is None:
                 return []
 
             def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
+                pending_msg = capture_input(pending_msg)
                 content = pending_msg.content
                 media = pending_msg.media if pending_msg.media else None
                 if media:
@@ -1087,20 +1093,30 @@ class AgentLoop:
                         row["subagent_task_id"] = task_id
                     row[HIDDEN_HISTORY_META] = marker
                     row["injected_event"] = "subagent_result"
+                elif session is not None and turn_continuation.should_persist_user_message(metadata):
+                    evidence = build_input_evidence(
+                        pending_msg, data_dir=self.context.data_dir, session_key=session.key,
+                    )
+                    state = ContextState.from_metadata(session.metadata)
+                    state.evidence[evidence.evidence_id] = evidence
+                    state.revision += 1
+                    session.metadata[CONTEXT_STATE_KEY] = state.to_metadata()
+                    self.sessions.save(session, fsync=True)
+                    row["_input_evidence_id"] = evidence.evidence_id
                 return row
 
-            items: list[dict[str, Any]] = []
+            items: list[InboundMessage] = []
             while len(items) < limit:
                 try:
-                    items.append(_to_user_message(pending_queue.get_nowait()))
+                    items.append(pending_queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
 
-            # Block if nothing drained but sub-agents spawned in this dispatch
-            # are still running.  Keeps the runner loop alive so subsequent
-            # completions are injected in-order rather than dispatched separately.
-            if (not items
+            # 仅收尾或显式 wait 才等回执，避免普通工具后阻塞 300 秒。
+            # 显式等待用户时立即交还；回执仍保留在队列中供后续处理。
+            if (wait_for_subagents and not items
                     and session is not None
+                    and not sustained_goal_waiting_for_user(session.metadata)
                     and self.subagents.get_running_count_by_session(session.key) > 0):
                 try:
                     msg = await asyncio.wait_for(pending_queue.get(), timeout=300)
@@ -1110,14 +1126,23 @@ class AgentLoop:
                         session.key,
                     )
                     return items
-                items.append(_to_user_message(msg))
+                items.append(msg)
                 while len(items) < limit:
                     try:
-                        items.append(_to_user_message(pending_queue.get_nowait()))
+                        items.append(pending_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
 
-            return items
+            try:
+                return [_to_user_message(item) for item in items]
+            except BaseException:
+                # 整批转换失败不得遗失尚未注入的用户输入；无 await，不与入队交错。
+                tail = []
+                while not pending_queue.empty():
+                    tail.append(pending_queue.get_nowait())
+                for item in items + tail:
+                    pending_queue.put_nowait(item)
+                raise
 
         active_session_key = session.key if session else session_key
         runtime_turn_id = turn_id or f"{active_session_key or 'ephemeral'}:{time.time_ns()}"
@@ -1238,6 +1263,7 @@ class AgentLoop:
                 session_key=session.key if session else None,
                 context_window_tokens=self.context_window_tokens,
                 context_block_limit=self.context_block_limit,
+                context_strategy=self.context_strategy,
                 provider_retry_mode=self.provider_retry_mode,
                 progress_callback=on_progress,
                 stream_progress_deltas=on_stream is not None,
@@ -1270,12 +1296,18 @@ class AgentLoop:
                 event_logger=_event_logger,
                 turn_id=runtime_turn_id,
                 context_delta_callback=_context_delta,
+                context_state_reader=(
+                    lambda: {"metadata": session.metadata, "todos": session.todos}
+                ) if session is not None else None,
             ))
         finally:
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
-        if result.stop_reason == "error" and session is not None:
+        if (
+            result.stop_reason == "error" and session is not None
+            and getattr(result, "context_safety_failure", False) is not True
+        ):
             fallback = _newly_completed_goal_fallback(
                 session.metadata,
                 completed_at_before=completed_at_before,
@@ -1393,10 +1425,10 @@ class AgentLoop:
                             self.commands.dispatch,
                         )
                         continue
-                    pending_msg = msg
+                    pending_msg = capture_input(msg)
                     if effective_key != msg.session_key:
                         pending_msg = dataclasses.replace(
-                            msg,
+                            pending_msg,
                             session_key_override=effective_key,
                         )
                     try:
@@ -1490,9 +1522,17 @@ class AgentLoop:
         recovery_metadata.pop("render_as", None)
         recovery_metadata.pop("stop_reason", None)
         recovery_metadata.pop("latency_ms", None)
+        recovery_content = _AUTO_RECOVER_MESSAGE
+        if self.subagents.get_running_count_by_session(session_key) > 0:
+            recovery_content += (
+                " 本话题仍有运行中的子任务，模型超时没有取消它们。"
+                "复用历史中的任务 ID；不要重复派发、重做已执行操作或把超时视为子任务失败。"
+                "先核对一次状态；无独立工作时调用 subagent_control(action='wait', "
+                "task_id='<实际任务ID>')，由宿主等待回执，不循环查询计划或用模型思考来等待。"
+            )
         await self.bus.publish_inbound(dataclasses.replace(
             msg,
-            content=_AUTO_RECOVER_MESSAGE,
+            content=recovery_content,
             metadata=recovery_metadata,
             media=[],
             session_key_override=session_key,
@@ -1654,7 +1694,9 @@ class AgentLoop:
                     )
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
+                        content=(str(exc) if isinstance(exc, SummaryTransactionError)
+                                 else "Sorry, I encountered an error."),
+                        metadata={**(msg.metadata or {}), "_error": True},
                     ))
                     if not turn_continuation.internal_continuation_pending(msg.metadata):
                         await self._runtime_events().turn_completed(
@@ -1855,6 +1897,9 @@ class AgentLoop:
             "max_tokens": self._replay_token_budget(),
             "extend_to_user": is_subagent,
         }
+        _hist_kwargs["preserve_unconsolidated"] = (
+            uses_native_context(self.provider) or self.context_strategy == "transactional"
+        )
         history = session.get_history(**_hist_kwargs)
         workspace_scope = self.workspace_scopes.for_message(msg, session.metadata)
 
@@ -2107,6 +2152,7 @@ class AgentLoop:
 
     async def _state_restore(self, ctx: TurnContext) -> TurnState:
         """Restore checkpoint / pending user turn; extract documents."""
+        ctx.msg = capture_input(ctx.msg)
         msg = ctx.msg
 
         if msg.media:
@@ -2201,6 +2247,9 @@ class AgentLoop:
                 "max_tokens": self._replay_token_budget(),
                 "extend_to_user": False,
             }
+            _hist_kwargs["preserve_unconsolidated"] = (
+                uses_native_context(self.provider) or self.context_strategy == "transactional"
+            )
             history = ctx.session.get_history(**_hist_kwargs)
             self._runtime_events().record_turn_runtime(
                 ctx.session_key,
@@ -2480,10 +2529,11 @@ class AgentLoop:
                         session.key,
                     )
                     continue
-                if isinstance(content, str) and len(content) > self.max_tool_result_chars:
+                legacy = getattr(self, "context_strategy", "transactional") == "legacy"
+                if legacy and isinstance(content, str) and len(content) > self.max_tool_result_chars:
                     entry["content"] = truncate_text_fn(content, self.max_tool_result_chars)
                 elif isinstance(content, list):
-                    filtered = self._sanitize_persisted_blocks(content, should_truncate_text=True)
+                    filtered = self._sanitize_persisted_blocks(content, should_truncate_text=legacy)
                     if not filtered:
                         # Preserve the tool_call/result pair after block filtering.
                         filtered = [
@@ -2498,7 +2548,10 @@ class AgentLoop:
                     and user_transcript_id
                 ):
                     entry.setdefault("_transcript_id", user_transcript_id)
-                if isinstance(content, str) and ContextBuilder._RUNTIME_CONTEXT_TAG in content:
+                if (
+                    isinstance(content, str) and ContextBuilder._RUNTIME_CONTEXT_TAG in content
+                    and not entry.get("_input_evidence_id")
+                ):
                     # Strip all metadata prefixes (TurnSummary + RuntimeContext).
                     # RuntimeContext tag is always present; split there, then skip its lines.
                     after_tag = content.split(ContextBuilder._RUNTIME_CONTEXT_TAG, 1)[1]
@@ -2691,6 +2744,7 @@ class AgentLoop:
             channel=channel, sender_id=sender_id, chat_id=chat_id,
             content=content, media=media or [], metadata=metadata,
         )
+        msg = capture_input(msg, "sdk")
         # Share the dispatch lock so direct calls serialize with bus turns.
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         try:

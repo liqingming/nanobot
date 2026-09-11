@@ -58,7 +58,8 @@ async def test_drain_injections_returns_empty_when_no_callback():
 
 
 @pytest.mark.asyncio
-async def test_drain_injections_extracts_content_from_inbound_messages():
+@pytest.mark.parametrize("wait_for_subagents", [False, True])
+async def test_drain_injections_extracts_content_from_inbound_messages(wait_for_subagents):
     """Should extract .content from InboundMessage objects."""
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
     from nanobot.bus.events import InboundMessage
@@ -81,7 +82,7 @@ async def test_drain_injections_extracts_content_from_inbound_messages():
         max_iterations=1, max_tool_result_chars=1000,
         injection_callback=cb,
     )
-    result = await runner._drain_injections(spec)
+    result = await runner._drain_injections(spec, wait_for_subagents=wait_for_subagents)
     assert result == [
         {"role": "user", "content": "hello"},
         {"role": "user", "content": "world"},
@@ -89,7 +90,8 @@ async def test_drain_injections_extracts_content_from_inbound_messages():
 
 
 @pytest.mark.asyncio
-async def test_drain_injections_passes_limit_to_callback_when_supported():
+@pytest.mark.parametrize("wait_for_subagents", [False, True])
+async def test_drain_injections_passes_limit_to_callback_when_supported(wait_for_subagents):
     """Limit-aware callbacks can preserve overflow in their own queue."""
     from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
     from nanobot.bus.events import InboundMessage
@@ -114,7 +116,7 @@ async def test_drain_injections_passes_limit_to_callback_when_supported():
         max_iterations=1, max_tool_result_chars=1000,
         injection_callback=cb,
     )
-    result = await runner._drain_injections(spec)
+    result = await runner._drain_injections(spec, wait_for_subagents=wait_for_subagents)
     assert seen_limits == [_MAX_INJECTIONS_PER_TURN]
     assert result == [
         {"role": "user", "content": "msg0"},
@@ -218,8 +220,9 @@ async def test_drain_injections_skips_objects_with_none_content():
 
 @pytest.mark.asyncio
 async def test_drain_injections_handles_callback_exception():
-    """If the callback raises, return empty list (error is logged)."""
+    """插话可能携带撤销指令；异常必须停止，不能伪装为空。"""
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.fork.agent.recovery_packet import RecoveryPacketError
 
     provider = MagicMock()
     runner = AgentRunner(provider)
@@ -234,8 +237,8 @@ async def test_drain_injections_handles_callback_exception():
         max_iterations=1, max_tool_result_chars=1000,
         injection_callback=cb,
     )
-    result = await runner._drain_injections(spec)
-    assert result == []
+    with pytest.raises(RecoveryPacketError):
+        await runner._drain_injections(spec)
 
 
 @pytest.mark.asyncio
@@ -563,6 +566,7 @@ async def test_runner_merges_multiple_injected_user_messages_without_losing_medi
 
     runner = AgentRunner(provider)
     result = await runner.run(AgentRunSpec(
+        context_strategy="legacy",  # 旧策略合并相邻 user；新策略保留独立接收事件。
         initial_messages=[{"role": "user", "content": "hello"}],
         tools=tools,
         model="test-model",

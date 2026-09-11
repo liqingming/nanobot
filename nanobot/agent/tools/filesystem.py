@@ -19,6 +19,8 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 from nanobot.config_base import Base
+from nanobot.fork.agent.read_visibility import read_evidence_required
+from nanobot.fork.agent.source_evidence import text_read_result
 from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 
@@ -328,7 +330,7 @@ class ReadFileTool(_FsTool):
 
             raw = fp.read_bytes()
             if not raw:
-                return f"(Empty file: {path})"
+                return text_read_result(f"(Empty file: {path})", fp, raw, start=1, end=0, total=0)
 
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if mime and mime.startswith("image/"):
@@ -343,6 +345,8 @@ class ReadFileTool(_FsTool):
                 current_mtime = 0.0
             if (
                 not force
+                # 磁盘未变不能证明正文仍在本轮模型窗口（尤其原生压缩后）。
+                and not read_evidence_required()
                 and entry
                 and entry.can_dedup
                 and entry.offset == offset
@@ -415,7 +419,7 @@ class ReadFileTool(_FsTool):
             else:
                 result += f"\n\n(End of file — {total} lines total)"
             self._file_states.record_read(fp, offset=offset, limit=limit)
-            return result
+            return text_read_result(result, fp, raw, start=offset, end=end, total=total)
         except PermissionError as e:
             return ToolResult.error(f"Error: {e}")
         except Exception as e:

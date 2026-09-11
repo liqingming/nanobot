@@ -55,10 +55,14 @@ async def test_runner_persists_large_tool_results_for_follow_up_calls(tmp_path):
     assert assistant_message["response_items"][0]["encrypted_content"] == "opaque-token"
     tool_message = next(msg for msg in captured_second_call if msg.get("role") == "tool")
     assert "[tool output persisted]" in tool_message["content"]
-    assert "tool-results" in tool_message["content"]
-    assert (
-        tmp_path / "data" / "sessions" / "test_runner" / "tool-results" / "call_big.txt"
-    ).exists()
+    from pathlib import Path
+
+    from nanobot.agent.context_governance import ContextGovernor
+
+    locator = ContextGovernor.persisted_result_locator(tool_message["content"])
+    assert locator is not None
+    assert Path(locator).is_relative_to(tmp_path / "data" / "sessions")
+    assert Path(locator).read_text(encoding="utf-8") == "x" * 20_000
     assert not (tmp_path / "project" / ".nanobot").exists()
 
 
@@ -175,12 +179,13 @@ async def test_read_file_result_is_not_offloaded(tmp_path):
     assert "[tool output persisted]" not in tool_message["content"]
     # read_file manages its own size; generic truncation must NOT apply
     assert len(tool_message["content"]) == 20_000
-    # no file should have been written for this read_file call
-    offload_dir = tmp_path / ".nanobot" / "tool-results"
-    assert not any(offload_dir.rglob("call_rf.txt")) if offload_dir.exists() else True
+    # 内联展示不变，但保存不可变快照以支持后续恢复。
+    snapshots = list((tmp_path / "data" / "sessions").glob("*/evidence/*.txt"))
+    assert len(snapshots) == 1
+    assert snapshots[0].read_text(encoding="utf-8") == "x" * 20_000
 
 
-async def test_runner_keeps_going_when_tool_result_persistence_fails():
+async def test_runner_stops_with_raw_receipt_when_tool_result_persistence_fails():
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
@@ -205,7 +210,7 @@ async def test_runner_keeps_going_when_tool_result_persistence_fails():
 
     runner = AgentRunner(provider)
     with patch(
-        "nanobot.agent.context_governance.maybe_persist_tool_result",
+        "nanobot.agent.runner.persist_tool_evidence",
         side_effect=RuntimeError("disk full"),
     ):
         result = await runner.run(AgentRunSpec(
@@ -216,6 +221,9 @@ async def test_runner_keeps_going_when_tool_result_persistence_fails():
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
         ))
 
-    assert result.final_content == "done"
-    tool_message = next(msg for msg in captured_second_call if msg.get("role") == "tool")
+    assert result.stop_reason == "error"
+    assert "保留原始回执" in result.final_content
+    assert call_count["n"] == 1
+    assert captured_second_call == []
+    tool_message = next(msg for msg in result.messages if msg.get("role") == "tool")
     assert tool_message["content"] == "tool result"

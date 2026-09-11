@@ -363,20 +363,31 @@ class TestSubagentCancellation:
     async def test_subagent_announces_error_when_tool_execution_fails(self, monkeypatch, tmp_path):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
-        from nanobot.providers.base import LLMResponse, ToolCallRequest
+        from nanobot.providers.base import (
+            GenerationSettings,
+            LLMProvider,
+            LLMResponse,
+            ToolCallRequest,
+        )
 
         bus = MessageBus()
-        provider = MagicMock()
+        provider = MagicMock(spec=LLMProvider)
+        provider.generation = GenerationSettings()
+        provider.aclose_execution = AsyncMock()
         provider.get_default_model.return_value = "test-model"
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
-            content="thinking",
-            tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
-        ))
+        provider.chat_with_retry = AsyncMock(side_effect=[
+            LLMResponse(content="thinking", tool_calls=[
+                ToolCallRequest(id=f"call_{i}", name="list_dir", arguments={"path": "."}),
+            ]) for i in (1, 2)
+        ])
         mgr = SubagentManager(
             provider=provider,
             workspace=tmp_path,
             bus=bus,
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            # 本用例验证严格失败；默认模式允许模型从普通工具错误中恢复。
+            fail_on_tool_error=True,
+            max_iterations=3,
         )
         mgr._announce_result = AsyncMock()
 
@@ -392,8 +403,14 @@ class TestSubagentCancellation:
 
         from nanobot.agent.subagent import SubagentStatus
         status = SubagentStatus(task_id="sub-1", label="label", task_description="do task", started_at=time.monotonic())
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, status)
+        await asyncio.wait_for(mgr._run_subagent(
+            "sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, status,
+        ), timeout=5)
 
+        assert calls["n"] == 2
+        assert provider.chat_with_retry.await_count == 2
+        provider.aclose_execution.assert_awaited_once()
+        assert status.stop_reason == "tool_error"
         mgr._announce_result.assert_awaited_once()
         args = mgr._announce_result.await_args.args
         assert "Completed steps:" in args[3]
@@ -406,10 +423,17 @@ class TestSubagentCancellation:
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):
         from nanobot.agent.subagent import SubagentManager, SubagentStatus
         from nanobot.bus.queue import MessageBus
-        from nanobot.providers.base import LLMResponse, ToolCallRequest
+        from nanobot.providers.base import (
+            GenerationSettings,
+            LLMProvider,
+            LLMResponse,
+            ToolCallRequest,
+        )
 
         bus = MessageBus()
-        provider = MagicMock()
+        provider = MagicMock(spec=LLMProvider)
+        provider.generation = GenerationSettings()
+        provider.aclose_execution = AsyncMock()
         provider.get_default_model.return_value = "test-model"
         provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
             content="thinking",
@@ -445,14 +469,19 @@ class TestSubagentCancellation:
         mgr._running_tasks["sub-1"] = task
         mgr._session_tasks["test:c1"] = {"sub-1"}
 
-        await asyncio.wait_for(started.wait(), timeout=1.0)
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            count = await asyncio.wait_for(mgr.cancel_by_session("test:c1"), timeout=2)
 
-        count = await mgr.cancel_by_session("test:c1")
-
-        assert count == 1
-        assert cancelled.is_set()
-        assert task.cancelled()
-        mgr._announce_result.assert_not_awaited()
+            assert count == 1
+            assert cancelled.is_set()
+            assert task.cancelled()
+            provider.aclose_execution.assert_awaited_once()
+            mgr._announce_result.assert_not_awaited()
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 class TestSubagentAnnounceSessionKey:

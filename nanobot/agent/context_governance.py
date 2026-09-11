@@ -13,13 +13,12 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.providers.base import provider_input_token_budget
+from nanobot.fork.agent.context_budget import resolve_context_budget
+from nanobot.fork.agent.tool_evidence import evidence_preview, persist_tool_evidence
 from nanobot.utils.helpers import (
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
     find_legal_message_start,
-    maybe_persist_tool_result,
-    truncate_text,
 )
 from nanobot.utils.runtime import ensure_nonempty_tool_result
 
@@ -131,24 +130,10 @@ class ContextGovernor:
 
     @staticmethod
     def input_budget(config: ContextGovernanceConfig) -> int:
-        if not config.context_window_tokens:
-            return 0
-
-        provider_max_tokens = getattr(
-            getattr(config.provider, "generation", None),
-            "max_tokens",
-            4096,
-        )
-        max_output = config.max_tokens if isinstance(config.max_tokens, int) else (
-            provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
-        )
-        budget = config.context_block_limit or provider_input_token_budget(
-            config.provider,
-            config.context_window_tokens,
-            max_output,
-            SNIP_SAFETY_BUFFER,
-        )
-        return budget if budget > 0 else 0
+        return resolve_context_budget(
+            config.provider, config.context_window_tokens, config.max_tokens,
+            config.context_block_limit, SNIP_SAFETY_BUFFER,
+        ).input_tokens or 0
 
     @staticmethod
     def persisted_result_locator(result: Any) -> str | None:
@@ -167,29 +152,14 @@ class ContextGovernor:
         tool_call_id: str,
         tool_name: str,
         result: Any,
+        *,
+        artifact_locator: str | None = None,
     ) -> Any:
         result = ensure_nonempty_tool_result(tool_name, result)
+        locator = artifact_locator or persist_tool_evidence(config, result)
         if tool_name in TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS:
             return result
-        try:
-            content = maybe_persist_tool_result(
-                config.workspace,
-                config.session_key,
-                tool_call_id,
-                result,
-                max_chars=config.max_tool_result_chars,
-                data_dir=config.data_dir,
-            )
-        except Exception:
-            logger.exception(
-                "Tool result persist failed for {} in {}; using raw result",
-                tool_call_id,
-                config.session_key or "default",
-            )
-            content = result
-        if isinstance(content, str) and len(content) > config.max_tool_result_chars:
-            return truncate_text(content, config.max_tool_result_chars)
-        return content
+        return evidence_preview(result, locator, config.max_tool_result_chars)
 
     @staticmethod
     def strip_placeholder_assistant_messages(

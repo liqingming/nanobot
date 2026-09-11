@@ -53,6 +53,7 @@ async def test_child_hard_budget_actually_shapes_large_tool_result(tmp_path):
         provider, tmp_path, MessageBus(), 16000, model="test",
         context_window_tokens=8000, context_block_limit=800,
     )
+    manager.context_strategy = "legacy"  # 旧策略回退仍可整形最新大回执。
     tools = MagicMock()
     tools.get_definitions.return_value = []
     tools.execute = AsyncMock(return_value="large proof " * 1000)

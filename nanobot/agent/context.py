@@ -15,6 +15,8 @@ from nanobot.agent.tools import mcp as mcp_tools
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.apps.cli import utils as cli_app_utils
 from nanobot.bus.events import InboundMessage
+from nanobot.fork.agent.input_evidence import make_input_verifier
+from nanobot.fork.agent.source_evidence import make_source_verifier
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
     build_assistant_message,
@@ -418,12 +420,19 @@ class ContextBuilder:
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         root = workspace or self.workspace
+        registry = getattr(runtime_state, "tools", None)
+        source_verifier = make_source_verifier(
+            root, registry.get("read_file") if isinstance(registry, ToolRegistry) else None,
+            getattr(inbound_message, "metadata", None),
+        )
         active_context = render_active_context(
             session_metadata,
             workspace=root,
             legacy_summary=session_summary,
             todos=todos,
             resume_request=resume_request,
+            source_verifier=source_verifier,
+            input_verifier=make_input_verifier(self.data_dir, session_key),
         )
         extra = [] if active_context else [*goal_state_runtime_lines(session_metadata)]
         if runtime_state is not None and inbound_message is not None:

@@ -22,7 +22,12 @@ _SERVER = r'''
 import json, sys
 from pathlib import Path
 capture, mode = sys.argv[1:]
+native_effects = not mode.startswith("plain:")
+mode = mode.removeprefix("plain:")
 def send(value):
+    if value.get("method", "").startswith(("item/", "turn/")) or value.get("method") == "thread/tokenUsage/updated":
+        value.setdefault("params", {}).setdefault("threadId", "thread")
+        value["params"].setdefault("turnId", "turn")
     print(json.dumps(value), flush=True)
 def event(method, **params):
     send({"method": method, "params": {"threadId": "thread", "turnId": "turn", **params}})
@@ -46,14 +51,25 @@ for line in sys.stdin:
             send({"id": msg["id"], "result": {"thread": {"id": "thread"}}})
     elif method == "turn/start":
         send({"id": msg["id"], "result": {"turn": {"id": "turn"}}})
-        if mode in {"native_fail", "native_safe"}:
+        if native_effects and (mode in {"native_fail", "native_safe"} or mode.startswith("steer")):
             event("item/completed", item={"type": "commandExecution", "id": "cmd", "status": "completed"})
-        if mode in {"file_fail", "native_safe"}:
+        if native_effects and mode in {"file_fail", "native_safe"}:
             event("item/completed", item={"type": "fileChange", "id": "file", "status": "completed"})
         call(1)
+    elif method == "turn/steer":
+        assert msg["params"]["threadId"] == "thread"
+        assert msg["params"]["expectedTurnId"] == "turn"
+        if mode == "steer_reject":
+            send({"id": msg["id"], "error": {"message": "steer unavailable"}})
+        elif mode == "steer_disconnect":
+            sys.exit(2)
+        else:
+            send({"id": msg["id"], "result": {
+                "turnId": "wrong" if mode == "steer_mismatch" else "turn",
+            }})
     elif "result" in msg:
         n = msg["id"] - 100
-        if mode in {"native_fail", "file_fail"}:
+        if mode in {"native_fail", "file_fail"} or (mode == "steer_later_disconnect" and n == 3):
             sys.exit(2)
         if n in (2, 5):
             event("thread/tokenUsage/updated", tokenUsage={
@@ -401,5 +417,166 @@ async def test_zero_input_budget_is_not_treated_as_unlimited(tmp_path):
         assert not result.error_should_retry
         assert not capture.exists()
         assert provider._turns == provider._turn_locks == {}
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("mode", [
+    "native_safe", "steer_reject", "steer_mismatch", "steer_disconnect", "steer_later_disconnect",
+])
+@pytest.mark.parametrize("native_effects", [True, False])
+async def test_native_receipt_steers_existing_thread_without_replaying(tmp_path, mode, native_effects):
+    provider, capture = _provider(tmp_path, mode if native_effects else "plain:" + mode)
+    config = _config(provider, tmp_path, budget=80000)
+    preparation = NativeContextPreparation(ContextGovernor())
+    # 统计全量治理次数：回执不应导致旧前缀再次治理。
+    original_prepare = preparation.governor.prepare_for_model
+    full_prepares = []
+
+    def prepare(*args, **kwargs):
+        full_prepares.append(True)
+        return original_prepare(*args, **kwargs)
+
+    preparation.governor.prepare_for_model = prepare
+    context = {"session_key": "topic", "turn_id": "receipt"}
+    messages = [{"role": "user", "content": "task"}]
+    try:
+        for n in range(1, 4):
+            projected = preparation.prepare_for_model(config, messages, set())
+            response = await provider.chat(messages=projected, request_context=context)
+            assert response.has_tool_calls, response.content
+            call = response.tool_calls[0]
+            messages.extend([
+                {"role": "assistant", "tool_calls": [call.to_openai_tool_call()]},
+                {"role": "tool", "name": call.name, "tool_call_id": call.id,
+                 "content": "receipt-" + str(n)},
+            ])
+        bridge = provider._turns[("topic", "receipt")]
+        messages.append({"role": "user", "content": "WORKER_COMPLETED",
+                         "injected_event": "subagent_result"})
+        projected = preparation.prepare_for_model(config, messages, set())
+        response = await provider.chat(messages=projected, request_context=context)
+        assert len(full_prepares) == 1
+        rpc = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        assert sum(m.get("method") == "thread/start" for m in rpc) == 1
+        steers = [m for m in rpc if m.get("method") == "turn/steer"]
+        assert len(steers) == 1
+        assert steers[0]["params"]["input"] == [{"type": "text", "text": "WORKER_COMPLETED"}]
+        if mode != "native_safe":
+            assert response.finish_reason == "error"
+            assert not response.error_should_retry
+            assert not response.has_tool_calls
+            assert provider._turns == provider._turn_locks == {}
+            assert list((tmp_path / "ledger").glob("*.json"))
+            # 不确定是否接收成功时，不能重建或重复提交待处理结果。
+            assert sum(m.get("id") == 103 and "result" in m for m in rpc) == (
+                1 if mode == "steer_later_disconnect" else 0
+            )
+            return
+        assert provider._turns[("topic", "receipt")] is bridge
+        assert response.provider_diagnostics["context_sync"] == "steered"
+        assert not response.provider_diagnostics.get("context_rebased")
+        assert response.tool_calls[0].id == "call-4"
+        assert not response.provider_diagnostics.get("idempotent_tool_replays")
+        # 原线程继续到结束；不同回执分别注入一次，原生事件状态保留。
+        for n in range(4, 8):
+            call = response.tool_calls[0]
+            messages.extend([
+                {"role": "assistant", "tool_calls": [call.to_openai_tool_call()]},
+                {"role": "tool", "name": call.name, "tool_call_id": call.id,
+                 "content": "receipt-" + str(n)},
+            ])
+            if n == 5:
+                messages.append({"role": "user", "content": "SECOND_RECEIPT"})
+            response = await provider.chat(
+                messages=preparation.prepare_for_model(config, messages, set()),
+                request_context=context,
+            )
+        assert response.content == "done"
+        assert response.provider_diagnostics.get("native_command_executions", {}).get("count", 0) == int(native_effects)
+        assert response.provider_diagnostics.get("native_file_changes", {}).get("count", 0) == int(native_effects)
+        rpc = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        assert [m["params"]["input"] for m in rpc if m.get("method") == "turn/steer"] == [
+            [{"type": "text", "text": "WORKER_COMPLETED"}],
+            [{"type": "text", "text": "SECOND_RECEIPT"}],
+        ]
+        assert len(full_prepares) == 1
+        assert sum(m.get("method") == "turn/start" for m in rpc) == 1
+        assert [m["id"] for m in rpc if "result" in m] == list(range(101, 108))
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("mode", ["native_safe", "plain:native_safe"])
+async def test_native_steer_checks_new_input_budget_before_sending(tmp_path, mode):
+    provider, capture = _provider(tmp_path, mode)
+    context = {"session_key": "topic", "turn_id": "oversized-steer", "native_context": {
+        "context_window_tokens": 8000, "context_block_limit": 1000,
+    }}
+    messages = [{"role": "user", "content": "task"}]
+    try:
+        response = await provider.chat(messages=messages, request_context=context)
+        assert response.has_tool_calls
+        call = response.tool_calls[0]
+        messages.extend([
+            {"role": "assistant", "tool_calls": [call.to_openai_tool_call()]},
+            {"role": "tool", "tool_call_id": call.id, "content": "ok"},
+            {"role": "user", "content": "large receipt " * 10000},
+        ])
+        response = await provider.chat(messages=messages, request_context=context)
+        assert response.finish_reason == "error"
+        assert not response.has_tool_calls
+        assert not response.error_should_retry
+        rpc = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        assert not any(m.get("method") == "turn/steer" for m in rpc)
+        assert not any("result" in m for m in rpc)
+        assert sum(m.get("method") == "thread/start" for m in rpc) == 1
+        assert list((tmp_path / "ledger").glob("*.json"))
+    finally:
+        await provider.aclose()
+
+
+async def test_receipt_after_history_exceeds_start_budget_keeps_existing_thread(tmp_path, monkeypatch):
+    from nanobot.fork.providers import codex_native_context
+
+    # 用确定性估算复现：单次增量合法，累计历史超过新线程启动预算。
+    monkeypatch.setattr(codex_native_context, "estimate_prompt_tokens_chain", lambda p, m, rows, t: (
+        sum(len(row.get("content") or "") for row in rows), "test",
+    ))
+    provider, capture = _provider(tmp_path, "normal")
+    context = {"session_key": "topic", "turn_id": "large-receipt", "native_context": {
+        "context_window_tokens": 10000, "context_block_limit": 1000,
+    }}
+    messages = [{"role": "user", "content": "h" * 200}]
+    try:
+        response = await provider.chat(messages=messages, request_context=context)
+        bridge = provider._turns[("topic", "large-receipt")]
+        for n in range(1, 8):
+            assert response.has_tool_calls, response.content
+            call = response.tool_calls[0]
+            assert call.id == f"call-{n}"
+            messages.extend([
+                {"role": "assistant", "tool_calls": [call.to_openai_tool_call()]},
+                {"role": "tool", "name": call.name, "tool_call_id": call.id, "content": "r" * 150},
+            ])
+            if n == 6:
+                messages.append({"role": "user", "content": "WORKER_COMPLETED",
+                                 "injected_event": "subagent_result"})
+                with pytest.raises(ValueError, match="exceeds local budget"):
+                    codex_native_context.check_native_payload(provider, "test", messages, [], 1000)
+            response = await provider.chat(messages=messages, request_context=context)
+            if n == 6:
+                assert response.finish_reason != "error", response.content
+                assert provider._turns[("topic", "large-receipt")] is bridge
+                assert response.provider_diagnostics["context_sync"] == "steered"
+                assert not response.provider_diagnostics.get("idempotent_tool_replays")
+        assert response.content == "done"
+        rpc = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        assert sum(m.get("method") == "thread/start" for m in rpc) == 1
+        assert sum(m.get("method") == "turn/start" for m in rpc) == 1
+        assert [m["params"]["input"] for m in rpc if m.get("method") == "turn/steer"] == [
+            [{"type": "text", "text": "WORKER_COMPLETED"}],
+        ]
+        assert [m["id"] for m in rpc if "result" in m] == list(range(101, 108))
     finally:
         await provider.aclose()

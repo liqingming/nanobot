@@ -32,8 +32,21 @@ from nanobot.agent.context_governance import (
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
+from nanobot.fork.agent.context_budget import ContextBudgetError, resolve_context_budget
 from nanobot.fork.agent.context_usage import accumulate_usage, with_context_usage
+from nanobot.fork.agent.governance_metrics import GovernanceMetrics, projection_changes
 from nanobot.fork.agent.native_context import NativeContextPreparation, uses_native_context
+from nanobot.fork.agent.read_visibility import require_read_evidence
+from nanobot.fork.agent.recovery_packet import RecoveryPacketError
+from nanobot.fork.agent.subagent_control import should_wait_for_subagent_result
+from nanobot.fork.agent.summary_transaction import SummaryTransactionError
+from nanobot.fork.agent.tool_evidence import EvidencePersistenceError, persist_tool_evidence
+from nanobot.fork.agent.transactional_context import (
+    TransactionalContextPreparation,
+    assert_request_fits,
+    is_context_overflow,
+    validate_strategy,
+)
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.utils.helpers import (
@@ -106,6 +119,7 @@ class AgentRunSpec:
     session_key: str | None = None
     context_window_tokens: int | None = None
     context_block_limit: int | None = None
+    context_strategy: str = "transactional"
     provider_retry_mode: str = "standard"
     progress_callback: Any | None = None
     stream_progress_deltas: bool = True
@@ -119,6 +133,7 @@ class AgentRunSpec:
     goal_continue_message: GoalContinueMessage | None = None
     finalize_on_max_iterations: bool = True
     context_delta_callback: Callable[[dict[str, Any]], Any] | None = None
+    context_state_reader: Callable[[], Any] | None = None
 
 @dataclass(slots=True)
 class AgentRunResult:
@@ -132,6 +147,7 @@ class AgentRunResult:
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
+    context_safety_failure: bool = False
 
 
 class AgentRunner:
@@ -204,6 +220,7 @@ class AgentRunner:
         phase: str = "after error",
         iteration: int | None = None,
         allow_goal_continue: bool = False,
+        wait_for_subagents: bool = False,
     ) -> tuple[bool, int]:
         """Drain pending injections. Returns (should_continue, updated_cycles).
 
@@ -215,7 +232,9 @@ class AgentRunner:
         injections: list[dict[str, Any]] = []
         real_injection = False
         if injection_cycles < _MAX_INJECTION_CYCLES:
-            injections = await self._drain_injections(spec)
+            injections = await self._drain_injections(
+                spec, wait_for_subagents=wait_for_subagents,
+            )
             real_injection = bool(injections)
         if not injections and allow_goal_continue and assistant_message is not None:
             predicate = spec.goal_active_predicate
@@ -239,7 +258,11 @@ class AgentRunner:
                         "pending_tool_calls": [],
                     },
                 )
-        self._append_injected_messages(messages, injections)
+        if spec.context_strategy == "transactional" and not uses_native_context(self.provider):
+            # 保留每个接收事件的原文与引用，不回写已被摘要版本捕获的 user 行。
+            messages.extend(deepcopy(injections))
+        else:
+            self._append_injected_messages(messages, injections)
         if real_injection:
             logger.info(
                 "Injected {} follow-up message(s) {} ({}/{})",
@@ -259,7 +282,9 @@ class AgentRunner:
                 custom = None
         return build_goal_continue_message(custom)
 
-    async def _drain_injections(self, spec: AgentRunSpec) -> list[dict[str, Any]]:
+    async def _drain_injections(
+        self, spec: AgentRunSpec, *, wait_for_subagents: bool = False,
+    ) -> list[dict[str, Any]]:
         """Drain pending user messages via the injection callback.
 
         Returns normalized user messages (capped by
@@ -271,20 +296,19 @@ class AgentRunner:
             return []
         try:
             signature = inspect.signature(spec.injection_callback)
-            accepts_limit = (
-                "limit" in signature.parameters
-                or any(
-                    parameter.kind is inspect.Parameter.VAR_KEYWORD
-                    for parameter in signature.parameters.values()
-                )
+            accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
             )
-            if accepts_limit:
-                items = await spec.injection_callback(limit=_MAX_INJECTIONS_PER_TURN)
-            else:
-                items = await spec.injection_callback()
-        except Exception:
-            logger.exception("injection_callback failed")
-            return []
+            kwargs = {}
+            if "limit" in signature.parameters or accepts_kwargs:
+                kwargs["limit"] = _MAX_INJECTIONS_PER_TURN
+            if "wait_for_subagents" in signature.parameters or accepts_kwargs:
+                kwargs["wait_for_subagents"] = wait_for_subagents
+            items = await spec.injection_callback(**kwargs)
+        except Exception as exc:
+            # 插话可能包含撤销/新约束；读取失败不能假装没有新用户输入。
+            raise RecoveryPacketError("插话接收失败，停止而不绕过待处理输入。") from exc
         if not items:
             return []
         injected_messages: list[dict[str, Any]] = []
@@ -319,6 +343,7 @@ class AgentRunner:
             return bool(content)
         return True
 
+    @require_read_evidence
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
@@ -392,9 +417,9 @@ class AgentRunner:
         tool_digests: dict[str, ToolDigest] = {}
         adaptive_context_block_limit: int | None = None
         false_tool_budget_retries = 0
+        context_safety_failure = False
         model_request_count = 0
-        prompt_peak_tokens = 0
-        governance_saved_total = 0
+        governance_metrics = GovernanceMetrics()
         governance_config = ContextGovernanceConfig(
             provider=self.provider,
             model=spec.model,
@@ -410,6 +435,10 @@ class AgentRunner:
         )
 
         native_context = uses_native_context(self.provider)
+        transactional = not native_context and validate_strategy(spec.context_strategy) == "transactional"
+        transaction = (
+            TransactionalContextPreparation(spec.context_state_reader) if transactional else None
+        )
         context_preparation = (
             NativeContextPreparation(self.context_governor) if native_context else self.context_governor
         )
@@ -433,14 +462,33 @@ class AgentRunner:
                     if adaptive_context_block_limit is not None
                     else governance_config
                 )
+                request_budget = resolve_context_budget(
+                    self.provider, active_governance_config.context_window_tokens,
+                    active_governance_config.max_tokens,
+                    active_governance_config.context_block_limit,
+                )
+                if request_budget.input_tokens == 0:
+                    raise ContextBudgetError("上下文输入预算已耗尽，请检查窗口和输出预留配置。")
                 tools_for_model = active_governance_config.tools.get_definitions()
                 before_context = self.context_governor.context_metrics(messages, tools_for_model)
-                messages_for_model = context_preparation.prepare_for_model(
-                    active_governance_config,
-                    messages,
-                    compacted_tool_call_ids,
-                    tool_digests=tool_digests,
-                )
+                if transaction is not None:
+                    previous_version = transaction.version
+                    messages_for_model = await transaction.prepare(active_governance_config, messages)
+                    if transaction.version != previous_version:
+                        # 摘要等待期间收到的撤销/约束优先于下一次执行请求。
+                        added, injection_cycles = await self._try_drain_injections(
+                            spec, messages, None, injection_cycles, phase="after context summary",
+                        )
+                        if added:
+                            had_injections = True
+                            messages_for_model = await transaction.prepare(active_governance_config, messages)
+                else:
+                    messages_for_model = context_preparation.prepare_for_model(
+                        active_governance_config,
+                        messages,
+                        compacted_tool_call_ids,
+                        tool_digests=tool_digests,
+                    )
                 after_context = self.context_governor.context_metrics(
                     messages_for_model, tools_for_model
                 )
@@ -449,22 +497,50 @@ class AgentRunner:
                     for key in before_context
                 }
                 saved_total = max(0, before_context["total"] - after_context["total"])
-                governance_saved_total += saved_total
+                governance_metrics.observe_projection(saved_total)
                 self._log_event(
                     spec,
                     "runner.context.governance",
                     context_scope="native_checkpoint_copy" if native_context else "local_model_copy",
+                    compaction_owner="provider" if native_context else "nanobot",
+                    strategy="native" if native_context else spec.context_strategy,
+                    context_version=transaction.version if transaction else 0,
+                    version_locator=transaction.version_locator if transaction else None,
+                    budget=request_budget.diagnostics(),
+                    metrics_source="local_estimate",
                     iteration=iteration,
                     before=before_context,
                     after=after_context,
                     saved=saved_by_group,
                     saved_total=saved_total,
+                    projection_metrics_semantics="local_copy_not_remote_or_billing",
+                    **projection_changes(messages, messages_for_model),
                     compacted_tool_results=len(compacted_tool_call_ids),
                     digested_tool_results=sum(
                         1 for call_id in compacted_tool_call_ids if call_id in tool_digests
                     ),
                 )
+            except ContextBudgetError as exc:
+                context_safety_failure = True
+                final_content = error = str(exc)
+                stop_reason = "error"
+                self._log_event(
+                    spec, "runner.context.budget_exhausted", iteration=iteration,
+                    budget=request_budget.diagnostics(),
+                )
+                break
+            except (RecoveryPacketError, EvidencePersistenceError, SummaryTransactionError) as exc:
+                context_safety_failure = True
+                final_content = error = str(exc)
+                stop_reason = "error"
+                self._log_event(spec, "runner.context.safety_stop", iteration=iteration)
+                break
             except Exception:
+                if transactional:
+                    context_safety_failure = True
+                    final_content = error = "上下文治理异常，保留原文并停止；不会自动改用旧策略。"
+                    stop_reason = "error"
+                    break
                 logger.exception(
                     "Context governance failed on turn {} for {}; applying minimal repair",
                     iteration,
@@ -495,6 +571,7 @@ class AgentRunner:
             if (
                 LLMProvider.is_context_length_response(response)
                 and not native_context
+                and not transactional
                 and not context.streamed_content
             ):
                 estimate, source = estimate_prompt_tokens_chain(
@@ -545,6 +622,12 @@ class AgentRunner:
                     response = await self._request_model(
                         spec, messages_for_model, hook, context
                     )
+            if transactional and is_context_overflow(response):
+                context_safety_failure = True
+                final_content = error = "Provider 拒绝上下文长度，已停止；未裁历史重试。"
+                stop_reason = "error"
+                self._accumulate_usage(usage, self._usage_or_estimate(spec, messages_for_model, response))
+                break
             if (
                 false_tool_budget_retries < 1
                 and self._claims_false_tool_budget(response)
@@ -584,6 +667,8 @@ class AgentRunner:
                 response = await self._request_model(
                     spec, messages_for_model, hook, context
                 )
+            if transactional and is_context_overflow(response):
+                raise ContextBudgetError("纠偏请求被 Provider 判定超限，停止而不裁剪重试。")
             context.response = response
 
             context.tool_calls = list(response.tool_calls)
@@ -597,7 +682,7 @@ class AgentRunner:
             context.usage = dict(raw_usage)
             self._accumulate_usage(usage, raw_usage)
             model_request_count += 1
-            prompt_peak_tokens = max(prompt_peak_tokens, raw_usage.get("prompt_tokens", 0))
+            governance_metrics.observe_usage(raw_usage)
             response_log_fields: dict[str, Any] = {
                 "iteration": iteration,
                 "finish_reason": response.finish_reason,
@@ -657,6 +742,12 @@ class AgentRunner:
                             "change the investigation or implementation approach, or finish with "
                             "a clear explanation of what blocks progress."
                         )
+                        if any(name == "subagent_control" for batch in loop_pattern for name, _ in batch):
+                            loop_correction += (
+                                " If a child is still running and independent work is finished, "
+                                "use subagent_control(action='wait', task_id='<actual-id>') once "
+                                "to let the host wait for its receipt. Do not poll unchanged plans."
+                            )
                         self._log_event(
                             spec,
                             "runner.tool_loop.warned",
@@ -782,31 +873,37 @@ class AgentRunner:
                 context.tool_events = list(new_events)
                 await hook.after_execute_tools(context)
                 completed_tool_results: list[dict[str, Any]] = []
+                evidence_error: Exception | None = None
                 for tool_call, result, event in zip(response.tool_calls, results, new_events):
-                    normalized = self.context_governor.normalize_tool_result(
-                        governance_config,
-                        tool_call.id,
-                        tool_call.name,
-                        result,
-                    )
-                    artifact_locator = self.context_governor.persisted_result_locator(normalized)
-                    digest, evidence = ToolDigestBuilder.build(
-                        tool_call_id=tool_call.id,
-                        tool_name=tool_call.name,
-                        arguments=tool_call.arguments,
-                        result=result,
-                        status=str(event.get("status") or "ok"),
-                        artifact_locator=artifact_locator,
-                    )
-                    tool_digests[tool_call.id] = digest
-                    if spec.context_delta_callback is not None:
-                        try:
+                    normalized = result
+                    try:
+                        # 来源只取运行时实际保存结果，不解析不可信回执内的“已保存路径”。
+                        artifact_locator = persist_tool_evidence(governance_config, result)
+                        normalized = self.context_governor.normalize_tool_result(
+                            governance_config, tool_call.id, tool_call.name, result,
+                            artifact_locator=artifact_locator,
+                        )
+                        digest, evidence = ToolDigestBuilder.build(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            arguments=tool_call.arguments,
+                            result=result,
+                            status=str(event.get("status") or "ok"),
+                            artifact_locator=artifact_locator,
+                        )
+                        tool_digests[tool_call.id] = digest
+                        if spec.context_delta_callback is not None:
                             spec.context_delta_callback({
                                 "tool_digest": digest,
                                 "evidence": evidence,
                             })
-                        except Exception:
-                            logger.exception("Context delta callback failed for {}", tool_call.id)
+                    except Exception as exc:
+                        # 工具已经执行：保留整批回执，不重新执行、不走通用裁剪兜底。
+                        normalized = result
+                        evidence_error = EvidencePersistenceError(
+                            "工具证据保存或登记失败，已保留原始回执；停止后续模型请求。"
+                        )
+                        logger.error("Tool evidence failed for {}: {}", tool_call.id, type(exc).__name__)
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -815,6 +912,17 @@ class AgentRunner:
                     }
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
+                if evidence_error is not None:
+                    context_safety_failure = True
+                    await self._emit_checkpoint(spec, {
+                        "phase": "tools_completed", "iteration": iteration, "model": spec.model,
+                        "assistant_message": assistant_message,
+                        "completed_tool_results": completed_tool_results, "pending_tool_calls": [],
+                    })
+                    error = final_content = str(evidence_error)
+                    stop_reason = "error"
+                    self._append_final_message(messages, final_content)
+                    break
                 if loop_correction is not None:
                     messages.append({"role": "user", "content": loop_correction})
                 if fatal_error is not None:
@@ -847,11 +955,18 @@ class AgentRunner:
                 )
                 empty_content_retries = 0
                 length_recovery_count = 0
-                # Checkpoint 1: drain injections after tools, before next LLM call
+                # 普通工具后立即检查；只有明确的子任务 wait 才让宿主接管等待。
+                host_wait = should_wait_for_subagent_result(response.tool_calls, results, new_events)
+                if host_wait:
+                    self._log_event(spec, "runner.subagent.wait.start", iteration=iteration)
                 _drained, injection_cycles = await self._try_drain_injections(
                     spec, messages, None, injection_cycles,
                     phase="after tool execution",
+                    wait_for_subagents=host_wait,
                 )
+                if host_wait:
+                    self._log_event(spec, "runner.subagent.wait.done", iteration=iteration,
+                                    had_injections=_drained)
                 if _drained:
                     had_injections = True
                 await hook.after_iteration(context)
@@ -928,15 +1043,18 @@ class AgentRunner:
                     response_items=response.response_items,
                 )
 
-            # Check real mid-turn injections before signaling stream end. A
-            # sustained goal persists across user turns; it must not manufacture
-            # another user message after a model has completed this turn.
-            # If real injections are found we keep the stream alive (resuming=True)
-            # so streaming channels don't prematurely finalize the card.
+            # 先接收真实插话；正常回复不是持续目标完成凭据。
+            # 仅活动且未等待用户的目标续跑，错误/空回复不触发；仍受迭代上限约束。
+            # 保持流开放，避免子任务回执后的阶段汇报提前终结主任务。
             should_continue, injection_cycles = await self._try_drain_injections(
                 spec, messages, assistant_message, injection_cycles,
                 phase="after final response",
                 iteration=iteration,
+                allow_goal_continue=response.finish_reason in {"stop", "end_turn"},
+                # 工具后的检查必须立即返回；只有正常回复收尾才允许等子任务。
+                wait_for_subagents=(
+                    assistant_message is not None and response.finish_reason in {"stop", "end_turn"}
+                ),
             )
             if should_continue:
                 had_injections = True
@@ -1052,16 +1170,17 @@ class AgentRunner:
                 )
             self._append_final_message(messages, final_content)
 
+        if transaction is not None:
+            self._accumulate_usage(usage, transaction.usage)
         self._log_event(
             spec,
             "runner.context.turn_summary",
             model_requests=model_request_count,
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
-            prompt_peak_tokens=prompt_peak_tokens,
+            **governance_metrics.summary(native=native_context),
             context_input_tokens=usage.get("context_input_tokens", 0),
             context_input_estimated=usage.get("context_input_estimated", 0),
-            governance_saved_total=governance_saved_total,
             compacted_tool_results=len(compacted_tool_call_ids),
             digested_tool_results=sum(
                 1 for call_id in compacted_tool_call_ids if call_id in tool_digests
@@ -1076,6 +1195,7 @@ class AgentRunner:
             error=error,
             tool_events=tool_events,
             had_injections=had_injections,
+            context_safety_failure=context_safety_failure,
         )
 
     @staticmethod
@@ -1169,6 +1289,12 @@ class AgentRunner:
         for name, arguments_json in batch:
             if name in _TOOL_LOOP_EXEMPT_TOOLS:
                 continue
+            if name == "subagent_control":
+                try:
+                    if json.loads(arguments_json).get("action") == "wait":
+                        continue
+                except (AttributeError, json.JSONDecodeError):
+                    return False
             if name == "process_control":
                 try:
                     action = json.loads(arguments_json).get("action")
@@ -1197,6 +1323,7 @@ class AgentRunner:
         malformed_retry: bool = False,
         timeout_retry: bool = False,
     ):
+        assert_request_fits(self.provider, spec, messages, spec.tools.get_definitions())
         timeout_s: float | None = spec.llm_timeout_s
         if timeout_s is None:
             # Default to a finite timeout to avoid per-session lock starvation when an LLM
@@ -1481,6 +1608,8 @@ class AgentRunner:
         started_at = time.monotonic()
         try:
             response = await self._request_no_tools(spec, retry_messages)
+        except (ContextBudgetError, RecoveryPacketError, EvidencePersistenceError, SummaryTransactionError):
+            raise
         except Exception as exc:
             self._log_event(
                 spec,
@@ -1555,8 +1684,13 @@ class AgentRunner:
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
     ) -> LLMResponse:
+        assert_request_fits(self.provider, spec, messages, None)
         kwargs = self._build_request_kwargs(spec, messages, tools=None)
-        return await self.provider.chat_with_retry(**kwargs)
+        response = await self.provider.chat_with_retry(**kwargs)
+        if spec.context_strategy == "transactional" and not uses_native_context(self.provider):
+            if is_context_overflow(response):
+                raise ContextBudgetError("最终回答请求被 Provider 判定超限，安全停止。")
+        return response
 
     @staticmethod
     def _budget_exhausted_finalization_messages(
