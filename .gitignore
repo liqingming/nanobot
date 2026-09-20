@@ -117,3 +117,6 @@ nanobot/fork/cmdSkins/*.[gG][iI][fF]
 %SystemDrive%
 webui/.verify-*
 .playwright-cli/
+MagicMock
+docs
+.nanobot
