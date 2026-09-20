@@ -8,7 +8,7 @@ from nanobot.fork.agent.context_usage import (
     context_input_tokens,
     with_context_usage,
 )
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, LLMUsage, ToolCallRequest
 
 
 def test_consumption_sums_but_context_replaces():
@@ -38,7 +38,7 @@ def test_codex_cumulative_delta_is_never_context_size():
 
 async def test_runner_retains_total_and_latest_context_through_tools():
     provider = MagicMock(spec=LLMProvider)
-    provider.chat_with_retry = AsyncMock(side_effect=[
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
         LLMResponse(content=None, tool_calls=[ToolCallRequest(id="c", name="read_file", arguments={})],
                     usage={"prompt_tokens": 100, "completion_tokens": 10}),
         LLMResponse(content="done", usage={"prompt_tokens": 200, "completion_tokens": 20}),
@@ -50,8 +50,8 @@ async def test_runner_retains_total_and_latest_context_through_tools():
         initial_messages=[{"role": "user", "content": "task"}],
         tools=tools, model="test", max_iterations=3, max_tool_result_chars=16000,
     ))
-    assert result.usage["prompt_tokens"] == 300
-    assert result.usage["completion_tokens"] == 30
+    assert result.usage.input_tokens == 300
+    assert result.usage.output_tokens == 30
     assert context_input_tokens(result.usage) == 200
 
 
@@ -72,8 +72,8 @@ def test_turn_summary_uses_latest_context_not_turn_consumption():
 
 def test_finalization_usage_merge_preserves_latest_context():
     merged = AgentRunner._merge_usage(
-        {"prompt_tokens": 1000, "context_input_tokens": 1000},
-        {"prompt_tokens": 500, "context_input_tokens": 500},
+        LLMUsage.reported(input_tokens=1000, output_tokens=0),
+        LLMUsage.reported(input_tokens=500, output_tokens=0),
     )
-    assert merged["prompt_tokens"] == 1500
-    assert merged["context_input_tokens"] == 500
+    assert merged.input_tokens == 1500
+    assert merged.context_tokens == 500

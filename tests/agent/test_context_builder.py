@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from nanobot.agent.context import ContextBuilder, SystemPromptBuild
+from nanobot.agent.context import ContextBuilder, SystemPromptBuild, TranscriptInput
+from nanobot.runtime_context import RuntimeContextBlock
 from nanobot.session.goal_state import GOAL_STATE_KEY
 from nanobot.utils.helpers import load_bundled_template
 
@@ -110,42 +111,6 @@ class TestSkillsRoots:
 
 
 # ---------------------------------------------------------------------------
-# _build_runtime_context (static)
-# ---------------------------------------------------------------------------
-
-
-class TestBuildRuntimeContext:
-    def test_time_only(self):
-        ctx = ContextBuilder._build_runtime_context(None, None)
-        assert "[Runtime Context" in ctx
-        assert "[/Runtime Context]" in ctx
-        assert "Current Time:" in ctx
-        assert "Channel:" not in ctx
-
-    def test_with_channel_and_chat_id(self):
-        ctx = ContextBuilder._build_runtime_context("telegram", "chat123")
-        assert "Channel: telegram" in ctx
-        assert "Chat ID: chat123" in ctx
-
-    def test_with_sender_id(self):
-        ctx = ContextBuilder._build_runtime_context("cli", "direct", sender_id="user1")
-        assert "Sender ID: user1" in ctx
-
-    def test_with_timezone(self):
-        ctx = ContextBuilder._build_runtime_context(None, None, timezone="Asia/Shanghai")
-        assert "Current Time:" in ctx
-
-    def test_no_channel_no_chat_id_omits_both(self):
-        ctx = ContextBuilder._build_runtime_context(None, None)
-        assert "Channel:" not in ctx
-        assert "Chat ID:" not in ctx
-
-    def test_no_sender_id_omits(self):
-        ctx = ContextBuilder._build_runtime_context("cli", "direct")
-        assert "Sender ID:" not in ctx
-
-
-# ---------------------------------------------------------------------------
 # _merge_message_content (static)
 # ---------------------------------------------------------------------------
 
@@ -209,6 +174,11 @@ class TestLoadBootstrapFiles:
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
 
     def test_no_bootstrap_files(self, tmp_path):
+        builder = _builder(tmp_path)
+        assert builder._load_bootstrap_files() == ""
+
+    def test_empty_bootstrap_files(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("\n", encoding="utf-8")
         builder = _builder(tmp_path)
         assert builder._load_bootstrap_files() == ""
 
@@ -294,6 +264,60 @@ class TestLoadBootstrapFiles:
         result = builder._load_bootstrap_files()
         assert "用中文回复" in result
 
+    def test_selected_project_supplies_only_agents_file(self, tmp_path):
+        agent_home = tmp_path / "agent-home"
+        project = tmp_path / "project"
+        agent_home.mkdir()
+        project.mkdir()
+        (agent_home / "AGENTS.md").write_text("global project rules", encoding="utf-8")
+        (agent_home / "SOUL.md").write_text("global soul", encoding="utf-8")
+        (agent_home / "USER.md").write_text("global user", encoding="utf-8")
+        (project / "AGENTS.md").write_text("selected project rules", encoding="utf-8")
+        (project / "SOUL.md").write_text("project soul collision", encoding="utf-8")
+        (project / "USER.md").write_text("project user collision", encoding="utf-8")
+
+        result = ContextBuilder(agent_home).build_system_prompt(workspace=project)
+
+        assert "selected project rules" in result
+        assert "global project rules" not in result
+        assert "global soul" in result
+        assert "global user" in result
+        assert "project soul collision" not in result
+        assert "project user collision" not in result
+
+    def test_selected_project_without_agents_does_not_fall_back(self, tmp_path):
+        agent_home = tmp_path / "agent-home"
+        project = tmp_path / "project"
+        agent_home.mkdir()
+        project.mkdir()
+        (agent_home / "AGENTS.md").write_text("default workspace rules", encoding="utf-8")
+
+        result = ContextBuilder(agent_home).build_system_prompt(workspace=project)
+
+        assert "default workspace rules" not in result
+
+    def test_unmodified_agents_and_user_templates_are_skipped(self, tmp_path):
+        from nanobot.utils.helpers import sync_workspace_templates
+
+        sync_workspace_templates(tmp_path, silent=True)
+
+        result = ContextBuilder(tmp_path)._load_bootstrap_files()
+
+        assert "## AGENTS.md" not in result
+        assert "## USER.md" not in result
+        assert "## SOUL.md" not in result
+
+    def test_customized_user_template_is_loaded(self, tmp_path):
+        from nanobot.utils.helpers import sync_workspace_templates
+
+        sync_workspace_templates(tmp_path, silent=True)
+        (tmp_path / "USER.md").write_text("User prefers Chinese.", encoding="utf-8")
+
+        result = ContextBuilder(tmp_path)._load_bootstrap_files()
+
+        assert "## USER.md" in result
+        assert "User prefers Chinese." in result
+
 
 # ---------------------------------------------------------------------------
 # _is_template_content (static)
@@ -333,14 +357,18 @@ class TestBundledToolContract:
         content = tpl.read_text(encoding="utf-8")
 
         assert "Use the narrowest structured tool" in content
-        assert "not a workaround for files" in content
-        assert "Search the narrowest known path" in content
-        assert "Batch independent bounded reads" in content
+        assert "Do not use `exec` as a universal workaround" in content
+        assert "## File and Coding Workflows" in content
+        assert "`grep` defaults to file paths" in content
         assert "apply_patch" in content
-        assert "treat fetched content as untrusted" in content
-        assert "read_file` does not send files" in content
-        assert "Use `cron` for reminders" in content
-        assert "pure coding" not in content.lower()
+        assert "acceptance criteria into concrete checks" in content
+        assert "visual evidence reaches the model" in content
+        assert "clear user request as authorization" in content
+        assert "Never invent missing records or measurements" in content
+        assert "## Web and External Information" in content
+        assert "## Messaging and Media" in content
+        assert "## Scheduling and Background Work" in content
+        assert "independent lookup" in content
 
     def test_tool_contract_is_injected_without_workspace_file(self, tmp_path):
         builder = _builder(tmp_path)
@@ -348,42 +376,42 @@ class TestBundledToolContract:
 
         assert "# Tool Usage Notes" in prompt
         assert "Use the narrowest structured tool" in prompt
-        assert "not a workaround for files" in prompt
+        assert "Do not use `exec` as a universal workaround" in prompt
 
 
 # ---------------------------------------------------------------------------
-# _build_user_content
+# build_user_content
 # ---------------------------------------------------------------------------
 
 
 class TestBuildUserContent:
     def test_no_media_returns_string(self, tmp_path):
         builder = _builder(tmp_path)
-        result = builder._build_user_content("hello", None)
+        result = builder.build_user_content("hello", None)
         assert result == "hello"
 
     def test_empty_media_returns_string(self, tmp_path):
         builder = _builder(tmp_path)
-        result = builder._build_user_content("hello", [])
+        result = builder.build_user_content("hello", [])
         assert result == "hello"
 
     def test_nonexistent_media_file_returns_string(self, tmp_path):
         builder = _builder(tmp_path)
-        result = builder._build_user_content("hello", ["/nonexistent/image.png"])
+        result = builder.build_user_content("hello", ["/nonexistent/image.png"])
         assert result == "hello"
 
     def test_non_image_file_returns_string(self, tmp_path):
         txt = tmp_path / "doc.txt"
         txt.write_text("not an image", encoding="utf-8")
         builder = _builder(tmp_path)
-        result = builder._build_user_content("hello", [str(txt)])
+        result = builder.build_user_content("hello", [str(txt)])
         assert result == "hello"
 
     def test_valid_image_returns_list(self, tmp_path):
         png = tmp_path / "test.png"
         png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
         builder = _builder(tmp_path)
-        result = builder._build_user_content("hello", [str(png)])
+        result = builder.build_user_content("hello", [str(png)])
         assert isinstance(result, list)
         assert len(result) == 2
         assert result[0]["type"] == "image_url"
@@ -395,7 +423,7 @@ class TestBuildUserContent:
         png = tmp_path / "test.png"
         png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
         builder = _builder(tmp_path)
-        result = builder._build_user_content("hello", [str(png)])
+        result = builder.build_user_content("hello", [str(png)])
         assert "_meta" in result[0]
         assert "path" in result[0]["_meta"]
 
@@ -434,18 +462,34 @@ class TestBuildSystemPrompt:
     def test_workspace_section_does_not_guess_memory_or_skill_paths(self, tmp_path):
         builder = _builder(tmp_path)
         result = builder.build_system_prompt(session_key="cli:topic")
-        workspace_section = result.split("## Platform Policy", maxsplit=1)[0]
 
-        assert "Your workspace is at:" in workspace_section
-        assert "Long-term memory:" not in workspace_section
-        assert "History log:" not in workspace_section
-        assert "Custom skills:" not in workspace_section
         assert "## Memory Paths" in result
         assert "Global memory:" in result
         assert "Topic memory:" in result
         assert "memory/history.jsonl" in result
         assert "memory/topics/cli_topic/history.jsonl" in result
         assert "HISTORY.md" not in result
+
+    def test_default_identity_uses_relative_agent_paths(self, tmp_path):
+        result = ContextBuilder(tmp_path)._get_identity()
+
+        assert str(tmp_path.resolve()) not in result.split("## Memory Paths", 1)[0]
+        assert "Agent profile: SOUL.md and USER.md" in result
+        assert "History log: memory/history.jsonl" in result
+        assert "Custom skills: skills/{skill-name}/SKILL.md" in result
+
+    def test_selected_project_identity_keeps_agent_data_in_agent_workspace(self, tmp_path):
+        agent_home = tmp_path / "agent-home"
+        project = tmp_path / "project"
+        agent_home.mkdir()
+        project.mkdir()
+
+        result = ContextBuilder(agent_home)._get_identity(workspace=project)
+
+        assert str(project.resolve()) not in result
+        assert f"agent workspace is at: {agent_home.resolve()}" in result
+        assert f"{agent_home.resolve()}/SOUL.md" in result
+        assert f"{project.resolve()}/SOUL.md" not in result
 
     def test_includes_bootstrap_files(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Be helpful and concise.", encoding="utf-8")
@@ -486,14 +530,24 @@ class TestBuildSystemPrompt:
 
     def test_session_summary_stays_out_of_stable_system_prompt(self, tmp_path):
         builder = _builder(tmp_path)
-        result = builder.build_system_prompt(session_summary="Previous chat about Python.")
-        assert "Previous chat about Python." not in result
-        assert "[Archived Context Summary]" not in result
+        summary = {
+            "text": "Previous chat about Python.",
+            "last_active": "2026-08-19T10:00:00",
+        }
+        result = builder.build_system_prompt(session_summary=summary)
+        assert "Previous chat about Python." in result
+        assert "[Archived Context Summary]" in result
+
+    def test_nothing_summary_builds_the_prompt_without_archived_context(self, tmp_path):
+        builder = _builder(tmp_path)
+        summary = {"text": "(nothing)", "last_active": "2026-08-19T10:00:00"}
+        assert builder.build_system_prompt(session_summary=summary) == builder.build_system_prompt()
 
     def test_sections_separated_by_separator(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Rules.", encoding="utf-8")
         builder = _builder(tmp_path)
-        result = builder.build_system_prompt(session_summary="Summary.")
+        summary = {"text": "Summary.", "last_active": "2026-08-19T10:00:00"}
+        result = builder.build_system_prompt(session_summary=summary)
         assert "\n\n---\n\n" in result
 
     def test_no_bootstrap_no_summary(self, tmp_path):
@@ -524,6 +578,14 @@ class TestBuildMessages:
         assert "Fresh summary" in messages[-1]["content"]
         assert "Fresh summary" not in messages[0]["content"]
 
+    def test_optional_arguments_are_keyword_only(self, tmp_path):
+        builder = _builder(tmp_path)
+
+        with pytest.raises(TypeError):
+            builder.build_system_prompt(["legacy-skill"])
+        with pytest.raises(TypeError):
+            builder.build_messages([], "hello", ["legacy-skill"])
+
     def test_basic_empty_history(self, tmp_path):
         builder = _builder(tmp_path)
         messages = builder.build_messages([], "hello")
@@ -532,69 +594,95 @@ class TestBuildMessages:
         assert messages[1]["role"] == "user"
         assert "hello" in str(messages[1]["content"])
 
-    def test_runtime_context_injected(self, tmp_path):
-        builder = _builder(tmp_path)
-        messages = builder.build_messages([], "hello", channel="cli", chat_id="direct")
-        user_msg = str(messages[-1]["content"])
-        assert "[Runtime Context" in user_msg
-        assert "hello" in user_msg
+    def test_public_builder_preserves_assistant_role_compatibility(self, tmp_path):
+        from nanobot.agent import ContextBuilder as PublicContextBuilder
 
-    def test_session_metadata_injects_active_goal_state(self, tmp_path):
-        builder = _builder(tmp_path)
-        meta = {
-            GOAL_STATE_KEY: {"status": "active", "objective": "Finish docs migration."},
-        }
+        builder = PublicContextBuilder(tmp_path)
         messages = builder.build_messages(
-            [],
-            "hi",
-            channel="cli",
-            chat_id="x",
-            session_metadata=meta,
+            history=[{"role": "assistant", "content": "previous result"}],
+            current_message="subagent result",
+            current_role="assistant",
+            runtime_context_blocks=[
+                RuntimeContextBlock(source="test", content="user-only runtime context"),
+            ],
         )
-        user_msg = str(messages[-1]["content"])
-        assert "task.objective:" in user_msg
-        assert "Finish docs migration." in user_msg
-        assert "Goal (active):" not in user_msg
 
-    def test_goal_state_does_not_leak_without_session_metadata(self, tmp_path):
+
+        assert len(messages) == 2
+        assert messages[-1]["role"] == "assistant"
+        assert messages[-1]["content"] == "previous result\n\nsubagent result"
+        assert "user-only runtime context" not in messages[-1]["content"]
+        assert "_meta" not in messages[-1]
+
+    def test_compatibility_builder_merges_system_role_without_history(self, tmp_path):
         builder = _builder(tmp_path)
-        other_session_meta = {
-            GOAL_STATE_KEY: {"status": "active", "objective": "Other chat goal."},
-        }
 
-        with_goal = builder.build_messages(
-            [],
-            "hi",
-            channel="websocket",
-            chat_id="chat-a",
-            session_metadata=other_session_meta,
+        messages = builder.build_messages([], "system event", current_role="system")
+
+        assert len(messages) == 1
+        assert messages[0]["role"] == "system"
+        assert str(messages[0]["content"]).endswith("system event")
+
+    def test_explicit_skill_reference_loads_full_instructions_for_this_turn(self, tmp_path):
+        skill_dir = tmp_path / "skills" / "review"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: review\n"
+            "description: Review changes.\n"
+            "---\n\n"
+            "# Review workflow\n\nFollow the unique review checklist.",
+            encoding="utf-8",
         )
-        without_goal = builder.build_messages(
-            [],
-            "hi",
-            channel="websocket",
-            chat_id="chat-b",
-            session_metadata={},
-        )
+        builder = _builder(tmp_path)
 
-        assert "Other chat goal." in str(with_goal[-1]["content"])
-        assert "Other chat goal." not in str(without_goal[-1]["content"])
-        assert "Goal (active):" not in str(without_goal[-1]["content"])
+        messages = builder.build_messages([], "Please $review this patch and use $review carefully.")
+        plain_messages = builder.build_messages([], "Please review this patch carefully.")
 
-    def test_current_runtime_lines_are_injected(self, tmp_path):
+        system_prompt = messages[0]["content"]
+        user_prompt = messages[-1]["content"]
+        assert system_prompt == plain_messages[0]["content"]
+        assert "Follow the unique review checklist." not in system_prompt
+        assert "Please $review this patch" in user_prompt
+        assert "[Active Skills — instructions for this user turn]" in user_prompt
+        assert "### Skill: review" in user_prompt
+        assert "Follow the unique review checklist." in user_prompt
+        assert user_prompt.count("### Skill: review") == 1
+        assert messages[-1]["_meta"]["runtime_context"]["sources"] == [
+            "explicit_skills"
+        ]
+
+    def test_unknown_skill_reference_does_not_change_active_skills(self, tmp_path):
+        messages = _builder(tmp_path).build_messages([], "Keep the shell literal $HOME.")
+
+        assert "# Active Skills" not in messages[0]["content"]
+
+    def test_runtime_context_is_not_injected_by_default(self, tmp_path):
+        builder = _builder(tmp_path)
+        messages = builder.build_messages([], "hello", channel="cli")
+        user_msg = str(messages[-1]["content"])
+        assert user_msg == "hello"
+
+    def test_explicit_runtime_context_blocks_are_appended(self, tmp_path):
         builder = _builder(tmp_path)
         messages = builder.build_messages(
             [],
             "please use @zoom tonight",
-            current_runtime_lines=[
-                "CLI App Attachment: @zoom (installed; tool=run_cli_app; entry_point=cli-anything-zoom).",
+            runtime_context_blocks=[
+                RuntimeContextBlock(
+                    source="cli_apps",
+                    content="CLI App Attachment: @zoom (installed; tool=run_cli_app).",
+                ),
             ],
         )
         user_msg = str(messages[-1]["content"])
 
         assert "CLI App Attachment: @zoom" in user_msg
         assert "tool=run_cli_app" in user_msg
-        assert "entry_point=cli-anything-zoom" in user_msg
+        assert user_msg.index("please use @zoom tonight") < user_msg.index(
+            "CLI App Attachment: @zoom"
+        )
+        assert messages[-1]["_meta"]["runtime_context"]["sources"] == ["cli_apps"]
 
     def test_consecutive_same_role_merged(self, tmp_path):
         builder = _builder(tmp_path)
@@ -603,6 +691,34 @@ class TestBuildMessages:
         assert len(messages) == 2  # system + merged user
         assert "previous user message" in str(messages[1]["content"])
         assert "new message" in str(messages[1]["content"])
+
+    def test_structured_transcript_preserves_fresh_turn_boundary(self, tmp_path):
+        builder = _builder(tmp_path)
+        transcript = TranscriptInput(
+            history=[{"role": "user", "content": "previous user message"}],
+            current_message="new message",
+        )
+
+        messages = builder.build_transcript(transcript)
+
+        assert [message["role"] for message in messages] == ["system", "user", "user"]
+        assert messages[-2]["content"] == "previous user message"
+        assert messages[-1]["content"] == "new message"
+        assert transcript.message_count == 3
+
+    def test_current_message_can_be_built_without_history_merge(self, tmp_path):
+        builder = _builder(tmp_path)
+        current = builder.build_current_message(
+            "new message",
+            runtime_context_blocks=[
+                RuntimeContextBlock(source="test", content="fresh context"),
+            ],
+        )
+
+        assert current["role"] == "user"
+        assert "new message" in current["content"]
+        assert "fresh context" in current["content"]
+        assert current["_meta"]["runtime_context"]["sources"] == ["test"]
 
     def test_different_role_appended(self, tmp_path):
         builder = _builder(tmp_path)
@@ -687,3 +803,15 @@ def test_build_messages_injects_resume_guard_and_unresolved_todos(tmp_path) -> N
     assert "resume.last_goal.status: completed" in user_msg
     assert "Finish documented follow-up" in user_msg
     assert "# Active Todos" in system_msg
+
+
+def test_active_goal_is_rendered_in_current_user_context(tmp_path):
+    builder = _builder(tmp_path)
+    messages = builder.build_messages(
+        [], "continue", session_metadata={GOAL_STATE_KEY: {
+            "status": "active", "objective": "Finish docs migration.",
+            "started_at": "2026-09-11T00:00:00",
+        }},
+    )
+    assert "Finish docs migration." in str(messages[-1]["content"])
+    assert "Goal (active):" not in str(messages[-1]["content"])

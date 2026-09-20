@@ -14,18 +14,21 @@ class RecordingHook(AgentHook):
         self._events.append(f"{self._label}:{context.iteration}")
 
 
-@pytest.mark.asyncio
-async def test_turn_hook_builder_runs_progress_hook_before_extra_hooks() -> None:
-    events: list[str] = []
+def test_turn_hook_context_preserves_legacy_positional_arguments(tmp_path) -> None:
+    context = AgentTurnHookContext(
+        None,
+        tmp_path,
+        "sdk",
+        "chat-a",
+        "message-1",
+        "sdk:chat-a",
+        {"trusted": True},
+        True,
+    )
 
-    hook = build_agent_turn_hook(AgentTurnHookSpec(
-        on_iteration=lambda iteration: events.append(f"progress:{iteration}"),
-        registered_hooks=[RecordingHook(events)],
-    ))
-
-    await hook.before_iteration(AgentHookContext(iteration=2, messages=[]))
-
-    assert events == ["progress:2", "hook:2"]
+    assert context.metadata == {"trusted": True}
+    assert context.ephemeral is True
+    assert context.attributes == {}
 
 
 @pytest.mark.asyncio
@@ -33,14 +36,13 @@ async def test_turn_hook_builder_runs_registered_hooks_before_turn_hooks() -> No
     events: list[str] = []
 
     hook = build_agent_turn_hook(AgentTurnHookSpec(
-        on_iteration=lambda iteration: events.append(f"progress:{iteration}"),
         registered_hooks=[RecordingHook(events, "registered")],
         turn_hooks=[RecordingHook(events, "turn")],
     ))
 
     await hook.before_iteration(AgentHookContext(iteration=2, messages=[]))
 
-    assert events == ["progress:2", "registered:2", "turn:2"]
+    assert events == ["registered:2", "turn:2"]
 
 
 @pytest.mark.asyncio
@@ -58,13 +60,13 @@ async def test_turn_hook_builder_runs_factories_with_matching_registration_order
         return _create
 
     hook = build_agent_turn_hook(AgentTurnHookSpec(
-        on_iteration=lambda iteration: events.append(f"progress:{iteration}"),
         channel="websocket",
         chat_id="chat-1",
         message_id="msg-1",
         session_key="websocket:chat-1",
         workspace=tmp_path,
         metadata={"source": "test"},
+        attributes={"tenant": "acme"},
         registered_hook_factories=[factory("registered_factory")],
         registered_hooks=[RecordingHook(events, "registered")],
         turn_hook_factories=[factory("turn_factory")],
@@ -74,7 +76,6 @@ async def test_turn_hook_builder_runs_factories_with_matching_registration_order
     await hook.before_iteration(AgentHookContext(iteration=2, messages=[]))
 
     assert events == [
-        "progress:2",
         "registered_factory:2",
         "registered:2",
         "turn_factory:2",
@@ -91,6 +92,10 @@ async def test_turn_hook_builder_runs_factories_with_matching_registration_order
     assert [context.metadata for context in captured] == [
         {"source": "test"},
         {"source": "test"},
+    ]
+    assert [context.attributes for context in captured] == [
+        {"tenant": "acme"},
+        {"tenant": "acme"},
     ]
 
 

@@ -107,3 +107,21 @@ async def test_trigger_command_without_name_returns_usage_only(tmp_path: Path) -
 
 def test_trigger_command_is_in_help_text() -> None:
     assert "/trigger <name>" in build_help_text()
+
+
+@pytest.mark.asyncio
+async def test_trigger_command_default_store_matches_cli_cache(tmp_path: Path) -> None:
+    from nanobot.config.paths import get_workspace_cache_dir
+
+    router = CommandRouter()
+    register_builtin_commands(router)
+    loop = SimpleNamespace(workspace=tmp_path, local_trigger_store=None)
+    msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/trigger review")
+    response = await router.dispatch(CommandContext(
+        msg=msg, session=None, key="cli:direct", raw=msg.content, loop=loop,
+    ))
+    assert response is not None
+    stored = LocalTriggerStore(get_workspace_cache_dir(tmp_path)).list_for_session("cli:direct")
+    assert len(stored) == 1
+    assert stored[0].name == "review"
+    assert LocalTriggerStore(tmp_path).list_for_session("cli:direct") == []

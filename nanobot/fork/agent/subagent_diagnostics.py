@@ -13,7 +13,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from nanobot.fork.agent.context_usage import with_context_usage
 from nanobot.fork.agent.execution_scope import current_execution_id
+from nanobot.providers.base import LLMUsage
 from nanobot.utils.session_runtime_log import append_session_runtime_log
 
 _EVENTS = frozenset({
@@ -141,6 +143,7 @@ class SubagentDiagnostics:
         }
         self._provider_execution_id: str | None = None
         self._sequence = 0
+        self._context_usage: dict[str, int] = {}
 
     def __call__(self, event: str, fields: dict[str, Any]) -> None:
         try:
@@ -150,12 +153,21 @@ class SubagentDiagnostics:
             if execution_id is not None:
                 self._provider_execution_id = execution_id
             safe = _safe_fields(fields, _NUMBERS, _BOOLS, _ENUMS)
+            usage = LLMUsage.from_dict(fields.get("usage"))
+            if usage is not None:
+                fields = {**fields, "usage": with_context_usage(usage, self._context_usage, lambda: 0)}
             for key, allowed in (
                 ("usage", _USAGE), ("budget", _BUDGET),
                 ("before", _GROUPS), ("after", _GROUPS), ("saved", _GROUPS),
             ):
                 if type(fields.get(key)) is dict:
                     safe[key] = _safe_fields(fields[key], allowed, frozenset(), {})
+            if event == "runner.model.response" and "usage" in safe:
+                self._context_usage = {
+                    key: value for key, value in safe["usage"].items()
+                    if key in {"context_input_tokens", "context_input_estimated"}
+                    and type(value) is int
+                }
             if type(fields.get("provider_diagnostics")) is dict:
                 safe["provider_diagnostics"] = _safe_fields(
                     fields["provider_diagnostics"], _PROVIDER_NUMBERS,

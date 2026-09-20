@@ -12,6 +12,7 @@ from nanobot.fork.agent.context_budget import ContextBudgetError, resolve_contex
 from nanobot.fork.agent.native_context import uses_native_context
 from nanobot.fork.agent.summary_transaction import SummaryTransactionError, valid_summary
 from nanobot.fork.agent.tool_evidence import EvidencePersistenceError, persist_tool_evidence
+from nanobot.providers.base import GenerationSettings, LLMUsage
 from nanobot.utils.helpers import estimate_prompt_tokens_chain
 
 SUMMARY_INSTRUCTION = (
@@ -66,13 +67,16 @@ def assert_request_fits(provider: Any, spec: Any, messages: list[dict], tools: A
 async def request_summary(
     provider: Any, *, model: str, messages: list[dict],
     max_tokens: int, timeout: float = 120,
+    generation: GenerationSettings | None = None,
 ) -> Any:
     # 原生 Agent Provider 不具备已验证的无执行摘要协议；tools=[] 不是关闭原生工具。
     if uses_native_context(provider):
         raise SummaryTransactionError("原生 Provider 未提供隔离摘要能力，拒绝启动可执行摘要请求。")
+    generation_kwargs = ({"temperature": generation.temperature, "reasoning_effort": generation.reasoning_effort}
+                         if generation is not None else {})
     return await asyncio.wait_for(provider.chat_with_retry(
         model=model, messages=messages, tools=None, tool_choice=None,
-        max_tokens=max_tokens,
+        max_tokens=max_tokens, **generation_kwargs,
     ), timeout=timeout)
 
 
@@ -85,7 +89,7 @@ class TransactionalContextPreparation:
         self.projected: list[dict] = []
         self.version = 0
         self.version_locator: str | None = None
-        self.usage: dict[str, int] = {}
+        self.usage: LLMUsage | None = None
 
     async def prepare(self, config: Any, messages: list[dict]) -> list[dict]:
         if messages[:len(self.source)] != self.source:
@@ -151,10 +155,15 @@ class TransactionalContextPreparation:
             response = await request_summary(
                 config.provider, model=config.model, messages=request, max_tokens=output_tokens,
             )
-            if isinstance(response.usage, dict):
-                for name, value in response.usage.items():
-                    if type(value) is int:
-                        self.usage[name] = self.usage.get(name, 0) + value
+            reported = response.usage
+            if isinstance(reported, dict):
+                reported = LLMUsage.reported(
+                    input_tokens=max(0, int(reported.get("prompt_tokens", 0))),
+                    output_tokens=max(0, int(reported.get("completion_tokens", 0))),
+                    total_tokens=max(0, int(reported.get("total_tokens", 0))),
+                )
+            if isinstance(reported, LLMUsage):
+                self.usage = reported if self.usage is None else self.usage + reported
             if response.finish_reason not in {"stop", "end_turn"} or response.tool_calls:
                 raise ValueError("摘要响应未完整完成或包含工具调用")
             payload = json.loads(response.content)

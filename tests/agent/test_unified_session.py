@@ -20,13 +20,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.tools.file_state import FileStateStore
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command.builtin import cmd_new, register_builtin_commands
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.config.schema import AgentDefaults, Config
+from nanobot.providers.base import GenerationSettings
 from nanobot.session.keys import UNIFIED_SESSION_KEY
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import SessionManager
+from nanobot.utils.llm_runtime import LLMRuntime
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -48,6 +51,15 @@ def _make_loop(tmp_path: Path, unified_session: bool = False) -> AgentLoop:
             unified_session=unified_session,
         )
     return loop
+
+
+def _runtime(provider) -> LLMRuntime:
+    provider.generation = GenerationSettings(max_tokens=100)
+    return LLMRuntime.capture(
+        provider,
+        "test-model",
+        context_window_tokens=1000,
+    )
 
 
 def _make_msg(channel: str = "telegram", chat_id: str = "111",
@@ -233,22 +245,39 @@ class TestCmdNewUnifiedSession:
         shared.add_message("assistant", "hi there")
         sessions.save(shared)
         assert len(sessions.get_or_create("unified:default").messages) == 2
+        expected_snapshot = list(shared.messages)
 
-        # _schedule_background is a *sync* method that schedules a coroutine via
+        # schedule_background is a *sync* method that schedules a coroutine via
         # asyncio.create_task().  Mirror that exactly so the coroutine is consumed
         # and no RuntimeWarning is emitted.
+        admitted_runtime = MagicMock(name="admitted_runtime")
+        file_state_store = FileStateStore()
+        previous_file_state = file_state_store.for_session("unified:default")
+        tracked_file = tmp_path / "tracked.txt"
+        tracked_file.write_text("tracked", encoding="utf-8")
+        previous_file_state.record_read(tracked_file)
         loop = SimpleNamespace(
             sessions=sessions,
-            consolidator=SimpleNamespace(archive=AsyncMock(return_value=True)),
+            consolidator=SimpleNamespace(archive_session=AsyncMock(return_value=True)),
+            _cancel_active_tasks=AsyncMock(return_value=0),
+            discard_session_file_state=file_state_store.discard,
+            llm_runtime=MagicMock(return_value=MagicMock()),
+            schedule_background=lambda coro: asyncio.ensure_future(coro),
             cancel_session_turn=AsyncMock(return_value=0),
         )
-        loop._schedule_background = lambda coro: asyncio.ensure_future(coro)
 
         msg = InboundMessage(
             channel="telegram", sender_id="user1", chat_id="111", content="/new",
             session_key_override="unified:default",  # as _dispatch() would set it
         )
-        ctx = CommandContext(msg=msg, session=None, key="unified:default", raw="/new", loop=loop)
+        ctx = CommandContext(
+            msg=msg,
+            session=None,
+            key="unified:default",
+            raw="/new",
+            loop=loop,
+            runtime=admitted_runtime,
+        )
 
         result = await cmd_new(ctx)
 
@@ -257,6 +286,19 @@ class TestCmdNewUnifiedSession:
         sessions.invalidate("unified:default")
         reloaded = sessions.get_or_create("unified:default")
         assert reloaded.messages == []
+        reset_file_state = file_state_store.for_session("unified:default")
+        assert reset_file_state is not previous_file_state
+        assert reset_file_state.is_unchanged(tracked_file) is False
+        archived = loop.consolidator.archive_session.call_args.args[0]
+        assert archived.key == "unified:default"
+        assert archived.messages == expected_snapshot
+        assert archived.last_archived == 0
+        loop.consolidator.archive_session.assert_called_once_with(
+            archived,
+            archive_end=len(expected_snapshot),
+            runtime=admitted_runtime,
+        )
+        loop.llm_runtime.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cmd_new_in_unified_mode_does_not_affect_other_sessions(self, tmp_path: Path):
@@ -273,10 +315,13 @@ class TestCmdNewUnifiedSession:
 
         loop = SimpleNamespace(
             sessions=sessions,
-            consolidator=SimpleNamespace(archive=AsyncMock(return_value=True)),
+            consolidator=SimpleNamespace(archive_session=AsyncMock(return_value=True)),
+            _cancel_active_tasks=AsyncMock(return_value=0),
+            discard_session_file_state=MagicMock(),
+            runtime_for_session=MagicMock(return_value=MagicMock()),
+            schedule_background=lambda coro: asyncio.ensure_future(coro),
             cancel_session_turn=AsyncMock(return_value=0),
         )
-        loop._schedule_background = lambda coro: asyncio.ensure_future(coro)
 
         msg = InboundMessage(
             channel="telegram", sender_id="user1", chat_id="111", content="/new",
@@ -289,119 +334,6 @@ class TestCmdNewUnifiedSession:
         sessions.invalidate("discord:999")
         assert sessions.get_or_create("unified:default").messages == []
         assert len(sessions.get_or_create("discord:999").messages) == 1
-
-
-# ---------------------------------------------------------------------------
-# TestConsolidationUnaffectedByUnifiedSession — consolidation is key-agnostic
-# ---------------------------------------------------------------------------
-
-class TestConsolidationUnaffectedByUnifiedSession:
-    """maybe_consolidate_by_tokens() behaviour is identical regardless of session key."""
-
-    @pytest.mark.asyncio
-    async def test_consolidation_skips_empty_session_for_unified_key(self):
-        """Empty unified:default session → consolidation exits immediately, archive not called."""
-        from nanobot.agent.memory import Consolidator, MemoryStore
-
-        store = MagicMock(spec=MemoryStore)
-        mock_provider = MagicMock()
-        mock_provider.chat_with_retry = AsyncMock(return_value=MagicMock(content="summary"))
-        # Use spec= so MagicMock doesn't auto-generate AsyncMock for non-async methods,
-        # which would leave unawaited coroutines and trigger RuntimeWarning.
-        sessions = MagicMock(spec=SessionManager)
-
-        consolidator = Consolidator(
-            store=store,
-            provider=mock_provider,
-            model="test-model",
-            sessions=sessions,
-            context_window_tokens=1000,
-            build_messages=MagicMock(return_value=[]),
-            get_tool_definitions=MagicMock(return_value=[]),
-            max_completion_tokens=100,
-        )
-        consolidator.archive = AsyncMock()
-
-        session = Session(key="unified:default")
-        session.messages = []
-
-        await consolidator.maybe_consolidate_by_tokens(session)
-
-        consolidator.archive.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_consolidation_behaviour_identical_for_any_key(self):
-        """archive call count is the same for 'telegram:123' and 'unified:default'
-        under identical token conditions."""
-        from nanobot.agent.memory import Consolidator, MemoryStore
-
-        archive_calls: dict[str, int] = {}
-
-        for key in ("telegram:123", "unified:default"):
-            store = MagicMock(spec=MemoryStore)
-            mock_provider = MagicMock()
-            mock_provider.chat_with_retry = AsyncMock(return_value=MagicMock(content="summary"))
-            sessions = MagicMock(spec=SessionManager)
-
-            consolidator = Consolidator(
-                store=store,
-                provider=mock_provider,
-                model="test-model",
-                sessions=sessions,
-                context_window_tokens=1000,
-                build_messages=MagicMock(return_value=[]),
-                get_tool_definitions=MagicMock(return_value=[]),
-                max_completion_tokens=100,
-            )
-
-            session = Session(key=key)
-            session.messages = []  # empty → exits immediately for both keys
-
-            consolidator.archive = AsyncMock()
-            await consolidator.maybe_consolidate_by_tokens(session)
-            archive_calls[key] = consolidator.archive.call_count
-
-        assert archive_calls["telegram:123"] == archive_calls["unified:default"] == 0
-
-    @pytest.mark.asyncio
-    async def test_consolidation_triggers_when_over_budget_unified_key(self):
-        """When tokens exceed budget, consolidation attempts to find a boundary —
-        behaviour is identical to any other session key."""
-        from nanobot.agent.memory import Consolidator, MemoryStore
-
-        store = MagicMock(spec=MemoryStore)
-        mock_provider = MagicMock()
-        sessions = MagicMock(spec=SessionManager)
-
-        consolidator = Consolidator(
-            store=store,
-            provider=mock_provider,
-            model="test-model",
-            sessions=sessions,
-            context_window_tokens=1000,
-            build_messages=MagicMock(return_value=[]),
-            get_tool_definitions=MagicMock(return_value=[]),
-            max_completion_tokens=100,
-        )
-
-        session = Session(key="unified:default")
-        session.messages = [{"role": "user", "content": "msg"}]
-        sessions.get_or_create.return_value = session
-
-        # Simulate over-budget: estimated > budget
-        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(950, "tiktoken"))
-        # No valid boundary found → returns gracefully without archiving
-        consolidator.pick_consolidation_boundary = MagicMock(return_value=None)
-        consolidator.archive = AsyncMock()
-
-        await consolidator.maybe_consolidate_by_tokens(session)
-
-        # estimate was called (consolidation was attempted)
-        consolidator.estimate_session_prompt_tokens.assert_called_once_with(
-            session,
-        )
-        # but archive was not called (no valid boundary)
-        consolidator.archive.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +361,7 @@ class TestStopCommandWithUnifiedSession:
         # Simulate the task creation flow (from _run loop)
         effective_key = UNIFIED_SESSION_KEY if loop._unified_session and not msg.session_key_override else msg.session_key
         task = asyncio.create_task(loop._dispatch(msg))
-        loop._active_tasks.setdefault(effective_key, []).append(task)
+        loop._active_tasks.setdefault(effective_key, set()).add(task)
 
         # Wait for task to complete
         await task
@@ -450,7 +382,7 @@ class TestStopCommandWithUnifiedSession:
             await asyncio.sleep(10)  # Will be cancelled
 
         task = asyncio.create_task(long_running())
-        loop._active_tasks[UNIFIED_SESSION_KEY] = [task]
+        loop._active_tasks[UNIFIED_SESSION_KEY] = {task}
 
         # Create a message that would have session_key=UNIFIED_SESSION_KEY after dispatch
         msg = InboundMessage(
@@ -481,7 +413,7 @@ class TestStopCommandWithUnifiedSession:
             await asyncio.sleep(10)
 
         task = asyncio.create_task(long_running())
-        loop._active_tasks[UNIFIED_SESSION_KEY] = [task]
+        loop._active_tasks[UNIFIED_SESSION_KEY] = {task}
         msg = InboundMessage(
             channel="telegram",
             chat_id="123456",
@@ -508,7 +440,7 @@ class TestStopCommandWithUnifiedSession:
 
         task1 = asyncio.create_task(long_running())
         task2 = asyncio.create_task(long_running())
-        loop._active_tasks[UNIFIED_SESSION_KEY] = [task1, task2]
+        loop._active_tasks[UNIFIED_SESSION_KEY] = {task1, task2}
 
         # /stop from discord should cancel tasks started from telegram
         msg = InboundMessage(

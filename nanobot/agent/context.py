@@ -6,21 +6,37 @@ import mimetypes
 import platform
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
 
 from nanobot.agent.context_artifacts import render_active_context, select_memory_view
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.skills import SkillsLoader, configured_skill_roots, project_skill_roots
+from nanobot.agent.skills import (
+    SkillsLoader,
+    configured_skill_roots,
+    project_skill_roots,
+)
+from nanobot.agent.tools import image_generation as image_generation_tools
 from nanobot.agent.tools import mcp as mcp_tools
+from nanobot.agent.tools import sessions as session_tools
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.apps.cli import utils as cli_app_utils
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import (
+    INBOUND_META_RUNTIME_CONTROL,
+    RUNTIME_CONTROL_SESSION_DISCARD,
+    InboundMessage,
+)
 from nanobot.fork.agent.input_evidence import make_input_verifier
 from nanobot.fork.agent.source_evidence import make_source_verifier
-from nanobot.session.goal_state import goal_state_runtime_lines
+from nanobot.runtime_context import (
+    RUNTIME_CONTEXT_MESSAGE_META,
+    RuntimeContextBlock,
+    append_runtime_context,
+)
+from nanobot.security.workspace_access import WorkspaceScopeResolver
+from nanobot.session.keys import last_channel_from_metadata
+from nanobot.session.manager import Session
+from nanobot.session.summary import SessionSummary
 from nanobot.utils.helpers import (
-    build_assistant_message,
-    current_time_str,
     detect_image_mime,
     estimate_message_tokens,
     load_bundled_template,
@@ -32,44 +48,82 @@ from nanobot.utils.prompt_templates import render_template
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return persisted kwargs for turn-attached capabilities."""
-    return cli_app_utils.session_extra(metadata) | mcp_tools.session_extra(metadata)
+    return (
+        cli_app_utils.session_extra(metadata)
+        | mcp_tools.session_extra(metadata)
+        | session_tools.session_extra(metadata)
+    )
+
+
+async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolRegistry) -> bool:
+    if msg.metadata.get(INBOUND_META_RUNTIME_CONTROL) == RUNTIME_CONTROL_SESSION_DISCARD:
+        await state.discard_session(msg.session_key)
+        return True
+    return await image_generation_tools.handle_runtime_control(state, msg, tools)
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedPromptContextResolver:
+    """Restore prompt routing context when no inbound message is available."""
+
+    workspace_scopes: WorkspaceScopeResolver
+    unified_session: bool = False
+
+    def __call__(self, session: Session) -> tuple[str | None, Path]:
+        channel = session.key.split(":", 1)[0] if ":" in session.key else None
+        if self.unified_session:
+            route = last_channel_from_metadata(session.metadata)
+            if route is not None:
+                channel = route[0]
+        scope = self.workspace_scopes.for_turn(
+            channel=channel,
+            message_metadata=None,
+            session_metadata=session.metadata,
+        )
+        return channel, scope.project_path
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptInput:
+    """Raw turn inputs from which ``ContextBuilder`` assembles a transcript."""
+
+    history: list[dict[str, Any]]
+    current_message: str | None
+    media: Sequence[str] | None = None
+    current_role: str = "user"
+    session_summary: SessionSummary | str | None = None
+    runtime_context_blocks: Sequence[RuntimeContextBlock] | None = None
+    session_key: str | None = None
+    session_metadata: Mapping[str, Any] | None = None
+    todos: list[dict[str, Any]] | None = None
+    learning_ctx: str | None = None
+    resume_request: bool = False
+    runtime_state: Any = None
+    inbound_message: Any = None
+    pending_summary: str | None = None
+    include_memory_recent_history: bool = True
+    unified_session: bool = False
+    system_prompt_metrics: dict[str, int] | None = None
+
+    @property
+    def message_count(self) -> int:
+        """Number of boundary-preserving messages in the assembled transcript."""
+        return 1 + len(self.history) + (self.current_message is not None)
 
 
 @dataclass(frozen=True, slots=True)
 class SystemPromptBuild:
-    """Rendered system prompt plus stable per-section token estimates."""
-
     prompt: str
     section_tokens: dict[str, int]
-
-
-def runtime_lines(state: Any, msg: Any, workspace: Path, *, skip: bool = False) -> list[str]:
-    """Return model-visible runtime annotations for turn-attached capabilities."""
-    return [
-        *cli_app_utils.runtime_lines(msg, workspace, skip=skip),
-        *mcp_tools.runtime_lines(
-            msg,
-            configured_server_names=set(state._mcp_servers),
-            connected_server_names=set(state._mcp_stacks),
-            skip=skip,
-        ),
-    ]
-
-
-async def connect_mcp(state: Any, tools: ToolRegistry) -> None:
-    await mcp_tools.connect_missing_servers(state, tools)
-
-
-async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolRegistry) -> bool:
-    return await mcp_tools.handle_runtime_control(state, msg, tools)
 
 
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
-    _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
-    _RUNTIME_CONTEXT_END = "[/Runtime Context]"
+    _SKIPPABLE_DEFAULTS = {"AGENTS.md", "USER.md"}
+    _SKILL_MATCH_MIN_TOKEN_LEN = 4
+    _SKILL_MATCH_MAX_SUGGESTIONS = 3
     _MAX_RECENT_HISTORY = 12
     _MAX_HISTORY_TOKENS = 1_500
     # Default bootstrap contents observed in this user's existing local data
@@ -98,35 +152,24 @@ class ContextBuilder:
         self.skills = SkillsLoader(
             self.data_dir,
             disabled_skills=set(disabled_skills) if disabled_skills else None,
-            extra_skill_roots=[*self.configured_skill_roots, *project_skill_roots(self.workspace)],
+            extra_skill_roots=[*self.configured_skill_roots, *project_skill_roots(self.workspace),
+                               *([("workspace", self.workspace / "skills")] if self.workspace != self.data_dir else [])],
         )
         self._topic_memory_factory = topic_memory_factory
 
-    def _get_topic_store(self, session_key: str | None) -> MemoryStore | None:
-        if self._topic_memory_factory is None or not isinstance(session_key, str) or not session_key:
-            return None
-        return self._topic_memory_factory.get(session_key)
-
-    def _skills_for_workspace(self, workspace: Path) -> SkillsLoader:
-        if workspace == self.workspace:
-            return self.skills
-        return SkillsLoader(
-            self.data_dir,
-            disabled_skills=self.skills.disabled_skills,
-            extra_skill_roots=[*self.configured_skill_roots, *project_skill_roots(workspace)],
-        )
-
     def build_system_prompt(
         self,
+        *,
         skill_names: list[str] | None = None,
         include_learning_rules: bool = False,
         session_key: str | None = None,
         todos: list[dict[str, Any]] | None = None,
         channel: str | None = None,
-        session_summary: str | None = None,
+        session_summary: SessionSummary | str | None = None,
         workspace: Path | None = None,
         include_memory_recent_history: bool = True,
         unified_session: bool = False,
+        include_memory: bool = True,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         return self.build_system_prompt_with_metrics(
@@ -139,94 +182,8 @@ class ContextBuilder:
             workspace=workspace,
             include_memory_recent_history=include_memory_recent_history,
             unified_session=unified_session,
+            include_memory=include_memory,
         ).prompt
-
-    def build_system_prompt_with_metrics(
-        self,
-        skill_names: list[str] | None = None,
-        include_learning_rules: bool = False,
-        session_key: str | None = None,
-        todos: list[dict[str, Any]] | None = None,
-        channel: str | None = None,
-        session_summary: str | None = None,
-        workspace: Path | None = None,
-        include_memory_recent_history: bool = True,
-        unified_session: bool = False,
-    ) -> SystemPromptBuild:
-        """Build the system prompt and expose comparable per-section estimates."""
-        del skill_names  # Reserved for API compatibility; skills are loaded progressively.
-        root = workspace or self.workspace
-        sections: list[tuple[str, str]] = []
-
-        def add(name: str, content: str | None) -> None:
-            if content and content.strip():
-                sections.append((name, content))
-
-        add("identity", self._get_identity(session_key=session_key, channel=channel, workspace=root))
-        add("bootstrap", self._load_bootstrap_files(root))
-        add("tool_contract", render_template("agent/tool_contract.md"))
-
-        mem_parts: list[str] = []
-        raw_global_memory = self.memory.read_memory()
-        if raw_global_memory and not self._is_template_content(
-            raw_global_memory, "memory/MEMORY.md"
-        ):
-            global_memory = self.memory.format_memory_context(raw_global_memory)
-            global_memory = select_memory_view(global_memory)
-            if global_memory:
-                mem_parts.append(global_memory)
-        topic_store = self._get_topic_store(session_key)
-        topic_mem = topic_store.read_memory() if topic_store is not None else ""
-        if topic_mem:
-            topic_view = select_memory_view(topic_mem)
-            if topic_view:
-                mem_parts.append(f"### Topic Memory\n{topic_view}")
-        add("memory", "\n\n".join(mem_parts))
-
-        if todos:
-            from nanobot.fork.agent.tools.todo import format_todos
-            add("todos", "# Active Todos\n\n" + format_todos(todos))
-
-        skills = self._skills_for_workspace(root)
-        always_skills = skills.get_always_skills()
-        always_content = skills.load_skills_for_context(always_skills) if always_skills else ""
-        add("always_skills", f"# Active Skills\n\n{always_content}" if always_content else "")
-
-        skills_summary = skills.build_skills_summary(exclude=set(always_skills))
-        if skills_summary:
-            add("skills_index", render_template("agent/skills_section.md", skills_summary=skills_summary))
-
-        if include_memory_recent_history:
-            entries = self.memory.read_recent_history_for_prompt(
-                since_cursor=self.memory.get_last_dream_cursor(),
-                session_key=session_key,
-                unified_session=unified_session,
-            )
-            if entries:
-                capped = entries[-self._MAX_RECENT_HISTORY:]
-                history_text = "\n".join(
-                    f"- [{entry['timestamp']}] {entry['content']}" for entry in capped
-                )
-                history_text = truncate_text_to_tokens(history_text, self._MAX_HISTORY_TOKENS)
-                add("recent_history", "# Recent History\n\n" + history_text)
-
-        # Active/legacy continuation state is injected with the current user
-        # metadata so the stable system prefix remains cache-friendly.
-
-        if include_learning_rules:
-            lr_path = self.data_dir / "LEARNING_RULES.md"
-            if lr_path.exists():
-                add("learning_rules", lr_path.read_text(encoding="utf-8"))
-
-        prompt = "\n\n---\n\n".join(content for _name, content in sections)
-        section_tokens = {
-            name: estimate_message_tokens({"role": "system", "content": content})
-            for name, content in sections
-        }
-        section_tokens["total"] = estimate_message_tokens(
-            {"role": "system", "content": prompt}
-        )
-        return SystemPromptBuild(prompt=prompt, section_tokens=section_tokens)
 
     def _get_identity(
         self,
@@ -243,6 +200,7 @@ class ContextBuilder:
         identity = render_template(
             "agent/identity.md",
             workspace_path=workspace_path,
+            agent_workspace_path=str(self.workspace.expanduser().resolve()),
             runtime=runtime,
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
@@ -263,37 +221,22 @@ class ContextBuilder:
         return f"{identity}\n\n## Memory Paths\n{memory_lines}\n- Custom skills: {data_path}/skills/{{skill-name}}/SKILL.md"
 
     @staticmethod
-    def _build_runtime_context(
-        channel: str | None,
-        chat_id: str | None,
-        timezone: str | None = None,
-        sender_id: str | None = None,
-        supplemental_lines: Sequence[str] | None = None,
-    ) -> str:
-        """Build untrusted runtime metadata block appended after user content."""
-        lines = [f"Current Time: {current_time_str(timezone)}"]
-        if channel and chat_id:
-            lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
-        if sender_id:
-            lines += [f"Sender ID: {sender_id}"]
-        if supplemental_lines:
-            lines.extend(supplemental_lines)
-        return (
-            ContextBuilder._RUNTIME_CONTEXT_TAG
-            + "\n"
-            + "\n".join(lines)
-            + "\n"
-            + ContextBuilder._RUNTIME_CONTEXT_END
-        )
-
-    @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
         if isinstance(left, str) and isinstance(right, str):
-            return f"{left}\n\n{right}" if left else right
+            if not left:
+                return right
+            if not right:
+                return left
+            return f"{left}\n\n{right}"
 
         def _to_blocks(value: Any) -> list[dict[str, Any]]:
             if isinstance(value, list):
-                return [item if isinstance(item, dict) else {"type": "text", "text": str(item)} for item in value]
+                return [
+                    cast(dict[str, Any], item)
+                    if isinstance(item, dict)
+                    else {"type": "text", "text": str(item)}
+                    for item in cast(list[Any], value)
+                ]
             if value is None:
                 return []
             return [{"type": "text", "text": str(value)}]
@@ -312,10 +255,8 @@ class ContextBuilder:
             (".claude/CLAUDE.md", root / ".claude" / "CLAUDE.md"),
         ]
         for filename in self.BOOTSTRAP_FILES:
-            data_path = self.data_dir / filename
-            candidates.append((filename, data_path))
-            if self.data_dir != root:
-                candidates.append((filename, root / filename))
+            source = root if filename == "AGENTS.md" else self.data_dir
+            candidates.append((filename, source / filename))
 
         for label, file_path in candidates:
             if not file_path.exists():
@@ -328,6 +269,10 @@ class ContextBuilder:
                 continue
             seen_paths.add(resolved)
             content = file_path.read_text(encoding="utf-8")
+            if label == "SOUL.md" and self._is_template_content(content, "legacy/SOUL.md"):
+                content = load_bundled_template("SOUL.md") or content
+            if not content.strip():
+                continue
             if label in self.BOOTSTRAP_FILES and self._is_template_content(content, label):
                 continue
             parts.append(f"## {label}\n\n{content}")
@@ -344,8 +289,327 @@ class ContextBuilder:
         digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         return digest in cls._LEGACY_DEFAULT_BOOTSTRAP_HASHES.get(template_path, set())
 
-    _SKILL_MATCH_MIN_TOKEN_LEN = 4
-    _SKILL_MATCH_MAX_SUGGESTIONS = 3
+    def build_messages(
+        self,
+        history: list[dict[str, Any]],
+        current_message: str | None,
+        *,
+        media: list[str] | None = None,
+        channel: str | None = None,
+        current_role: str = "user",
+        session_summary: SessionSummary | str | None = None,
+        runtime_context_blocks: Sequence[RuntimeContextBlock] | None = None,
+        workspace: Path | None = None,
+        include_memory: bool = True,
+        skill_names: list[str] | None = None,
+        chat_id: str | None = None,
+        sender_id: str | None = None,
+        learning_ctx: str | None = None,
+        session_key: str | None = None,
+        todos: list[dict[str, Any]] | None = None,
+        pending_summary: str | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
+        resume_request: bool = False,
+        current_runtime_lines: Sequence[str] | None = None,
+        runtime_state: Any = None,
+        inbound_message: Any = None,
+        skip_runtime_lines: bool = False,
+        include_memory_recent_history: bool = True,
+        unified_session: bool = False,
+        system_prompt_metrics: dict[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Adapt legacy turn inputs to the boundary-preserving transcript builder."""
+        del skill_names
+        blocks = list(runtime_context_blocks or ())
+        if not skip_runtime_lines:
+            lines = list(current_runtime_lines or ())
+            if chat_id:
+                lines.append(f"Chat ID: {chat_id}")
+            if sender_id:
+                lines.append(f"Sender ID: {sender_id}")
+            if lines:
+                blocks.append(RuntimeContextBlock(source="fork_request", content="\n".join(lines)))
+        messages = self.build_transcript(
+            TranscriptInput(
+                history=history,
+                current_message=current_message,
+                media=media,
+                current_role=current_role,
+                session_summary=session_summary,
+                runtime_context_blocks=blocks,
+                session_key=session_key,
+                session_metadata=session_metadata,
+                todos=todos,
+                learning_ctx=learning_ctx,
+                pending_summary=pending_summary,
+                resume_request=resume_request,
+                runtime_state=runtime_state,
+                inbound_message=inbound_message,
+                include_memory_recent_history=include_memory_recent_history,
+                unified_session=unified_session,
+                system_prompt_metrics=system_prompt_metrics,
+            ),
+            channel=channel,
+            workspace=workspace,
+            include_memory=include_memory,
+        )
+        if current_message is None:
+            return messages
+        current = messages[-1]
+        if len(messages) < 2 or messages[-2].get("role") != current.get("role"):
+            return messages
+
+        merged = dict(messages[-2])
+        merged["content"] = self._merge_message_content(
+            merged.get("content"),
+            current.get("content"),
+        )
+        current_meta = current.get("_meta")
+        if current.get("role") == "user" and isinstance(current_meta, dict):
+            internal_meta = dict(merged.get("_meta") or {})
+            internal_meta.update(cast(dict[str, Any], current_meta))
+            merged["_meta"] = internal_meta
+        return [*messages[:-2], merged]
+
+    def build_transcript(
+        self,
+        transcript: TranscriptInput,
+        *,
+        channel: str | None = None,
+        workspace: Path | None = None,
+        include_memory: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Build a model transcript while preserving the fresh-turn boundary."""
+        root = workspace or self.workspace
+        system_build = self.build_system_prompt_with_metrics(
+            channel=channel,
+            session_key=transcript.session_key,
+            todos=transcript.todos,
+            include_learning_rules=transcript.learning_ctx is not None,
+            session_summary=transcript.session_summary,
+            workspace=root,
+            include_memory=include_memory,
+            include_memory_recent_history=transcript.include_memory_recent_history,
+            unified_session=transcript.unified_session,
+        )
+        if transcript.system_prompt_metrics is not None:
+            transcript.system_prompt_metrics.clear()
+            transcript.system_prompt_metrics.update(system_build.section_tokens)
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_build.prompt},
+            *transcript.history,
+        ]
+        if transcript.current_message is None:
+            return messages
+
+        registry = getattr(transcript.runtime_state, "tools", None)
+        active = render_active_context(
+            transcript.session_metadata, workspace=root,
+            legacy_summary=transcript.session_summary if isinstance(transcript.session_summary, str) else None,
+            todos=transcript.todos, resume_request=transcript.resume_request,
+            source_verifier=make_source_verifier(
+                root, registry.get("read_file") if isinstance(registry, ToolRegistry) else None,
+                getattr(transcript.inbound_message, "metadata", None),
+            ),
+            input_verifier=make_input_verifier(self.data_dir, transcript.session_key),
+        )
+        reminder = ""
+        if transcript.pending_summary and transcript.pending_summary.strip():
+            reminder = (
+                "<system-reminder>\nUpdated long-term memory (consolidated from earlier "
+                "in this conversation; not yet promoted to MEMORY.md):\n\n"
+                f"{transcript.pending_summary.strip()}\n</system-reminder>"
+            )
+        loader = self._skills_for_workspace(root)
+        skill_hint = self._build_skill_match_reminder(
+            transcript.current_message, loader,
+        ) if (
+            transcript.current_role == "user"
+            and getattr(transcript.inbound_message, "sender_id", None) != "subagent"
+            and not loader.get_explicitly_invoked_skills(transcript.current_message)
+        ) else ""
+        prefix = "\n\n".join(
+            part for part in (active, transcript.learning_ctx, reminder, skill_hint) if part
+        ) if transcript.current_role == "user" else ""
+        blocks = list(transcript.runtime_context_blocks or ())
+        if prefix:
+            blocks.append(RuntimeContextBlock(source="fork_context", content=prefix))
+        current = self.build_current_message(
+            transcript.current_message,
+            media=list(transcript.media) if transcript.media else None,
+            current_role=transcript.current_role,
+            runtime_context_blocks=blocks,
+            skills=self._skills_for_workspace(root),
+        )
+        messages.append(current)
+        return messages
+
+    def build_current_message(
+        self,
+        current_message: str,
+        *,
+        media: list[str] | None = None,
+        current_role: str = "user",
+        runtime_context_blocks: Sequence[RuntimeContextBlock] | None = None,
+        skills: SkillsLoader | None = None,
+    ) -> dict[str, Any]:
+        """Build only the fresh turn message without merging it into history."""
+        content = self.build_user_content(current_message, image_paths=media)
+        blocks: list[RuntimeContextBlock] = []
+        if current_role == "user":
+            blocks.extend(runtime_context_blocks or ())
+            skill_context = (skills or self.skills).build_explicit_skill_runtime_context(current_message)
+            if skill_context is not None and skill_context not in blocks:
+                blocks.append(skill_context)
+        merged, runtime_context_meta = append_runtime_context(content, blocks)
+        current: dict[str, Any] = {"role": current_role, "content": merged}
+        if current_role == "user" and runtime_context_meta is not None:
+            current["_meta"] = {
+                RUNTIME_CONTEXT_MESSAGE_META: runtime_context_meta,
+            }
+        return current
+
+    def build_user_content(
+        self,
+        text: str,
+        image_paths: list[str] | None,
+    ) -> str | list[dict[str, Any]]:
+        """Build user message content from prefiltered image paths."""
+        if not image_paths:
+            return text
+
+        image_blocks: list[dict[str, Any]] = []
+        for path in image_paths:
+            p = Path(path)
+            if not p.is_file():
+                continue
+            raw = p.read_bytes()
+            # Re-detect from the bytes used for the request: the file may have
+            # changed since attachment routing, and the data URL needs its MIME.
+            mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
+            if not mime or not mime.startswith("image/"):
+                continue
+            b64 = base64.b64encode(raw).decode()
+            image_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+                "_meta": {"path": str(p)},
+            })
+
+        if not image_blocks:
+            return text
+        return image_blocks + [{"type": "text", "text": text}]
+
+    def _get_topic_store(self, session_key: str | None) -> MemoryStore | None:
+        if self._topic_memory_factory is None or not isinstance(session_key, str) or not session_key:
+            return None
+        return self._topic_memory_factory.get(session_key)
+
+
+    def _skills_for_workspace(self, workspace: Path) -> SkillsLoader:
+        if workspace == self.workspace:
+            return self.skills
+        return SkillsLoader(
+            self.data_dir,
+            disabled_skills=self.skills.disabled_skills,
+            extra_skill_roots=[*self.configured_skill_roots, *project_skill_roots(workspace),
+                               *([("workspace", workspace / "skills")] if workspace != self.data_dir else [])],
+        )
+
+
+    def build_system_prompt_with_metrics(
+        self,
+        skill_names: list[str] | None = None,
+        include_learning_rules: bool = False,
+        session_key: str | None = None,
+        todos: list[dict[str, Any]] | None = None,
+        channel: str | None = None,
+        session_summary: SessionSummary | str | None = None,
+        workspace: Path | None = None,
+        include_memory_recent_history: bool = True,
+        unified_session: bool = False,
+        include_memory: bool = True,
+    ) -> SystemPromptBuild:
+        """Build the system prompt and expose comparable per-section estimates."""
+        del skill_names  # Reserved for API compatibility; skills are loaded progressively.
+        root = workspace or self.workspace
+        sections: list[tuple[str, str]] = []
+
+        def add(name: str, content: str | None) -> None:
+            if content and content.strip():
+                sections.append((name, content))
+
+        add("identity", self._get_identity(session_key=session_key, channel=channel, workspace=root))
+        add("bootstrap", self._load_bootstrap_files(root))
+        add("tool_contract", render_template("agent/tool_contract.md"))
+        if root.resolve() != self.workspace.resolve():
+            add("project", f"# Current Project\n\nWorking directory: {root.resolve()}\nUse it as the default root for project files and relative tool paths.")
+
+        mem_parts: list[str] = []
+        raw_global_memory = self.memory.read_memory() if include_memory else ""
+        if raw_global_memory and not self._is_template_content(
+            raw_global_memory, "memory/MEMORY.md"
+        ):
+            global_memory = self.memory.format_memory_context(raw_global_memory)
+            global_memory = select_memory_view(global_memory)
+            if global_memory:
+                mem_parts.append(global_memory)
+        topic_store = self._get_topic_store(session_key) if include_memory else None
+        topic_mem = topic_store.read_memory() if topic_store is not None else ""
+        if topic_mem:
+            topic_view = select_memory_view(topic_mem)
+            if topic_view:
+                mem_parts.append(f"### Topic Memory\n{topic_view}")
+        add("memory", "\n\n".join(mem_parts))
+
+        if todos:
+            from nanobot.fork.agent.tools.todo import format_todos
+            add("todos", "# Active Todos\n\n" + format_todos(todos))
+
+        skills = self._skills_for_workspace(root)
+        always_skills = skills.get_always_skills()
+        always_content = skills.load_skills_for_context(always_skills) if always_skills else ""
+        add("always_skills", f"# Active Skills\n\n{always_content}" if always_content else "")
+
+        skills_summary = skills.build_skills_summary(exclude=set(always_skills), workspace=root)
+        if skills_summary:
+            add("skills_index", render_template("agent/skills_section.md", skills_summary=skills_summary))
+
+        if include_memory and include_memory_recent_history:
+            entries = self.memory.read_recent_history_for_prompt(
+                since_cursor=self.memory.get_last_dream_cursor(),
+                session_key=session_key,
+                unified_session=unified_session,
+            )
+            if entries:
+                capped = entries[-self._MAX_RECENT_HISTORY:]
+                history_text = "\n".join(
+                    f"- [{entry['timestamp']}] {entry['content']}" for entry in capped
+                )
+                history_text = truncate_text_to_tokens(history_text, self._MAX_HISTORY_TOKENS)
+                add("recent_history", "# Recent History\n\n" + history_text)
+
+        if isinstance(session_summary, dict) and session_summary.get("text") != "(nothing)":
+            add("summary", f"[Archived Context Summary]\n\nPrevious conversation summary (last active {session_summary['last_active']}):\n{session_summary['text']}")
+
+        # Active/legacy continuation state is injected with the current user
+        # metadata so the stable system prefix remains cache-friendly.
+
+        if include_learning_rules:
+            lr_path = self.data_dir / "LEARNING_RULES.md"
+            if lr_path.exists():
+                add("learning_rules", lr_path.read_text(encoding="utf-8"))
+
+        prompt = "\n\n---\n\n".join(content for _name, content in sections)
+        section_tokens = {
+            name: estimate_message_tokens({"role": "system", "content": content})
+            for name, content in sections
+        }
+        section_tokens["total"] = estimate_message_tokens(
+            {"role": "system", "content": prompt}
+        )
+        return SystemPromptBuild(prompt=prompt, section_tokens=section_tokens)
+
 
     def _build_skill_match_reminder(
         self,
@@ -365,7 +629,7 @@ class ContextBuilder:
         suggestions: list[tuple[str, str, int]] = []
         for skill in entries:
             name = skill.get("name", "")
-            desc = loader._get_skill_description(name) or ""
+            desc = loader.get_skill_description(name) or ""
             if not name or not desc:
                 continue
             tokens = {
@@ -391,170 +655,3 @@ class ContextBuilder:
             f"{bullets}\n"
             "</system-reminder>"
         )
-
-    def build_messages(
-        self,
-        history: list[dict[str, Any]],
-        current_message: str,
-        skill_names: list[str] | None = None,
-        media: list[str] | None = None,
-        channel: str | None = None,
-        chat_id: str | None = None,
-        current_role: str = "user",
-        learning_ctx: str | None = None,
-        session_key: str | None = None,
-        todos: list[dict[str, Any]] | None = None,
-        pending_summary: str | None = None,
-        sender_id: str | None = None,
-        session_summary: str | None = None,
-        session_metadata: Mapping[str, Any] | None = None,
-        resume_request: bool = False,
-        current_runtime_lines: Sequence[str] | None = None,
-        workspace: Path | None = None,
-        runtime_state: Any | None = None,
-        inbound_message: Any | None = None,
-        skip_runtime_lines: bool = False,
-        include_memory_recent_history: bool = True,
-        unified_session: bool = False,
-        system_prompt_metrics: dict[str, int] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Build the complete message list for an LLM call."""
-        root = workspace or self.workspace
-        registry = getattr(runtime_state, "tools", None)
-        source_verifier = make_source_verifier(
-            root, registry.get("read_file") if isinstance(registry, ToolRegistry) else None,
-            getattr(inbound_message, "metadata", None),
-        )
-        active_context = render_active_context(
-            session_metadata,
-            workspace=root,
-            legacy_summary=session_summary,
-            todos=todos,
-            resume_request=resume_request,
-            source_verifier=source_verifier,
-            input_verifier=make_input_verifier(self.data_dir, session_key),
-        )
-        extra = [] if active_context else [*goal_state_runtime_lines(session_metadata)]
-        if runtime_state is not None and inbound_message is not None:
-            extra.extend(runtime_lines(runtime_state, inbound_message, root, skip=skip_runtime_lines))
-        if current_runtime_lines:
-            extra.extend(line for line in current_runtime_lines if line)
-        runtime_ctx = self._build_runtime_context(
-            channel,
-            chat_id,
-            self.timezone,
-            sender_id=sender_id,
-            supplemental_lines=extra or None,
-        )
-        user_content = self._build_user_content(current_message, media)
-
-        reminder = ""
-        # ``session_summary`` is persistently included in the system prompt.
-        # Only a newly produced pending summary needs this one-shot reminder.
-        if pending_summary and pending_summary.strip():
-            reminder = (
-                "<system-reminder>\n"
-                "Updated long-term memory (consolidated from earlier in this "
-                "conversation; not yet promoted to MEMORY.md):\n\n"
-                f"{pending_summary.strip()}\n"
-                "</system-reminder>"
-            )
-        skill_hint = self._build_skill_match_reminder(
-            current_message,
-            self._skills_for_workspace(root),
-        )
-        prefix_parts = [
-            part for part in (active_context, learning_ctx, reminder, skill_hint) if part
-        ]
-        prefix = "\n\n".join(prefix_parts) if prefix_parts else ""
-
-        if isinstance(user_content, str):
-            user_with_prefix = f"{prefix}\n\n{user_content}" if prefix else user_content
-            merged = f"{user_with_prefix}\n\n{runtime_ctx}"
-        else:
-            merged = ([{"type": "text", "text": prefix}] if prefix else []) + user_content
-            merged.append({"type": "text", "text": runtime_ctx})
-
-        system_build = self.build_system_prompt_with_metrics(
-            skill_names,
-            include_learning_rules=(learning_ctx is not None),
-            session_key=session_key,
-            todos=todos,
-            channel=channel,
-            session_summary=session_summary,
-            workspace=root,
-            include_memory_recent_history=include_memory_recent_history,
-            unified_session=unified_session,
-        )
-        if system_prompt_metrics is not None:
-            system_prompt_metrics.clear()
-            system_prompt_metrics.update(system_build.section_tokens)
-        messages = [
-            {"role": "system", "content": system_build.prompt},
-            *history,
-        ]
-        if messages[-1].get("role") == current_role and len(messages) > 1:
-            last = dict(messages[-1])
-            last["content"] = self._merge_message_content(last.get("content"), merged)
-            messages[-1] = last
-            return messages
-        messages.append({"role": current_role, "content": merged})
-        return messages
-
-    def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
-        if not media:
-            return text
-
-        images = []
-        for path in media:
-            p = Path(path)
-            if not p.is_file():
-                continue
-            raw = p.read_bytes()
-            mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
-            if not mime or not mime.startswith("image/"):
-                continue
-            b64 = base64.b64encode(raw).decode()
-            images.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-                "_meta": {"path": str(p)},
-            })
-
-        if not images:
-            return text
-        return images + [{"type": "text", "text": text}]
-
-    def add_tool_result(
-        self,
-        messages: list[dict[str, Any]],
-        tool_call_id: str,
-        tool_name: str,
-        result: Any,
-    ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": tool_name,
-            "content": result,
-        })
-        return messages
-
-    def add_assistant_message(
-        self,
-        messages: list[dict[str, Any]],
-        content: str | None,
-        tool_calls: list[dict[str, Any]] | None = None,
-        reasoning_content: str | None = None,
-        thinking_blocks: list[dict] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Add an assistant message to the message list."""
-        messages.append(build_assistant_message(
-            content,
-            tool_calls=tool_calls,
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        ))
-        return messages

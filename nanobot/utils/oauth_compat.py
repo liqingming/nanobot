@@ -11,7 +11,7 @@ T = TypeVar("T")
 
 def call_with_optional_proxy(func: Callable[..., T], /, *args: Any, proxy: str | None = None, **kwargs: Any) -> T:
     """Call *func* with ``proxy`` only when its signature accepts it."""
-    if proxy and _accepts_keyword(func, "proxy"):
+    if _accepts_keyword(func, "proxy"):
         kwargs["proxy"] = proxy
     return func(*args, **kwargs)
 

@@ -350,7 +350,7 @@ class ManagedProcessManager:
 
     def _identity(self, pid: int) -> str | None:
         if self.platform_name == "Windows":
-            from nanobot.gateway.runtime import _windows_process_identity
+            from nanobot.process_runtime import _windows_process_identity
 
             return _windows_process_identity(pid)
         try:
@@ -462,13 +462,12 @@ def shutdown_managed_tasks() -> None:
         restart_policy=StringSchema("never, on-failure, or always", nullable=True),
         health_url=StringSchema("Optional localhost HTTP health URL", nullable=True),
         health_grace_s=IntegerSchema(
-            10, description="Health check startup grace", minimum=0, maximum=600
+            description="Health check startup grace", minimum=0, maximum=600
         ),
         max_restarts=IntegerSchema(
-            10, description="Maximum automatic restarts", minimum=0, maximum=1000
+            description="Maximum automatic restarts", minimum=0, maximum=1000
         ),
         max_log_bytes=IntegerSchema(
-            _DEFAULT_LOG_LIMIT,
             description="Stop when log exceeds this size",
             minimum=1048576,
             maximum=5368709120,
@@ -563,7 +562,7 @@ class StartProcessTool(Tool):
         action=StringSchema("list, logs, stop, or restart"),
         process_id=StringSchema("Required except for list", nullable=True),
         tail=IntegerSchema(
-            100, description="Log lines to return", minimum=1, maximum=5000
+            description="Log lines to return", minimum=1, maximum=5000
         ),
         required=["action"],
     )

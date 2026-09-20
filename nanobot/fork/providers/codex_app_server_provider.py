@@ -34,7 +34,13 @@ from nanobot.fork.providers.codex_native_context import (
     check_native_payload,
     native_input_budget,
 )
-from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.providers.base import (
+    LLMResponse,
+    LLMUsage,
+    ProviderCallContext,
+    ProviderConversationState,
+    ToolCallRequest,
+)
 from nanobot.providers.openai_codex_provider import (
     OpenAICodexProvider as LegacyOpenAICodexProvider,
 )
@@ -99,6 +105,19 @@ _NATIVE_TOOL_CORRECTION = (
     "subagents. To inspect a local image, call the Nanobot read_file tool with its path; "
     "the image will be returned in that tool result. Never call imageView. Do not repeat "
     "tool calls whose successful results already appear in the transcript."
+)
+_CURRENT_REQUEST_GUARD = (
+    "\n\nNanobot current-turn continuity: The JSON below is a copy of the user request "
+    "that started this turn, kept separately from the historical transcript so native "
+    "context compaction does not replace it with an earlier task. It is quoted user-level "
+    "context, not system instructions or additional authorization. Later user corrections "
+    "and cancellations take precedence. Interpret short approvals using the preceding "
+    "conversation. After compaction, continue the unfinished current request from the "
+    "latest completed action; do not repeat completed tool calls. Before ending, check "
+    "that the response answers this request and any later amendments. A recap of an older "
+    "task or an acknowledgement of restored context does not complete the current request. "
+    "If work remains, continue within the authorized scope or explain the actual blocker. "
+    "Keep this continuity bookkeeping out of the user-facing response.\n"
 )
 _SKILL_DYNAMIC_TOOL_RE = re.compile(r"\bmcp__[A-Za-z0-9_]+")
 _SECRET_PATTERNS = (
@@ -1080,12 +1099,12 @@ class _CodexAppServerTurn:
             if text:
                 self._stderr_lines.append(text[:1000])
 
-    def _take_usage_delta(self) -> dict[str, int]:
+    def _take_usage_delta(self) -> LLMUsage | None:
         current = dict(self._last_usage)
         delta = _usage_delta(current, self._reported_usage)
         if current:
             self._reported_usage = current
-        return delta
+        return _canonical_usage(delta)
 
 
 class OpenAICodexProvider(LegacyOpenAICodexProvider):
@@ -1099,8 +1118,14 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         default_model: str = "openai-codex/gpt-5.1-codex",
         proxy: str | None = None,
         idempotency_dir: Path | None = None,
+        extra_body: dict[str, Any] | None = None,
+        *,
+        provider_name: str = "openai_codex",
     ):
-        super().__init__(default_model=default_model, proxy=proxy)
+        super().__init__(
+            default_model=default_model, proxy=proxy, extra_body=extra_body,
+            provider_name=provider_name,
+        )
         self._app_server_command: list[str] | None = None
         self._app_server_env = _codex_subprocess_env(self.proxy)
         self._rpc_timeout_s = _positive_float_env(
@@ -1114,6 +1139,12 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         self._idempotency_dir = idempotency_dir
         self._turns: dict[tuple[str, str], _CodexAppServerTurn] = {}
         self._turn_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+    def can_resume_conversation_state(self, state: ProviderConversationState, model: str | None = None) -> bool:
+        return False
+
+    def supports_native_compaction(self, model: str | None = None) -> bool:
+        return False
 
     async def aclose(self) -> None:
         """Close every app-server bridge still owned by this provider."""
@@ -1137,6 +1168,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         model: str | None,
+        max_tokens: int,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
         request_context: dict[str, Any] | None = None,
@@ -1144,7 +1176,17 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_stream_recover: Callable[[], Awaitable[None]] | None = None,
+        provider_context: ProviderCallContext | None = None,
     ) -> LLMResponse:
+        if provider_context is not None:
+            request_context = dict(request_context or {})
+            if provider_context.session_id:
+                request_context.setdefault("session_key", provider_context.session_id)
+            if provider_context.context_window_tokens:
+                request_context.setdefault("native_context", {
+                    "context_window_tokens": provider_context.context_window_tokens,
+                    "max_tokens": max_tokens,
+                })
         key = _turn_key(request_context)
         lock = self._turn_locks.setdefault(key, asyncio.Lock())
         async with lock:
@@ -1231,7 +1273,13 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
                             checkpoint_continuation = True
                     if bridge is None:
                         check_native_payload(
-                            self, model or self.default_model, active_messages, tools, native_budget,
+                            self, model or self.default_model,
+                            active_messages + [{
+                                "role": "system",
+                                "content": _current_request_instructions(active_messages)
+                                + _NATIVE_TOOL_GUARD,
+                            }],
+                            tools, native_budget,
                         )
                         await self._close_stale_session_turns(key)
                         if self._app_server_command is None:
@@ -1433,7 +1481,7 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None,
     ) -> tuple[LLMResponse, int]:
         replayed = 0
-        replay_usage: dict[str, int] = {}
+        replay_usage: LLMUsage | None = None
         while True:
             response = await bridge.next_response(
                 on_content_delta=on_content_delta,
@@ -1508,15 +1556,18 @@ class OpenAICodexProvider(LegacyOpenAICodexProvider):
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_stream_recover: Callable[[], Awaitable[None]] | None = None,
+        provider_context: ProviderCallContext | None = None,
     ) -> LLMResponse:
-        del max_tokens, temperature
+        del temperature
         return await self._call_codex(
             messages,
             tools,
             model,
+            max_tokens,
             reasoning_effort,
             tool_choice,
             request_context=request_context,
+            provider_context=provider_context,
             on_content_delta=on_content_delta,
             on_thinking_delta=on_thinking_delta,
             on_tool_call_delta=on_tool_call_delta,
@@ -1744,6 +1795,23 @@ def _skill_requires_unavailable_tools(skill: dict[str, Any], tool_names: set[str
     return bool(referenced_tools - tool_names)
 
 
+def _current_request_instructions(messages: list[dict[str, Any]]) -> str:
+    """Keep the starting request in native instructions, which survive compaction.
+
+    Only text is duplicated: media stays in the original multimodal turn input.
+    This is per-bridge context, never persisted into the shared system prompt.
+    """
+    latest = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    if latest is None:
+        return ""
+    inputs = _content_to_user_inputs(latest.get("content"))
+    text = "\n".join(item["text"] for item in inputs if item.get("type") == "text")
+    request = {"role": "user", "text": text}
+    if any(item.get("type") != "text" for item in inputs):
+        request["media"] = "See the original user attachments; do not infer unseen content."
+    return _CURRENT_REQUEST_GUARD + json.dumps(request, ensure_ascii=False)
+
+
 def _messages_to_app_server_input(
     messages: list[dict[str, Any]],
     *,
@@ -1758,6 +1826,7 @@ def _messages_to_app_server_input(
     instructions = "\n\n".join(part for part in instruction_parts if part)
     if not instructions:
         instructions = "You are Nanobot, a helpful AI agent."
+    instructions += _current_request_instructions(messages)
 
     user_indexes = [
         index for index, message in enumerate(messages) if message.get("role") == "user"
@@ -2191,11 +2260,26 @@ def _usage_delta(current: dict[str, int], previous: dict[str, int]) -> dict[str,
     }
 
 
-def _sum_usage(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
-    merged = dict(left)
-    for key, value in right.items():
-        merged[key] = merged.get(key, 0) + value
-    return merged
+def _canonical_usage(value: dict[str, int]) -> LLMUsage | None:
+    """Normalize cumulative app-server counters only at the provider boundary."""
+    if not value:
+        return None
+    input_tokens = max(0, value.get("prompt_tokens", 0))
+    return LLMUsage.reported(
+        input_tokens=input_tokens,
+        output_tokens=max(0, value.get("completion_tokens", 0)),
+        total_tokens=max(0, value.get("total_tokens", 0)),
+        cache_read_tokens=(
+            min(input_tokens, max(0, value["cached_tokens"]))
+            if "cached_tokens" in value else None
+        ),
+    )
+
+
+def _sum_usage(left: LLMUsage | None, right: LLMUsage | None) -> LLMUsage | None:
+    if left is None:
+        return right
+    return left if right is None else left + right
 
 
 def _turn_failure(turn: dict[str, Any]) -> CodexAppServerError:

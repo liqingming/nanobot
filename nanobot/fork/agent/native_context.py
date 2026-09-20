@@ -4,13 +4,16 @@
 故障检查点，不代表远端压缩后的窗口。状态仅属于一次 runner.run，主子任务不共享。
 """
 
+from __future__ import annotations
+
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from nanobot.agent.context_artifacts import ToolDigest
-from nanobot.agent.context_governance import ContextGovernanceConfig, ContextGovernor
+if TYPE_CHECKING:
+    from nanobot.agent.context_artifacts import ToolDigest
+    from nanobot.agent.context_governance import ContextGovernanceConfig, ContextGovernor
 from nanobot.fork.agent.tool_evidence import persist_tool_evidence
 from nanobot.fork.providers.codex_context_checkpoint import ContextCheckpoint
 from nanobot.fork.providers.codex_native_context import native_input_budget

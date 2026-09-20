@@ -70,3 +70,7 @@ runner 治理日志的 `native_checkpoint_copy` 仅指本地检查点，不代�
 本地代码：`nanobot/fork/agent/native_context.py`、
 `nanobot/fork/providers/codex_native_context.py`。
 测试：`tests/fork/test_codex_native_context.py`。
+
+## 显式请求参数与传输方式
+
+`openai_codex` 默认使用 Codex app-server，保留原生上下文治理。配置非空的 `providers.openaiCodex.extraBody` 时，工厂改用 HTTP Responses 传输以完整应用自定义请求字段；该配置的上下文管理遵循 HTTP Provider 协议。清空 `extraBody` 后恢复默认传输。

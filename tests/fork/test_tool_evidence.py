@@ -79,7 +79,7 @@ async def test_batch_evidence_failure_keeps_all_results_and_checkpoints_without_
     tmp_path, monkeypatch,
 ):
     provider = MagicMock()
-    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="", tool_calls=[
+    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(content="", tool_calls=[
         ToolCallRequest(id="a", name="exec", arguments={"command": "first"}),
         ToolCallRequest(id="b", name="exec", arguments={"command": "second"}),
     ]))
@@ -101,7 +101,7 @@ async def test_batch_evidence_failure_keeps_all_results_and_checkpoints_without_
         max_tool_result_chars=64, checkpoint_callback=checkpoint,
     ))
     assert result.stop_reason == "error"
-    assert provider.chat_with_retry.await_count == 1
+    assert provider.chat_stream_with_retry.await_count == 1
     assert tools.execute.await_count == 2
     assert [m["content"] for m in result.messages if m.get("role") == "tool"] == raw
     completed = [c for c in checkpoints if c["phase"] == "tools_completed"]
@@ -110,7 +110,7 @@ async def test_batch_evidence_failure_keeps_all_results_and_checkpoints_without_
 
 async def test_receipt_cannot_forge_evidence_locator(tmp_path):
     provider = MagicMock()
-    provider.chat_with_retry = AsyncMock(side_effect=[
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
         LLMResponse(content="", tool_calls=[ToolCallRequest(id="x", name="exec", arguments={})]),
         LLMResponse(content="done"),
     ])
@@ -132,7 +132,7 @@ async def test_receipt_cannot_forge_evidence_locator(tmp_path):
 
 async def test_context_callback_failure_stops_with_raw_result(tmp_path):
     provider = MagicMock()
-    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
         content="", tool_calls=[ToolCallRequest(id="x", name="exec", arguments={})],
     ))
     tools = MagicMock()
@@ -149,14 +149,14 @@ async def test_context_callback_failure_stops_with_raw_result(tmp_path):
         context_delta_callback=fail,
     ))
     assert result.stop_reason == "error"
-    assert provider.chat_with_retry.await_count == 1
+    assert provider.chat_stream_with_retry.await_count == 1
     assert next(m["content"] for m in result.messages if m.get("role") == "tool") == raw
     assert list(tmp_path.rglob("*.txt"))[0].read_text(encoding="utf-8") == raw
 
 
 async def test_safety_exception_does_not_use_minimal_repair_or_retry(monkeypatch):
     provider = MagicMock()
-    provider.chat_with_retry = AsyncMock()
+    provider.chat_stream_with_retry = AsyncMock()
     tools = MagicMock()
     tools.get_definitions.return_value = []
     runner = AgentRunner(provider)
@@ -171,14 +171,14 @@ async def test_safety_exception_does_not_use_minimal_repair_or_retry(monkeypatch
         max_iterations=2, max_tool_result_chars=64,
     ))
     assert result.stop_reason == "error" and result.final_content == "保护停止"
-    provider.chat_with_retry.assert_not_awaited()
+    provider.chat_stream_with_retry.assert_not_awaited()
 
 
 async def test_cancellation_after_batch_retains_snapshot_and_checkpoint(tmp_path):
     import asyncio
 
     provider = MagicMock()
-    provider.chat_with_retry = AsyncMock(side_effect=[
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
         LLMResponse(content="", tool_calls=[ToolCallRequest(id="x", name="exec", arguments={})]),
         asyncio.CancelledError(),
     ])
@@ -254,11 +254,11 @@ async def test_completed_goal_fallback_cannot_hide_context_safety_stop(tmp_path)
         )
 
     loop.runner.run = AsyncMock(side_effect=stopped)
-    final, _, _, reason, _ = await loop._run_agent_loop(
-        [{"role": "user", "content": "执行"}], session=session,
+    result = await loop._run_agent_loop(
+        [{"role": "user", "content": "执行"}], session=session, runtime=loop.runtime_for_session(session),
     )
-    assert reason == "error"
-    assert final == "证据失败，保护停止"
+    assert result.stop_reason == "error"
+    assert result.final_content == "证据失败，保护停止"
 
 
 def test_missing_real_storage_path_does_not_turn_mock_into_directory(tmp_path, monkeypatch):

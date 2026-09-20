@@ -3,12 +3,13 @@ cached-token propagation, and hook context."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent.runner_helpers import make_run_spec
 from nanobot.config.schema import AgentDefaults
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, LLMUsage, ToolCallRequest
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
@@ -16,22 +17,22 @@ _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 @pytest.mark.asyncio
 async def test_runner_calls_hooks_in_order():
     from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
     call_count = {"n": 0}
     events: list[tuple] = []
 
-    async def chat_with_retry(**kwargs):
+    async def chat_stream_with_retry(**kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return LLMResponse(
                 content="thinking",
                 tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
             )
-        return LLMResponse(content="done", tool_calls=[], usage={})
+        return LLMResponse(content="done", tool_calls=[], usage=None)
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
     tools.execute = AsyncMock(return_value="tool result")
@@ -67,8 +68,8 @@ async def test_runner_calls_hooks_in_order():
             events.append(("finalize_content", context.iteration, content))
             return content.upper() if content else content
 
-    runner = AgentRunner(provider)
-    result = await runner.run(AgentRunSpec(
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
         initial_messages=[],
         tools=tools,
         model="test-model",
@@ -100,7 +101,7 @@ async def test_runner_calls_hooks_in_order():
 @pytest.mark.asyncio
 async def test_runner_streaming_hook_receives_deltas_and_end_signal():
     from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
     streamed: list[str] = []
@@ -109,7 +110,7 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
     async def chat_stream_with_retry(*, on_content_delta, **kwargs):
         await on_content_delta("he")
         await on_content_delta("llo")
-        return LLMResponse(content="hello", tool_calls=[], usage={})
+        return LLMResponse(content="hello", tool_calls=[], usage=None)
 
     provider.chat_stream_with_retry = chat_stream_with_retry
     provider.chat_with_retry = AsyncMock()
@@ -126,8 +127,8 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
         async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
             endings.append(resuming)
 
-    runner = AgentRunner(provider)
-    result = await runner.run(AgentRunSpec(
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
         initial_messages=[],
         tools=tools,
         model="test-model",
@@ -143,31 +144,129 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
 
 
 @pytest.mark.asyncio
-async def test_runner_passes_cached_tokens_to_hook_context():
-    """Hook context.usage should contain cached_tokens."""
-    from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+async def test_runner_measures_stream_generation_without_time_to_first_token():
+    from nanobot.agent.hook import AgentHook
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
-    captured_usage: list[dict] = []
 
-    class UsageHook(AgentHook):
-        async def after_iteration(self, context: AgentHookContext) -> None:
-            captured_usage.append(dict(context.usage))
-
-    async def chat_with_retry(**kwargs):
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        await on_content_delta("he")
+        await on_content_delta("llo")
         return LLMResponse(
-            content="done",
-            tool_calls=[],
-            usage={"prompt_tokens": 200, "completion_tokens": 20, "cached_tokens": 150},
+            content="hello",
+            usage=LLMUsage.reported(input_tokens=100, output_tokens=12),
         )
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    provider.chat_with_retry = AsyncMock()
     tools = MagicMock()
     tools.get_definitions.return_value = []
 
-    runner = AgentRunner(provider)
-    await runner.run(AgentRunSpec(
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+    with patch(
+        "nanobot.agent.runner.time.perf_counter",
+        side_effect=[10.0, 10.2, 10.4, 10.8],
+    ):
+        result = await AgentRunner().run(make_run_spec(
+            provider,
+            initial_messages=[],
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            hook=StreamingHook(),
+        ))
+
+    assert result.usage is not None
+    assert result.usage.generation_ms == 600
+    assert result.usage.measured_output_tokens == 12
+    assert result.usage.ttft_ms == 200
+    assert result.usage.timed_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_length_recovery_streams_segments_once_and_returns_all_content():
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+    streamed: list[str] = []
+    endings: list[bool] = []
+    merge_next: list[bool] = []
+    responses = iter([
+        LLMResponse(content="first ", finish_reason="length"),
+        LLMResponse(content="second", finish_reason="stop"),
+    ])
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        response = next(responses)
+        await on_content_delta(response.content or "")
+        return response
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    provider.chat_with_retry = AsyncMock()
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+        async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+            streamed.append(delta)
+
+        async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+            endings.append(resuming)
+            merge_next.append(context.stream_continues_current_message)
+
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "give a long answer"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        hook=StreamingHook(),
+    ))
+
+    assert result.final_content == "first second"
+    assert streamed == ["first ", "second"]
+    assert endings == [True, False]
+    assert merge_next == [True, False]
+    provider.chat_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runner_passes_cache_read_tokens_to_hook_context():
+    """Hook context usage preserves a reported cache-read count."""
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+    captured_usage: list[LLMUsage] = []
+
+    class UsageHook(AgentHook):
+        async def after_iteration(self, context: AgentHookContext) -> None:
+            assert context.usage is not None
+            captured_usage.append(context.usage)
+
+    async def chat_stream_with_retry(**kwargs):
+        return LLMResponse(
+            content="done",
+            tool_calls=[],
+            usage=LLMUsage.reported(input_tokens=200, output_tokens=20, cache_read_tokens=150),
+        )
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner()
+    await runner.run(make_run_spec(provider,
         initial_messages=[],
         tools=tools,
         model="test-model",
@@ -177,26 +276,27 @@ async def test_runner_passes_cached_tokens_to_hook_context():
     ))
 
     assert len(captured_usage) == 1
-    assert captured_usage[0]["cached_tokens"] == 150
-    assert captured_usage[0]["provider_tokens"] == 220
+    assert captured_usage[0].cache_read_tokens == 150
+    assert captured_usage[0].reported_tokens == 220
 
 
 @pytest.mark.asyncio
 async def test_runner_estimates_usage_when_provider_omits_usage(monkeypatch):
     from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
-    captured_usage: list[dict] = []
+    captured_usage: list[LLMUsage] = []
 
     class UsageHook(AgentHook):
         async def after_iteration(self, context: AgentHookContext) -> None:
-            captured_usage.append(dict(context.usage))
+            assert context.usage is not None
+            captured_usage.append(context.usage)
 
-    async def chat_with_retry(**kwargs):
-        return LLMResponse(content="done", tool_calls=[], usage={})
+    async def chat_stream_with_retry(**kwargs):
+        return LLMResponse(content="done", tool_calls=[], usage=None)
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = [{"type": "function", "function": {"name": "lookup"}}]
     monkeypatch.setattr(
@@ -205,8 +305,8 @@ async def test_runner_estimates_usage_when_provider_omits_usage(monkeypatch):
     )
     monkeypatch.setattr("nanobot.agent.runner.estimate_message_tokens", lambda message: 7)
 
-    runner = AgentRunner(provider)
-    result = await runner.run(AgentRunSpec(
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
         initial_messages=[{"role": "user", "content": "hi"}],
         tools=tools,
         model="test-model",
@@ -215,30 +315,27 @@ async def test_runner_estimates_usage_when_provider_omits_usage(monkeypatch):
         hook=UsageHook(),
     ))
 
-    assert result.usage["prompt_tokens"] == 123
-    assert result.usage["completion_tokens"] == 7
-    assert result.usage["total_tokens"] == 130
-    assert result.usage["estimated_tokens"] == 130
-    assert captured_usage[0]["estimated_tokens"] == 130
+    assert result.usage == LLMUsage.estimated(input_tokens=123, output_tokens=7)
+    assert captured_usage[0].estimated_tokens == 130
 
 
 @pytest.mark.asyncio
 async def test_runner_calls_run_level_hooks_on_success():
     from nanobot.agent.hook import AgentHook, AgentRunHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
     events: list[tuple] = []
 
-    async def chat_with_retry(**kwargs):
+    async def chat_stream_with_retry(**kwargs):
         events.append(("request_messages", list(kwargs["messages"])))
         return LLMResponse(
             content="done",
             tool_calls=[],
-            usage={"prompt_tokens": 3, "completion_tokens": 2},
+            usage=LLMUsage.reported(input_tokens=3, output_tokens=2),
         )
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
 
@@ -253,7 +350,7 @@ async def test_runner_calls_run_level_hooks_on_success():
                 context.final_content,
                 context.stop_reason,
                 context.error,
-                dict(context.usage),
+                context.usage,
                 [msg["role"] for msg in context.messages],
             ))
 
@@ -263,8 +360,8 @@ async def test_runner_calls_run_level_hooks_on_success():
         async def on_finally(self, context: AgentRunHookContext) -> None:
             events.append(("on_finally", context.stop_reason, context.exception))
 
-    runner = AgentRunner(provider)
-    result = await runner.run(AgentRunSpec(
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
         initial_messages=[{"role": "user", "content": "hi"}],
         tools=tools,
         model="test-model",
@@ -282,12 +379,7 @@ async def test_runner_calls_run_level_hooks_on_success():
             "done",
             "completed",
             None,
-            {
-                "prompt_tokens": 3,
-                "completion_tokens": 2,
-                "total_tokens": 5,
-                "provider_tokens": 5,
-            },
+            LLMUsage.reported(input_tokens=3, output_tokens=2),
             ["user", "assistant"],
         ),
         ("on_finally", "completed", None),
@@ -297,13 +389,13 @@ async def test_runner_calls_run_level_hooks_on_success():
 @pytest.mark.asyncio
 async def test_runner_run_level_context_is_detached_snapshot():
     from nanobot.agent.hook import AgentHook, AgentRunHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
     call_count = {"n": 0}
     request_messages: list[list[dict]] = []
 
-    async def chat_with_retry(**kwargs):
+    async def chat_stream_with_retry(**kwargs):
         call_count["n"] += 1
         request_messages.append([dict(msg) for msg in kwargs["messages"]])
         if call_count["n"] == 1:
@@ -311,9 +403,9 @@ async def test_runner_run_level_context_is_detached_snapshot():
                 content="thinking",
                 tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
             )
-        return LLMResponse(content="done", tool_calls=[], usage={})
+        return LLMResponse(content="done", tool_calls=[], usage=None)
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
     tools.execute = AsyncMock(return_value="tool result")
@@ -330,8 +422,8 @@ async def test_runner_run_level_context_is_detached_snapshot():
         async def on_finally(self, context: AgentRunHookContext) -> None:
             context.messages[0]["content"] = "mutated-finally"
 
-    runner = AgentRunner(provider)
-    result = await runner.run(AgentRunSpec(
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
         initial_messages=[{"role": "user", "content": "hi"}],
         tools=tools,
         model="test-model",
@@ -351,15 +443,15 @@ async def test_runner_run_level_context_is_detached_snapshot():
 @pytest.mark.asyncio
 async def test_runner_calls_on_error_for_model_error_result():
     from nanobot.agent.hook import AgentHook, AgentRunHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
     events: list[tuple] = []
 
-    async def chat_with_retry(**kwargs):
+    async def chat_stream_with_retry(**kwargs):
         return LLMResponse(content="model failed", finish_reason="error", tool_calls=[])
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
 
@@ -376,8 +468,8 @@ async def test_runner_calls_on_error_for_model_error_result():
         async def on_finally(self, context: AgentRunHookContext) -> None:
             events.append(("on_finally", context.stop_reason, context.error))
 
-    runner = AgentRunner(provider)
-    result = await runner.run(AgentRunSpec(
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
         initial_messages=[],
         tools=tools,
         model="test-model",
@@ -399,15 +491,15 @@ async def test_runner_calls_on_error_for_model_error_result():
 @pytest.mark.asyncio
 async def test_runner_calls_on_error_and_finally_for_unhandled_exception():
     from nanobot.agent.hook import AgentHook, AgentRunHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
     events: list[tuple] = []
 
-    async def chat_with_retry(**kwargs):
+    async def chat_stream_with_retry(**kwargs):
         raise RuntimeError("provider exploded")
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
 
@@ -429,9 +521,9 @@ async def test_runner_calls_on_error_and_finally_for_unhandled_exception():
         async def on_finally(self, context: AgentRunHookContext) -> None:
             events.append(("on_finally", context.stop_reason))
 
-    runner = AgentRunner(provider)
+    runner = AgentRunner()
     with pytest.raises(RuntimeError, match="provider exploded"):
-        await runner.run(AgentRunSpec(
+        await runner.run(make_run_spec(provider,
             initial_messages=[{"role": "user", "content": "hi"}],
             tools=tools,
             model="test-model",
@@ -450,14 +542,14 @@ async def test_runner_calls_on_error_and_finally_for_unhandled_exception():
 @pytest.mark.asyncio
 async def test_runner_preserves_original_exception_when_finally_hook_fails():
     from nanobot.agent.hook import AgentHook, AgentRunHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
 
-    async def chat_with_retry(**kwargs):
+    async def chat_stream_with_retry(**kwargs):
         raise RuntimeError("provider exploded")
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
 
@@ -465,9 +557,9 @@ async def test_runner_preserves_original_exception_when_finally_hook_fails():
         async def on_finally(self, context: AgentRunHookContext) -> None:
             raise RuntimeError("finally exploded")
 
-    runner = AgentRunner(provider)
+    runner = AgentRunner()
     with pytest.raises(RuntimeError, match="provider exploded"):
-        await runner.run(AgentRunSpec(
+        await runner.run(make_run_spec(provider,
             initial_messages=[{"role": "user", "content": "hi"}],
             tools=tools,
             model="test-model",
@@ -482,15 +574,15 @@ async def test_runner_does_not_report_cancellation_as_error():
     import asyncio
 
     from nanobot.agent.hook import AgentHook, AgentRunHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
     events: list[tuple] = []
 
-    async def chat_with_retry(**kwargs):
+    async def chat_stream_with_retry(**kwargs):
         raise asyncio.CancelledError()
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
 
@@ -512,9 +604,9 @@ async def test_runner_does_not_report_cancellation_as_error():
                 type(context.exception).__name__ if context.exception else None,
             ))
 
-    runner = AgentRunner(provider)
+    runner = AgentRunner()
     with pytest.raises(asyncio.CancelledError):
-        await runner.run(AgentRunSpec(
+        await runner.run(make_run_spec(provider,
             initial_messages=[{"role": "user", "content": "hi"}],
             tools=tools,
             model="test-model",
@@ -534,14 +626,14 @@ async def test_runner_preserves_cancellation_when_finally_hook_fails():
     import asyncio
 
     from nanobot.agent.hook import AgentHook, AgentRunHookContext
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
 
-    async def chat_with_retry(**kwargs):
+    async def chat_stream_with_retry(**kwargs):
         raise asyncio.CancelledError()
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
 
@@ -549,9 +641,9 @@ async def test_runner_preserves_cancellation_when_finally_hook_fails():
         async def on_finally(self, context: AgentRunHookContext) -> None:
             raise RuntimeError("finally exploded")
 
-    runner = AgentRunner(provider)
+    runner = AgentRunner()
     with pytest.raises(asyncio.CancelledError):
-        await runner.run(AgentRunSpec(
+        await runner.run(make_run_spec(provider,
             initial_messages=[{"role": "user", "content": "hi"}],
             tools=tools,
             model="test-model",
@@ -580,7 +672,7 @@ async def test_runner_continues_to_tools_when_pre_tool_hook_times_out():
             )
         return LLMResponse(content="done", tool_calls=[], usage={})
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
     tools.execute = AsyncMock(return_value="tool result")

@@ -192,7 +192,7 @@ async def test_runner_preserves_source_receipt_until_evidence_registration(tmp_p
     registry = ToolRegistry()
     registry.register(ReadFileTool(workspace=tmp_path, allowed_dir=tmp_path))
     provider = MagicMock()
-    provider.chat_with_retry = AsyncMock(side_effect=[
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
         LLMResponse(content="", tool_calls=[
             ToolCallRequest(id="read", name="read_file", arguments={"path": str(path)}),
         ]),

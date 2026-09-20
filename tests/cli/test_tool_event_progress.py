@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nanobot.cli.commands import _tool_result_summary_from_events
+from nanobot.fork.cli.agent import _tool_result_summary_from_events
 
 
 def test_tool_event_end_petrifies_textual_spinner_without_visible_summary() -> None:

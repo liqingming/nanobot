@@ -1,5 +1,7 @@
 # Fork 变更清单与 upstream 同步手册
 
+> 2026-09-19：9 月 11 日上游目标的隔离同步已完成冲突处理及已知行为回归修复，已转入原目录测试分支 `test/upstream-local-20260919`，尚未提交或合回 main，见 [同步记录](../../docs/upstream-sync-20260911.md)。以下 7 月同步背景保留作历史参考。
+
 本文档记录 `liqingming/nanobot` 相对 `HKUDS/nanobot` 的本地 fork 增量。后续同步 `upstream/main` 时，先读本文档，再处理冲突。
 
 当前同步背景：

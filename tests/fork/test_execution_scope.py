@@ -22,15 +22,15 @@ async def test_execution_scope_restores_context_and_closes_owner(failure):
         seen.append(current_execution_id())
         if failure is not None:
             raise failure()
-        return spec
+        return spec.payload
 
     runner = SimpleNamespace(provider=provider, run=run)
     for _ in range(2):
         if failure is None:
-            assert await run_isolated_subagent(runner, "result") == "result"
+            assert await run_isolated_subagent(runner, SimpleNamespace(runtime=None, payload="result")) == "result"
         else:
             with pytest.raises(failure):
-                await run_isolated_subagent(runner, "result")
+                await run_isolated_subagent(runner, SimpleNamespace(runtime=None, payload="result"))
         assert current_execution_id() is None
     assert all(seen)
     assert len(set(seen)) == 2
@@ -39,19 +39,19 @@ async def test_execution_scope_restores_context_and_closes_owner(failure):
 
 async def test_nested_scope_restores_parent_without_provider_cleanup_capability():
     async def child_run(spec):
-        assert current_execution_id() != spec
+        assert current_execution_id() != spec.payload
         return current_execution_id()
 
     child = SimpleNamespace(provider=object(), run=child_run)
 
     async def parent_run(spec):
         parent_id = current_execution_id()
-        await run_isolated_subagent(child, parent_id)
+        await run_isolated_subagent(child, SimpleNamespace(runtime=None, payload=parent_id))
         assert current_execution_id() == parent_id
-        return spec
+        return spec.payload
 
     parent = SimpleNamespace(provider=object(), run=parent_run)
-    assert await run_isolated_subagent(parent, "ok") == "ok"
+    assert await run_isolated_subagent(parent, SimpleNamespace(runtime=None, payload="ok")) == "ok"
     assert current_execution_id() is None
 
 
@@ -59,5 +59,16 @@ async def test_execution_scope_restores_context_even_if_cleanup_fails():
     provider = SimpleNamespace(aclose_execution=AsyncMock(side_effect=RuntimeError("close")))
     runner = SimpleNamespace(provider=provider, run=AsyncMock(return_value="ok"))
     with pytest.raises(RuntimeError, match="close"):
-        await run_isolated_subagent(runner, None)
+        await run_isolated_subagent(runner, SimpleNamespace(runtime=None))
+    assert current_execution_id() is None
+
+
+async def test_execution_scope_closes_provider_bound_to_runtime():
+    active_provider = SimpleNamespace(aclose_execution=AsyncMock())
+    fallback_provider = SimpleNamespace(aclose_execution=AsyncMock())
+    runner = SimpleNamespace(provider=fallback_provider, run=AsyncMock(return_value="ok"))
+    spec = SimpleNamespace(runtime=SimpleNamespace(provider=active_provider))
+    assert await run_isolated_subagent(runner, spec) == "ok"
+    active_provider.aclose_execution.assert_awaited_once()
+    fallback_provider.aclose_execution.assert_not_awaited()
     assert current_execution_id() is None

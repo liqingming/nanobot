@@ -66,8 +66,9 @@ def test_suffix_transition_at_minute_boundary() -> None:
 
 def test_suffix_progresses_linearly_with_real_time() -> None:
     """Critical sanity: the displayed seconds advance at real-time rate."""
-    from nanobot.fork.cli.tui_textual import _NanobotApp
     import re
+
+    from nanobot.fork.cli.tui_textual import _NanobotApp
 
     # Pretend we started 3 seconds ago, then sleep 1.1 real seconds and
     # check that the displayed seconds advance by ~1.

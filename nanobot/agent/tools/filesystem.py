@@ -1,6 +1,8 @@
 """File system tools: read, write, edit, list."""
 
 import asyncio
+
+# pyright: reportPrivateUsage=false, reportUnusedFunction=false
 import difflib
 import mimetypes
 import os
@@ -9,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
-from nanobot.agent.tools.context import current_request_context
+from nanobot.agent.tools.context import ToolContext, current_request_context
 from nanobot.agent.tools.file_state import FileStates, _hash_file, current_file_states
 from nanobot.agent.tools.path_utils import resolve_workspace_path
 from nanobot.agent.tools.schema import (
@@ -53,7 +55,7 @@ class _FsTool(Tool):
         return FileToolsConfig
 
     @classmethod
-    def enabled(cls, ctx: Any) -> bool:
+    def enabled(cls, ctx: ToolContext) -> bool:
         return ctx.config.file.enable
 
     def __init__(
@@ -67,6 +69,7 @@ class _FsTool(Tool):
         file_states: FileStates | None = None,
         restrict_to_workspace: bool | None = None,
         sandbox_restricts_workspace: bool = False,
+        extra_read_allowed_files: list[Path] | None = None,
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
@@ -76,6 +79,7 @@ class _FsTool(Tool):
             *(extra_allowed_dirs or []),
             *(extra_read_allowed_dirs or []),
         ]
+        self._extra_read_allowed_files = list(extra_read_allowed_files or [])
         self._extra_write_allowed_dirs = list(extra_write_allowed_dirs or [])
         self._extra_write_allowed_files = list(extra_write_allowed_files or [])
         self._restrict_to_workspace = (
@@ -91,20 +95,24 @@ class _FsTool(Tool):
         self._fallback_file_states = FileStates()
 
     @classmethod
-    def create(cls, ctx: Any) -> Tool:
+    def create(cls, ctx: ToolContext) -> Tool:
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 
+        agent_workspace = Path(ctx.workspace)
+        resolved_agent_workspace = agent_workspace.expanduser().resolve(strict=False)
         restrict = (
             ctx.config.restrict_to_workspace
             or ctx.config.exec.sandbox
         )
         sandbox_restricts = bool(ctx.config.exec.sandbox)
-        allowed_dir = Path(ctx.workspace) if restrict else None
-        extra_read = [BUILTIN_SKILLS_DIR]
+        allowed_dir = agent_workspace if restrict else None
+        # Agent-owned skills stay available from project scopes. History is a narrower
+        # capability: expose only the append-only log, not the surrounding memory directory.
         return cls(
-            workspace=Path(ctx.workspace),
+            workspace=agent_workspace,
             allowed_dir=allowed_dir,
-            extra_read_allowed_dirs=extra_read,
+            extra_read_allowed_dirs=[BUILTIN_SKILLS_DIR, resolved_agent_workspace / "skills"],
+            extra_read_allowed_files=[resolved_agent_workspace / "memory" / "history.jsonl"],
             file_states=ctx.file_state_store,
             restrict_to_workspace=ctx.config.restrict_to_workspace,
             sandbox_restricts_workspace=sandbox_restricts,
@@ -135,27 +143,54 @@ class _FsTool(Tool):
         extra_allowed_files: list[Path] | None,
         *,
         include_media_dir: bool,
+        extra_files_require_allowed_root: bool = False,
     ) -> Path:
         access = current_tool_workspace(
             self._workspace,
             restrict_to_workspace=self._restrict_to_workspace,
             sandbox_restricts_workspace=self._sandbox_restricts_workspace,
         )
+        allowed_root = self._effective_allowed_root(access.allowed_root)
+        if extra_files_require_allowed_root and allowed_root is None:
+            extra_allowed_files = None
         return resolve_workspace_path(
             path,
             access.project_path,
-            self._effective_allowed_root(access.allowed_root),
+            allowed_root,
             extra_allowed_dirs,
             extra_allowed_files,
             include_media_dir=include_media_dir,
         )
 
     def _resolve_read(self, path: str) -> Path:
+        plugin_skill_dirs: list[Path] = []
+        if self._workspace is not None:
+            from nanobot.agent.plugins import enabled_agent_plugin_skill_dirs
+
+            try:
+                access = current_tool_workspace(
+                    self._workspace,
+                    restrict_to_workspace=self._restrict_to_workspace,
+                    sandbox_restricts_workspace=self._sandbox_restricts_workspace,
+                )
+                if self._effective_allowed_root(access.allowed_root) is not None:
+                    candidate = Path(path).expanduser()
+                    if not candidate.is_absolute() and access.project_path is not None:
+                        candidate = access.project_path / candidate
+                    plugin_skill_dirs = list(
+                        enabled_agent_plugin_skill_dirs(
+                            Path(self._workspace),
+                            requested_path=candidate.resolve(strict=False),
+                        )
+                    )
+            except (OSError, RuntimeError):
+                pass
         return self._resolve_with_extra(
             path,
-            self._extra_read_allowed_dirs,
-            None,
+            [*self._extra_read_allowed_dirs, *plugin_skill_dirs],
+            self._extra_read_allowed_files,
             include_media_dir=True,
+            extra_files_require_allowed_root=True,
         )
 
     def _resolve_write(self, path: str) -> Path:
@@ -227,33 +262,20 @@ def _builtin_skill_read_path(path: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-def _parse_page_range(pages: str, total: int) -> tuple[int, int]:
-    """Parse a page range like '2-5' into 0-based (start, end) inclusive."""
-    parts = pages.strip().split("-")
-    if len(parts) == 1:
-        p = int(parts[0])
-        return max(0, p - 1), min(p - 1, total - 1)
-    start = int(parts[0])
-    end = int(parts[1])
-    return max(0, start - 1), min(end - 1, total - 1)
-
-
 @tool_parameters(
     tool_parameters_schema(
         path=StringSchema("The file path to read"),
         offset=IntegerSchema(
-            1,
-            description="Line number to start reading from (1-indexed, default 1)",
+            description="1-based text or extracted-document line (default 1)",
             minimum=1,
         ),
         limit=IntegerSchema(
-            400,
-            description="Maximum number of lines to read (default 400)",
+            description="Maximum lines to return (default 400)",
             minimum=1,
         ),
-        pages=StringSchema("Page range for PDF files, e.g. '1-5' (default: all, max 20 pages)"),
+        pages=StringSchema("PDF page number or range, e.g. '7' or '1-5' (max 20 pages)"),
         force=BooleanSchema(
-            description="Bypass same-file read deduplication and return content again.",
+            description="Return an unchanged range again",
             default=False,
         ),
         required=["path"],
@@ -264,6 +286,7 @@ class ReadFileTool(_FsTool):
     _scopes = {"core", "subagent", "memory"}
 
     _MAX_CHARS = 128_000
+    _MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
     _DEFAULT_LIMIT = 400
     _MAX_PDF_PAGES = 20
 
@@ -320,13 +343,22 @@ class ReadFileTool(_FsTool):
             if not fp.is_file():
                 return ToolResult.error(f"Error: Not a file: {path}")
 
+            file_size = fp.stat().st_size
+            if file_size > self._MAX_FILE_SIZE_BYTES:
+                size_mib = file_size / (1024 * 1024)
+                max_mib = self._MAX_FILE_SIZE_BYTES // (1024 * 1024)
+                return ToolResult.error(
+                    f"Error: File too large to read ({size_mib:.1f} MiB). "
+                    f"Maximum is {max_mib} MiB."
+                )
+
             # PDF support
             if fp.suffix.lower() == ".pdf":
                 return self._read_pdf(fp, pages)
 
             # Office document support
             if fp.suffix.lower() in {".docx", ".xlsx", ".pptx"}:
-                return self._read_office_doc(fp)
+                return self._read_office_doc(fp, offset, limit)
 
             raw = fp.read_bytes()
             if not raw:
@@ -379,11 +411,25 @@ class ReadFileTool(_FsTool):
             try:
                 text_content = raw.decode("utf-8")
             except UnicodeDecodeError:
-                # Binary file - return error message
-                mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
-                if mime and mime.startswith("image/"):
-                    return build_image_content_blocks(raw, mime, str(fp), f"(Image file: {path})")
-                return ToolResult.error(f"Error: Cannot read binary file {path} (MIME: {mime or 'unknown'}). Only UTF-8 text and images are supported.")
+                # Match the former eager extractor for known text formats while
+                # keeping arbitrary binary files on the guarded error path.
+                from nanobot.utils.document import _is_text_extension
+
+                if _is_text_extension(fp.suffix.lower()):
+                    text_content = raw.decode("latin-1")
+                else:
+                    mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
+                    if mime and mime.startswith("image/"):
+                        return build_image_content_blocks(
+                            raw,
+                            mime,
+                            str(fp),
+                            f"(Image file: {path})",
+                        )
+                    return ToolResult.error(
+                        f"Error: Cannot read binary file {path} (MIME: {mime or 'unknown'}). "
+                        "Only supported text files and images can be read."
+                    )
 
             # Normalize CRLF -> LF before line-splitting. Primarily a Windows
             # concern (git checkouts with autocrlf, editors saving CRLF) but
@@ -405,7 +451,8 @@ class ReadFileTool(_FsTool):
             result = "\n".join(numbered)
 
             if len(result) > self._MAX_CHARS:
-                trimmed, chars = [], 0
+                trimmed: list[str] = []
+                chars = 0
                 for line in numbered:
                     chars += len(line) + 1
                     if chars > self._MAX_CHARS:
@@ -435,69 +482,114 @@ class ReadFileTool(_FsTool):
         return f"{n} line{'s' if n != 1 else ''}, {len(result)} chars"
 
     def _read_pdf(self, fp: Path, pages: str | None) -> str:
-        try:
-            import fitz  # pymupdf
-        except ImportError:
-            return ToolResult.error("Error: PDF reading requires pymupdf. Install with: pip install pymupdf")
+        from nanobot.utils.document import PdfPageRangeError, PdfSafetyError, extract_pdf_pages
 
         try:
-            doc = fitz.open(str(fp))
+            extraction = extract_pdf_pages(
+                fp,
+                pages=pages,
+                max_pages=self._MAX_PDF_PAGES,
+                max_chars=self._MAX_CHARS,
+            )
+        except PdfPageRangeError as e:
+            return ToolResult.error(f"Error: Invalid page range '{pages}': {e!s}.")
+        except PdfSafetyError as e:
+            return ToolResult.error(f"Error reading PDF: {e}")
         except Exception as e:
             return ToolResult.error(f"Error reading PDF: {e}")
 
-        total_pages = len(doc)
-        if pages:
-            try:
-                start, end = _parse_page_range(pages, total_pages)
-            except (ValueError, IndexError):
-                doc.close()
-                return ToolResult.error(f"Error: Invalid page range '{pages}'. Use format like '1-5'.")
-            if start > end or start >= total_pages:
-                doc.close()
-                return ToolResult.error(f"Error: Page range '{pages}' is out of bounds (document has {total_pages} pages).")
-        else:
-            start = 0
-            end = min(total_pages - 1, self._MAX_PDF_PAGES - 1)
-
-        if end - start + 1 > self._MAX_PDF_PAGES:
-            end = start + self._MAX_PDF_PAGES - 1
-
-        parts: list[str] = []
-        for i in range(start, end + 1):
-            page = doc[i]
-            text = page.get_text().strip()
-            if text:
-                parts.append(f"--- Page {i + 1} ---\n{text}")
-        doc.close()
-
-        if not parts:
+        if not extraction.text:
             return f"(PDF has no extractable text: {fp})"
 
-        result = "\n\n".join(parts)
-        if end < total_pages - 1:
-            result += f"\n\n(Showing pages {start + 1}-{end + 1} of {total_pages}. Use pages='{end + 2}-{min(end + 1 + self._MAX_PDF_PAGES, total_pages)}' to continue.)"
-        if len(result) > self._MAX_CHARS:
-            result = result[:self._MAX_CHARS] + "\n\n(PDF text truncated at ~128K chars)"
+        result = extraction.text
+        if extraction.end_page < extraction.total_pages - 1:
+            next_start = extraction.end_page + 2
+            next_end = min(extraction.end_page + 1 + self._MAX_PDF_PAGES, extraction.total_pages)
+            result += (
+                f"\n\n(Showing pages {extraction.start_page + 1}-{extraction.end_page + 1} "
+                f"of {extraction.total_pages}. Use pages='{next_start}-{next_end}' to continue.)"
+            )
         return result
 
-    def _read_office_doc(self, fp: Path) -> str:
-        from nanobot.utils.document import extract_text
+    def _read_office_doc(
+        self,
+        fp: Path,
+        offset: int,
+        limit: int | None,
+    ) -> str:
+        from nanobot.utils.document import open_document_line_source
 
-        result = extract_text(fp)
+        offset = max(1, offset)
+        requested_limit = limit or self._DEFAULT_LIMIT
+        source_iterator = None
+        try:
+            source = open_document_line_source(fp)
+            if source is None:
+                return ToolResult.error(f"Error: Unsupported file format: {fp.suffix}")
+            source_iterator = source.lines
+            numbered: list[str] = []
+            output_chars = 0
+            total_seen = 0
+            end = offset - 1
+            has_more = False
+            line_was_clipped = False
 
-        if result is None:
-            return ToolResult.error(f"Error: Unsupported file format: {fp.suffix}")
+            for line in source_iterator:
+                total_seen = line.extracted_line
+                if line.extracted_line < offset:
+                    continue
+                if len(numbered) >= requested_limit:
+                    has_more = True
+                    break
 
-        if result.startswith("[error:"):
-            return ToolResult.error(f"Error reading {fp.suffix.upper()} file: {result}")
+                rendered = f"{line.extracted_line}| {line.text}"
+                extra = 1 if numbered else 0
+                if output_chars + extra + len(rendered) > self._MAX_CHARS:
+                    if numbered:
+                        has_more = True
+                        break
+                    prefix = f"{line.extracted_line}| "
+                    available = max(0, self._MAX_CHARS - len(prefix) - 3)
+                    rendered = f"{prefix}{line.text[:available]}..."
+                    line_was_clipped = True
+                    has_more = True
+                numbered.append(rendered)
+                output_chars += extra + len(rendered)
+                end = line.extracted_line
+                if line_was_clipped:
+                    break
 
-        if not result:
-            return f"({fp.suffix.upper().lstrip('.')} has no extractable text: {fp})"
+            if not numbered:
+                if total_seen == 0:
+                    return (
+                        f"({fp.suffix.upper().lstrip('.')} has no extractable text: {fp})"
+                    )
+                return ToolResult.error(
+                    f"Error: offset {offset} is beyond end of extracted document "
+                    f"({total_seen} lines)"
+                )
 
-        if len(result) > self._MAX_CHARS:
-            result = result[:self._MAX_CHARS] + "\n\n(Document text truncated at ~128K chars)"
-
-        return result
+            output = "\n".join(numbered)
+            if has_more:
+                if line_was_clipped:
+                    output += (
+                        "\n\n(Document text truncated at ~128K chars; line clipped. "
+                        f"Use offset={end + 1} to continue.)"
+                    )
+                else:
+                    output += (
+                        f"\n\n(Showing extracted lines {offset}-{end}. "
+                        f"Use offset={end + 1} to continue.)"
+                    )
+            else:
+                output += f"\n\n(End of document — {total_seen} extracted lines total)"
+            return output
+        except Exception as e:
+            return ToolResult.error(f"Error reading {fp.suffix.upper()} file: {e!s}")
+        finally:
+            close = getattr(source_iterator, "close", None)
+            if close is not None:
+                close()
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +747,15 @@ class _MatchSpan:
     end: int
     text: str
     line: int
+
+
+def _match_end_line(match: _MatchSpan) -> int:
+    comparable = match.text[:-1] if match.text.endswith("\n") else match.text
+    return match.line + comparable.count("\n")
+
+
+def _match_covers_line(match: _MatchSpan, line: int) -> bool:
+    return match.line <= line <= _match_end_line(match)
 
 
 def _find_exact_matches(content: str, old_text: str) -> list[_MatchSpan]:
@@ -834,23 +935,25 @@ def _summarize_write_or_edit(args: dict[str, Any], result: Any) -> str:
 @tool_parameters(
     tool_parameters_schema(
         path=StringSchema("The file path to edit"),
-        old_text=StringSchema("The text to find and replace"),
-        new_text=StringSchema("The text to replace with"),
+        old_text=StringSchema("The text to find and replace; copy it from read_file."),
+        new_text=StringSchema(
+            "The replacement text; must differ from old_text for an existing file."
+        ),
         replace_all=BooleanSchema(description="Replace all occurrences (default false)"),
         occurrence=IntegerSchema(
-            1,
             description="Optional 1-based occurrence to replace when old_text appears multiple times.",
             minimum=1,
             nullable=True,
         ),
         line_hint=IntegerSchema(
-            1,
-            description="Optional 1-based line hint used to choose the nearest match.",
+            description=(
+                "Optional exact 1-based target line copied from read_file. "
+                "The selected old_text match must cover this line."
+            ),
             minimum=1,
             nullable=True,
         ),
         expected_replacements=IntegerSchema(
-            1,
             description="Optional guard for the number of replacements that must be made.",
             minimum=1,
             nullable=True,
@@ -872,13 +975,9 @@ class EditFileTool(_FsTool):
     @property
     def description(self) -> str:
         return (
-            "Perform a small, exact replacement in one file by replacing "
-            "old_text with new_text. Use this for narrow text substitutions "
-            "with old_text copied from read_file. For multi-file, structural, "
-            "or generated code edits, prefer apply_patch. If old_text matches "
-            "multiple times, provide more context or set occurrence, line_hint, "
-            "replace_all, and expected_replacements. Shows closest-match "
-            "diagnostics on failure."
+            "Perform a small, exact replacement in one file. "
+            "Prefer apply_patch for multi-file, structural, or generated edits. "
+            "occurrence, line_hint, and replace_all=true are mutually exclusive."
         )
 
     @staticmethod
@@ -907,9 +1006,12 @@ class EditFileTool(_FsTool):
                 return ToolResult.error("Error: expected_replacements must be >= 1.")
 
             fp = self._resolve_write(path)
+            file_exists = fp.exists()
+            if file_exists and old_text == new_text:
+                return ToolResult.error("Error: new_text must be different from old_text.")
 
             # Create-file semantics: old_text='' + file doesn't exist → create
-            if not fp.exists():
+            if not file_exists:
                 if old_text == "":
                     fp.parent.mkdir(parents=True, exist_ok=True)
                     fp.write_text(new_text, encoding="utf-8")
@@ -953,36 +1055,21 @@ class EditFileTool(_FsTool):
                 return ToolResult.error("Error: line_hint cannot be used with replace_all=true.")
             if occurrence is not None and line_hint is not None:
                 return ToolResult.error("Error: line_hint cannot be used with occurrence.")
-            if count > 1 and not replace_all:
-                if occurrence is not None:
-                    if occurrence > count:
-                        return ToolResult.error(
-                            f"Error: occurrence {occurrence} is out of range; "
-                            f"old_text appears {count} times."
-                        )
-                elif line_hint is not None:
-                    nearest = min(matches, key=lambda match: abs(match.line - line_hint))
-                    distance = abs(nearest.line - line_hint)
-                    if sum(1 for match in matches if abs(match.line - line_hint) == distance) > 1:
-                        return ToolResult.error(
-                            f"Error: line_hint {line_hint} is ambiguous; "
-                            f"old_text appears {count} times."
-                        )
-                else:
-                    line_numbers = [match.line for match in matches]
-                    preview = ", ".join(f"line {n}" for n in line_numbers[:3])
-                    if len(line_numbers) > 3:
-                        preview += ", ..."
-                    location_hint = f" at {preview}" if preview else ""
-                    return (
-                        f"Warning: old_text appears {count} times{location_hint}. "
-                        "Provide more context, set occurrence to choose one match, "
-                        "or set replace_all=true."
-                    )
-            elif occurrence is not None and occurrence > count:
+            if occurrence is not None and occurrence > count:
                 return ToolResult.error(
                     f"Error: occurrence {occurrence} is out of range; "
-                    f"old_text appears {count} time."
+                    f"old_text appears {count} time(s)."
+                )
+            if count > 1 and not replace_all and occurrence is None and line_hint is None:
+                line_numbers = [match.line for match in matches]
+                preview = ", ".join(f"line {n}" for n in line_numbers[:3])
+                if len(line_numbers) > 3:
+                    preview += ", ..."
+                location_hint = f" at {preview}" if preview else ""
+                return (
+                    f"Warning: old_text appears {count} times{location_hint}. "
+                    "Provide more context, set occurrence to choose one match, "
+                    "or set replace_all=true."
                 )
 
             norm_new = new_text.replace("\r\n", "\n")
@@ -993,10 +1080,27 @@ class EditFileTool(_FsTool):
 
             if replace_all:
                 selected = matches
+            elif occurrence is not None:
+                selected = [matches[occurrence - 1]]
             elif line_hint is not None:
-                selected = [min(matches, key=lambda match: abs(match.line - line_hint))]
+                candidates = [match for match in matches if _match_covers_line(match, line_hint)]
+                if not candidates:
+                    locations = ", ".join(f"line {match.line}" for match in matches[:3])
+                    if len(matches) > 3:
+                        locations += ", ..."
+                    return ToolResult.error(
+                        f"Error: line_hint {line_hint} does not match the old_text location. "
+                        f"old_text appears at {locations}. Re-read the intended region and "
+                        "copy old_text that covers the target line."
+                    )
+                if len(candidates) > 1:
+                    return ToolResult.error(
+                        f"Error: line_hint {line_hint} is ambiguous; "
+                        f"old_text appears {len(candidates)} times on that line."
+                    )
+                selected = candidates
             else:
-                selected = [matches[occurrence - 1 if occurrence else 0]]
+                selected = [matches[0]]
             if expected_replacements is not None and len(selected) != expected_replacements:
                 return ToolResult.error(
                     f"Error: expected {expected_replacements} replacements but "
@@ -1093,7 +1197,6 @@ class EditFileTool(_FsTool):
         path=StringSchema("The directory path to list"),
         recursive=BooleanSchema(description="Recursively list all files (default false)"),
         max_entries=IntegerSchema(
-            200,
             description="Maximum entries to return (default 200)",
             minimum=1,
         ),

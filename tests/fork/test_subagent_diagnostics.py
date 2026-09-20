@@ -25,7 +25,7 @@ def _manager(tmp_path, *, native=False, block_limit=3000):
     manager = SubagentManager(
         provider, tmp_path / "workspace", MessageBus(), 16000, model="test-model",
         data_dir=tmp_path / "data", context_window_tokens=8000,
-        context_block_limit=block_limit,
+        context_block_limit=block_limit, max_concurrent_subagents=3,
     )
     manager.workspace.mkdir()
     manager._build_tools = lambda **kwargs: ToolRegistry()
@@ -45,7 +45,7 @@ async def _run(manager, *, session="cli:topic", task_id="a" * 32):
     await manager._run_subagent(
         task_id, _SECRET, "label",
         {"channel": "cli", "chat_id": "topic", "session_key": session}, status,
-        origin_message_id="parent-message",
+        origin_message_id="parent-message", runtime=manager._compat_runtime,
     )
     return status
 
@@ -62,7 +62,7 @@ async def test_real_manager_audits_governance_usage_and_native_counts(tmp_path, 
         })
         if measured:
             diagnostics["context_input_tokens"] = 321
-    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
         content=_SECRET,
         usage={"prompt_tokens": 900, "completion_tokens": 10} if measured or native else {},
         provider_diagnostics=diagnostics,
@@ -96,7 +96,7 @@ async def test_real_manager_audits_governance_usage_and_native_counts(tmp_path, 
     assert _SECRET not in json.dumps(records)
     assert records[-1]["parent_session_ref"] == session_ref("cli:topic")
     assert records[-1]["task_id"] == "a" * 32
-    request = provider.chat_with_retry.await_args.kwargs["request_context"]
+    request = provider.chat_stream_with_retry.await_args.kwargs["request_context"]
     assert request["session_key"] == "cli:topic"
     assert request["turn_id"] == records[-1]["turn_id"]
     assert request["turn_id"].startswith("subagent:")
@@ -123,7 +123,7 @@ async def test_spawn_concurrency_keeps_audit_and_provider_identity_isolated(tmp_
         await asyncio.wait_for(entered.wait(), timeout=5)
         return LLMResponse(content="ok", usage={"prompt_tokens": 100, "completion_tokens": 5})
 
-    provider.chat_with_retry = AsyncMock(side_effect=respond)
+    provider.chat_stream_with_retry = AsyncMock(side_effect=respond)
     tasks = []
     for session in ("cli:same", "cli:same", "cli:other"):
         await manager.spawn("task", session_key=session, origin_message_id="parent")
@@ -151,14 +151,14 @@ async def test_spawn_concurrency_keeps_audit_and_provider_identity_isolated(tmp_
 async def test_terminal_audit_survives_non_success_paths(tmp_path, failure):
     manager, provider = _manager(tmp_path, block_limit=1 if failure == "budget" else 3000)
     if failure == "provider_error":
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
             content=_SECRET, finish_reason="error", error_status_code=429,
             error_kind="rate_limit", error_code="rate_limit_exceeded",
             error_type=_SECRET,
         ))
     else:
         error = asyncio.CancelledError() if failure == "cancelled" else RuntimeError(_SECRET)
-        provider.chat_with_retry = AsyncMock(side_effect=error)
+        provider.chat_stream_with_retry = AsyncMock(side_effect=error)
     if failure == "cancelled":
         with pytest.raises(asyncio.CancelledError):
             await _run(manager)
@@ -172,7 +172,7 @@ async def test_terminal_audit_survives_non_success_paths(tmp_path, failure):
         assert done["error_status_code"] == 429
         assert done["error_code"] == "rate_limit_exceeded"
     if failure == "budget":
-        provider.chat_with_retry.assert_not_awaited()
+        provider.chat_stream_with_retry.assert_not_awaited()
         assert records[-1]["context_safety_failure"] is True
         assert any(row["event"] == "subagent.runner.context.budget_exhausted" for row in records)
     assert current_execution_id() is None
@@ -189,11 +189,11 @@ async def test_log_writer_failure_does_not_change_result_or_cleanup(tmp_path, mo
 
     monkeypatch.setattr(subagent_diagnostics, "append_session_runtime_log", broken_writer)
     if failure == "cancelled":
-        provider.chat_with_retry = AsyncMock(side_effect=asyncio.CancelledError())
+        provider.chat_stream_with_retry = AsyncMock(side_effect=asyncio.CancelledError())
         with pytest.raises(asyncio.CancelledError):
             await _run(manager)
     else:
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
             content="result", finish_reason="error" if failure == "error" else "stop",
         ))
         status = await _run(manager)
@@ -248,7 +248,7 @@ async def test_initialization_failure_still_has_terminal_audit(tmp_path):
     assert rows[-1]["outcome"] == "error"
     assert rows[-1]["parent_session_ref"] == session_ref("cli:topic")
     assert _SECRET not in json.dumps(rows)
-    provider.chat_with_retry.assert_not_called()
+    provider.chat_stream_with_retry.assert_not_called()
 
 
 async def test_same_task_reexecution_has_new_audit_identity_and_safe_retry(tmp_path):
@@ -261,7 +261,7 @@ async def test_same_task_reexecution_has_new_audit_identity_and_safe_retry(tmp_p
         })
         return LLMResponse(content="ok")
 
-    provider.chat_with_retry = AsyncMock(side_effect=respond)
+    provider.chat_stream_with_retry = AsyncMock(side_effect=respond)
     await _run(manager)
     await _run(manager)
     logs = _logs(tmp_path)

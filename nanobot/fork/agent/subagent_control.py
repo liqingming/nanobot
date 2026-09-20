@@ -21,10 +21,10 @@ class SubagentControlState:
 
     def __init__(self, data_dir: Path | None = None) -> None:
         self.store = SubagentReceiptStore(data_dir) if data_dir is not None else None
-        self.active: dict[str, tuple[str, str, asyncio.Task, Any]] = {}
+        self.active: dict[str, tuple[str, str, asyncio.Task[Any], Any]] = {}
         self.finished: OrderedDict[str, tuple[str, str, dict]] = OrderedDict()
 
-    def register(self, task_id: str, session: str, workspace: Path, task: asyncio.Task,
+    def register(self, task_id: str, session: str, workspace: Path, task: asyncio.Task[Any],
                  status: Any) -> None:
         if self.store is not None:
             self.store.register(task_id, session, workspace, self._receipt(task_id, task, status))
@@ -46,7 +46,7 @@ class SubagentControlState:
             self.finished.popitem(last=False)
 
     @staticmethod
-    def _receipt(task_id: str, task: asyncio.Task, status: Any) -> dict:
+    def _receipt(task_id: str, task: asyncio.Task[Any], status: Any) -> dict:
         stopped = task.done()
         reason = status.stop_reason
         if task.cancelled():
@@ -119,7 +119,7 @@ class SubagentControlState:
         }
 
 
-def should_wait_for_subagent_result(calls: list[Any], results: list[str], events: list[dict]) -> bool:
+def should_wait_for_subagent_result(calls: list[Any], results: list[str], events: list[dict[str, Any]]) -> bool:
     """仅单个、成功的显式 wait 且目标仍运行时，把等待交给宿主队列。"""
     if len(calls) != 1 or len(results) != 1 or len(events) != 1:
         return False

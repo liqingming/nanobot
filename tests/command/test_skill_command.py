@@ -97,7 +97,7 @@ async def test_skill_command_excludes_disabled(tmp_path: Path) -> None:
     _write_skill(ws_skills, "alpha", description="Alpha skill")
     _write_skill(ws_skills, "beta", description="Beta skill")
 
-    loop = _make_loop(tmp_path)
+    loop = _loop_with_skills(tmp_path)
     loop.context.skills.disabled_skills = {"alpha"}
 
     out = await cmd_skill(_ctx(loop))
@@ -124,6 +124,14 @@ async def test_skill_command_no_render_as_text(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path)
     out = await cmd_skill(_ctx(loop))
     assert out.metadata.get("render_as") != "text"
+
+
+@pytest.mark.asyncio
+async def test_skill_command_does_not_list_goal_runtime_protocol(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    out = await cmd_skill(_ctx(loop))
+
+    assert "long-goal" not in out.content
 
 
 @pytest.mark.asyncio

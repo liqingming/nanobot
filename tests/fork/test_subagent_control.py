@@ -9,7 +9,7 @@ import pytest
 
 from nanobot.agent.runner import AgentRunResult
 from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.context import RequestContext, ToolContext
+from nanobot.agent.tools.context import RequestContext, ToolContext, request_context
 from nanobot.agent.tools.loader import ToolLoader
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.spawn import SpawnTool
@@ -49,9 +49,9 @@ async def test_spawn_is_fresh_and_completed_receipt_is_not_business_success(tmp_
 
     sm.runner.run = run
     spawner = SpawnTool(sm)
-    spawner.set_context(RequestContext(channel="cli", chat_id="one", session_key="cli:one"))
     task_text = "仅处理指定目录下的任务，输出报告作为交付，验收要求核对结果并确认通过，不修改其他文件。"
-    result = await spawner.execute(task_text)
+    with request_context(RequestContext(channel="cli", chat_id="one", session_key="cli:one", runtime=sm._compat_runtime)):
+        result = await spawner.execute(task_text)
     tid = result.split("(id: ")[1].split(")")[0]
     ctl = control(sm)
     result = json.loads(await ctl.execute("wait", tid))

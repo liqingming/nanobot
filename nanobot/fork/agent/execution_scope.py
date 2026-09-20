@@ -20,7 +20,7 @@ async def run_isolated_subagent(runner: AgentRunner, spec: AgentRunSpec) -> Agen
     """每次运行独立命名空间；退出时仅清理支持此能力的 provider 的自有连接。"""
     execution_id = uuid.uuid4().hex
     token = _execution_id.set(execution_id)
-    provider = runner.provider
+    provider = spec.runtime.provider if spec.runtime is not None else runner.provider
     try:
         return await runner.run(spec)
     finally:

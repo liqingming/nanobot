@@ -504,11 +504,52 @@ def test_messages_become_instructions_history_and_latest_user_input() -> None:
             },
         ]
     )
-    assert instructions == "System rules"
+    assert instructions.startswith("System rules")
+    request = json.loads(instructions.splitlines()[-1])
+    assert request["role"] == "user"
+    assert request["text"] == "Latest question"
+    assert "media" in request
+    assert "data:image" not in instructions
+    assert "Earlier answer" not in instructions
     assert "user: Earlier question" in turn_input[0]["text"]
     assert "assistant: Earlier answer" in turn_input[0]["text"]
     assert turn_input[1] == {"type": "text", "text": "Latest question"}
     assert turn_input[2] == {"type": "image", "url": "data:image/png;base64,AAA"}
+
+
+@pytest.mark.parametrize("current_request", [
+    "Does the UI knowledge base contain a nested scrolling pattern?",
+    "Add a complete nested-list pattern to the Compose skill; do not commit.",
+])
+def test_current_request_survives_separately_from_completed_history(current_request):
+    messages = [
+        {"role": "system", "content": "Repository rules"},
+        {"role": "user", "content": "Fix the three skills"},
+        {"role": "assistant", "content": "Three skills updated; 548 tests passed."},
+        {"role": "user", "content": current_request},
+        {"role": "assistant", "tool_calls": [{
+            "id": "read-1", "type": "function", "function": {
+                "name": "read_file", "arguments": '{"path":"SKILL.md"}',
+            },
+        }]},
+        {"role": "tool", "tool_call_id": "read-1", "content": "Existing skill rules"},
+    ]
+    instructions, inputs = _messages_to_app_server_input(
+        messages, include_current_turn_history=True,
+    )
+    # Native compaction can replace the transcript, but the current request must
+    # remain in the fixed instructions, outside both history and the checkpoint.
+    assert json.loads(instructions.splitlines()[-1]) == {
+        "role": "user", "text": current_request,
+    }
+    assert "548 tests" not in instructions
+    assert "548 tests" in inputs[0]["text"]
+    assert "read-1" not in instructions
+    assert "read-1" in inputs[-1]["text"]
+    assert "quoted user-level" in instructions
+    assert "Later user corrections and cancellations take precedence" in instructions
+    assert "do not repeat completed tool calls" in instructions
+    assert "A recap of an older task" in instructions
 
 
 def test_recovery_input_includes_completed_current_turn_history() -> None:
@@ -1311,7 +1352,7 @@ async def test_stdio_protocol_continues_tool_result_and_usage_is_incremental(
         request_context=context,
     )
     assert first.finish_reason == "tool_calls"
-    assert first.usage["total_tokens"] == 10
+    assert first.usage.total_tokens == 10
     assert first.provider_diagnostics["context_input_tokens"] == 8
 
     messages.extend(
@@ -1335,8 +1376,8 @@ async def test_stdio_protocol_continues_tool_result_and_usage_is_incremental(
         request_context=context,
     )
     assert second.content == "done"
-    assert second.usage["total_tokens"] == 8
-    assert first.usage["total_tokens"] + second.usage["total_tokens"] == 18
+    assert second.usage.total_tokens == 8
+    assert first.usage.total_tokens + second.usage.total_tokens == 18
     assert second.provider_diagnostics["context_input_tokens"] == 5
     assert provider._turns == {}
 
@@ -1438,7 +1479,7 @@ async def test_bridge_recovers_once_and_replays_cached_result(tmp_path: Path) ->
         request_context=context,
     )
     assert recovered.content == "done"
-    assert recovered.usage["total_tokens"] == 18
+    assert recovered.usage.total_tokens == 18
     assert recovered.provider_diagnostics["bridge_recovery_attempts"] == 1
     assert recovered.provider_diagnostics["idempotent_tool_replays"] == 1
     assert list(ledger_dir.glob("*.json")) == []
@@ -1594,7 +1635,7 @@ async def test_new_provider_restores_durable_result_after_process_restart(
         request_context=context,
     )
     assert restored.content == "done"
-    assert restored.usage["total_tokens"] == 18
+    assert restored.usage.total_tokens == 18
     assert restored.provider_diagnostics["restored_from_idempotency_ledger"] is True
     assert restored.provider_diagnostics["idempotent_tool_replays"] == 1
     assert list(ledger_dir.glob("*.json")) == []
@@ -2068,7 +2109,7 @@ async def test_main_and_subagents_keep_independent_bridges_and_cleanup(
     bus = MessageBus()
     manager = SubagentManager(
         provider=provider, workspace=tmp_path, bus=bus,
-        model="gpt-test", max_tool_result_chars=16000,
+        model="gpt-test", max_tool_result_chars=16000, max_concurrent_subagents=2,
     )
     manager._build_tools = lambda **kwargs: None
     manager._build_subagent_prompt = lambda **kwargs: "test"
@@ -2126,7 +2167,7 @@ async def test_main_and_subagents_keep_independent_bridges_and_cleanup(
                 task_id=name, label=name, task_description=name, started_at=0,
             )
             tasks.append(asyncio.create_task(
-                manager._run_subagent(name, name, name, origin, status),
+                manager._run_subagent(name, name, name, origin, status, manager._compat_runtime),
             ))
         await asyncio.wait_for(asyncio.gather(*(event.wait() for event in ready.values())), 10)
         assert len({main_key, *keys.values()}) == 3

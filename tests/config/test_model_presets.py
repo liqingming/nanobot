@@ -1,8 +1,14 @@
 import json
+import os
+import subprocess
+import sys
+import textwrap
 import warnings
 
 import pytest
 
+from nanobot.agent.model_presets import load_model_preset_catalog
+from nanobot.config.errors import ConfigLoadError
 from nanobot.config.loader import load_config, save_active_model_preset
 from nanobot.config.schema import Config
 
@@ -36,6 +42,53 @@ def test_save_active_model_preset_preserves_raw_env_references(tmp_path) -> None
     assert data["agents"]["defaults"]["modelPreset"] == "fast"
     assert data["providers"]["openai"]["apiKey"] == "${OPENAI_API_KEY}"
     assert load_config(config_path).agents.defaults.model_preset == "fast"
+def test_model_preset_catalog_missing_env_reports_explicit_config_path(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    name = "NANOBOT_TEST_CATALOG_MISSING_KEY"
+    monkeypatch.delenv(name, raising=False)
+    config_path = tmp_path / "custom.json"
+    config_path.write_text(
+        json.dumps({"providers": {"openrouter": {"apiKey": f"${{{name}}}"}}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigLoadError) as exc_info:
+        load_model_preset_catalog(config_path)
+
+    assert exc_info.value.path == config_path
+
+
+def test_agent_timezone_rejects_unknown_iana_name() -> None:
+    with pytest.raises(ValueError, match="unknown timezone"):
+        Config.model_validate({"agents": {"defaults": {"timezone": "Not/AZone"}}})
+
+
+def test_agent_timezones_use_packaged_data_without_system_database() -> None:
+    script = textwrap.dedent(
+        """\
+        from zoneinfo import TZPATH
+
+        from nanobot.config.schema import Config
+
+        assert not TZPATH
+        for name in ("UTC", "Asia/Shanghai"):
+            config = Config.model_validate({"agents": {"defaults": {"timezone": name}}})
+            serialized = config.model_dump(mode="json", by_alias=True)
+            restored = Config.model_validate(serialized)
+            assert restored.agents.defaults.timezone == name
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=os.environ | {"PYTHONTZPATH": ""},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_provider_api_type_accepts_exact_values_only() -> None:
@@ -241,6 +294,25 @@ def test_model_presets_accepts_camel_case_root_key() -> None:
     assert config.model_presets["fast"].provider == "openai"
 
 
+@pytest.mark.parametrize(
+    "model_presets",
+    [
+        {"Default": {"model": "openai/gpt-4.1"}},
+        {
+            "Fast": {"model": "openai/gpt-4.1-mini"},
+            "fast": {"model": "openai/gpt-4.1"},
+        },
+        {" fast ": {"model": "openai/gpt-4.1"}},
+    ],
+)
+def test_model_preset_names_accepted_by_earlier_releases_remain_loadable(
+    model_presets: dict[str, dict[str, str]],
+) -> None:
+    config = Config.model_validate({"modelPresets": model_presets})
+
+    assert list(config.model_presets) == list(model_presets)
+
+
 def test_model_presets_serializes_with_camel_case_root_key() -> None:
     config = Config.model_validate({
         "model_presets": {
@@ -281,6 +353,24 @@ def test_validator_rejects_unknown_preset() -> None:
                     "modelPreset": "unknown",
                 }
             }
+        })
+
+
+def test_validator_accepts_dream_model_preset() -> None:
+    config = Config.model_validate({
+        "modelPresets": {
+            "dream": {"model": "anthropic/claude-haiku-4-5", "provider": "anthropic"},
+        },
+        "agents": {"defaults": {"dream": {"modelOverride": "dream"}}},
+    })
+
+    assert config.agents.defaults.dream.model_override == "dream"
+
+
+def test_validator_rejects_unknown_dream_model_preset() -> None:
+    with pytest.raises(ValueError, match="Dream model preset 'unknown' not found"):
+        Config.model_validate({
+            "agents": {"defaults": {"dream": {"modelOverride": "unknown"}}},
         })
 
 
