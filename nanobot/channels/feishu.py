@@ -755,6 +755,12 @@ class FeishuChannel(BaseChannel):
 
             import lark_oapi.ws.client as _lark_ws_client
 
+            thread = threading.current_thread()
+            self.logger.info(
+                "Feishu WebSocket worker started thread={} ident={}",
+                thread.name,
+                thread.ident,
+            )
             previous_loop = getattr(_lark_ws_client, "loop", None)
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
@@ -774,8 +780,17 @@ class FeishuChannel(BaseChannel):
                 with suppress(Exception):
                     asyncio.set_event_loop(None)
                 ws_loop.close()
+                self.logger.info(
+                    "Feishu WebSocket worker stopped thread={} ident={}",
+                    thread.name,
+                    thread.ident,
+                )
 
-        self._ws_thread = threading.Thread(target=run_ws, daemon=True)
+        self._ws_thread = threading.Thread(
+            target=run_ws,
+            name="nanobot-feishu-websocket",
+            daemon=True,
+        )
         self._ws_thread.start()
 
         # Fetch bot's own open_id for accurate @mention matching
@@ -790,9 +805,23 @@ class FeishuChannel(BaseChannel):
         self.logger.info("bot started with WebSocket long connection")
         self.logger.info("No public IP required - using WebSocket to receive events")
 
-        # Keep running until stopped
+        # Keep running until stopped and expose the worker state in verbose logs.
+        health_loop = asyncio.get_running_loop()
+        next_health_log = health_loop.time() + 60
         while self._running:
             await asyncio.sleep(1)
+            now = health_loop.time()
+            if now < next_health_log:
+                continue
+            alive = bool(self._ws_thread and self._ws_thread.is_alive())
+            log = self.logger.debug if alive else self.logger.error
+            log(
+                "Feishu WebSocket worker health alive={} thread={} ident={}",
+                alive,
+                self._ws_thread.name if self._ws_thread else "-",
+                self._ws_thread.ident if self._ws_thread else None,
+            )
+            next_health_log = now + 60
 
     async def stop(self) -> None:
         """
@@ -2135,8 +2164,69 @@ class FeishuChannel(BaseChannel):
         Sync handler for incoming messages (called from WebSocket thread).
         Schedules async handling in the main event loop.
         """
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+        event = getattr(data, "event", None)
+        message = getattr(event, "message", None)
+        message_id = getattr(message, "message_id", None) or "-"
+        chat_id = getattr(message, "chat_id", None) or "-"
+        chat_type = getattr(message, "chat_type", None) or "-"
+        msg_type = getattr(message, "message_type", None) or "-"
+        callback_thread = threading.current_thread()
+        self.logger.debug(
+            "Feishu SDK callback received message_id={} chat_id={} chat_type={} "
+            "msg_type={} thread={} ident={}",
+            message_id,
+            chat_id,
+            chat_type,
+            msg_type,
+            callback_thread.name,
+            callback_thread.ident,
+        )
+
+        if not self._loop or not self._loop.is_running():
+            self.logger.error(
+                "Feishu SDK callback not scheduled message_id={} reason=main_loop_not_running",
+                message_id,
+            )
+            return
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+        except Exception:
+            self.logger.exception(
+                "Feishu SDK callback scheduling failed message_id={}",
+                message_id,
+            )
+            return
+
+        self.logger.debug("Feishu SDK callback scheduled message_id={}", message_id)
+        future.add_done_callback(
+            lambda completed: self._on_message_scheduled_done(message_id, completed)
+        )
+
+    def _on_message_scheduled_done(self, message_id: str, future: Any) -> None:
+        """Log the result of handing an SDK callback to the main event loop."""
+        if future.cancelled():
+            self.logger.warning(
+                "Feishu SDK callback cancelled message_id={}",
+                message_id,
+            )
+            return
+        try:
+            error = future.exception()
+        except Exception:
+            self.logger.exception(
+                "Feishu SDK callback result unavailable message_id={}",
+                message_id,
+            )
+            return
+        if error is not None:
+            self.logger.error(
+                "Feishu SDK callback failed message_id={} error={}",
+                message_id,
+                error,
+            )
+            return
+        self.logger.debug("Feishu SDK callback completed message_id={}", message_id)
 
     async def _on_message(self, data: P2ImMessageReceiveV1) -> None:
         """Handle incoming message from Feishu."""
