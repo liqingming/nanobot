@@ -6,14 +6,16 @@ from nanobot.agent.runner import AgentRunResult
 from nanobot.agent.subagent import SubagentManager, SubagentStatus
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import GenerationSettings, LLMProvider
+from nanobot.utils.llm_runtime import LLMRuntime
 
 
 async def test_child_spec_has_window_and_block_limit(tmp_path):
     provider = MagicMock(spec=LLMProvider)
+    provider.generation = GenerationSettings(max_tokens=100)
     manager = SubagentManager(
-        provider, tmp_path, MessageBus(), 16000, model="test",
-        context_window_tokens=8000, context_block_limit=3000,
+        workspace=tmp_path, bus=MessageBus(), max_tool_result_chars=16000,
+        context_block_limit=3000,
     )
     manager._build_tools = lambda **kwargs: MagicMock()
     manager._build_subagent_prompt = lambda **kwargs: "test"
@@ -22,20 +24,33 @@ async def test_child_spec_has_window_and_block_limit(tmp_path):
         "id", "task", "label",
         {"channel": "cli", "chat_id": "topic", "session_key": "cli:topic"},
         SubagentStatus(task_id="id", label="label", task_description="task", started_at=0),
+        LLMRuntime.capture(provider, "test", context_window_tokens=8000),
     )
     spec = manager.runner.run.await_args.args[0]
     assert spec.context_window_tokens == 8000
     assert spec.context_block_limit == 3000
 
 
-def test_default_and_model_switch_keep_a_budget(tmp_path):
+async def test_child_budget_is_bound_to_each_runtime(tmp_path):
     provider = MagicMock(spec=LLMProvider)
-    manager = SubagentManager(provider, tmp_path, MessageBus(), 16000, model="test")
-    assert manager.context_window_tokens == AgentDefaults().context_window_tokens
-    manager.set_provider(provider, "small", context_window_tokens=6000)
-    assert manager.context_window_tokens == 6000
-    manager.set_provider(provider, "next")
-    assert manager.context_window_tokens == 6000
+    provider.generation = GenerationSettings()
+    manager = SubagentManager(workspace=tmp_path, bus=MessageBus(), max_tool_result_chars=16000)
+    manager._build_tools = lambda **kwargs: MagicMock()
+    manager._build_subagent_prompt = lambda **kwargs: "test"
+    manager.runner.run = AsyncMock(return_value=AgentRunResult(final_content="ok", messages=[]))
+    specs = []
+    for model, window in [("default", AgentDefaults().context_window_tokens), ("small", 6000)]:
+        runtime = LLMRuntime.capture(provider, model, context_window_tokens=window)
+        await manager._run_subagent(
+            model, "task", "label", {"channel": "cli", "chat_id": "topic"},
+            SubagentStatus(task_id=model, label="label", task_description="task", started_at=0),
+            runtime,
+        )
+        spec = manager.runner.run.await_args.args[0]
+        assert spec.runtime is runtime
+        assert spec.context_window_tokens == window
+        specs.append(spec)
+    assert specs[0].context_window_tokens == AgentDefaults().context_window_tokens
 
 
 async def test_child_hard_budget_actually_shapes_large_tool_result(tmp_path):
@@ -43,15 +58,16 @@ async def test_child_hard_budget_actually_shapes_large_tool_result(tmp_path):
     from nanobot.utils.helpers import estimate_prompt_tokens_chain
 
     provider = MagicMock(spec=LLMProvider)
-    provider.chat_with_retry = AsyncMock(side_effect=[
+    provider.generation = GenerationSettings(max_tokens=100)
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
         LLMResponse(content=None, tool_calls=[
             ToolCallRequest(id="read", name="read_file", arguments={"path": "receipt"}),
         ]),
         LLMResponse(content="done"),
     ])
     manager = SubagentManager(
-        provider, tmp_path, MessageBus(), 16000, model="test",
-        context_window_tokens=8000, context_block_limit=800,
+        workspace=tmp_path, bus=MessageBus(), max_tool_result_chars=16000,
+        context_block_limit=800,
     )
     manager.context_strategy = "legacy"  # 旧策略回退仍可整形最新大回执。
     tools = MagicMock()
@@ -63,8 +79,9 @@ async def test_child_hard_budget_actually_shapes_large_tool_result(tmp_path):
         "id", "task", "label",
         {"channel": "cli", "chat_id": "topic", "session_key": "cli:topic"},
         SubagentStatus(task_id="id", label="label", task_description="task", started_at=0),
+        LLMRuntime.capture(provider, "test", context_window_tokens=8000),
     )
-    assert provider.chat_with_retry.await_count == 2
-    second = provider.chat_with_retry.await_args.kwargs["messages"]
+    assert provider.chat_stream_with_retry.await_count == 2
+    second = provider.chat_stream_with_retry.await_args.kwargs["messages"]
     assert estimate_prompt_tokens_chain(provider, "test", second, [])[0] <= 800
     assert all("large proof " * 1000 != msg.get("content") for msg in second)

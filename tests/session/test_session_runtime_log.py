@@ -12,7 +12,7 @@ def test_session_runtime_log_path_is_topic_scoped(tmp_path: Path) -> None:
 
     path = manager.get_session_runtime_log_path("cli:topic_20260707")
 
-    assert path == tmp_path / "sessions" / "cli_topic_20260707" / "runtime.log"
+    assert path == manager.sessions_dir / "cli_topic_20260707" / "runtime.log"
     assert path.parent.exists()
 
 

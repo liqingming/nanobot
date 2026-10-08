@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nanobot.agent.context import TranscriptInput
 from nanobot.agent.context_governance import ContextGovernanceConfig, ContextGovernor
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.fork.agent.native_context import NativeContextPreparation, uses_native_context
@@ -177,14 +178,16 @@ async def test_native_compaction_keeps_one_thread_and_all_receipts(tmp_path, mod
         session_key="topic", turn_id="turn", workspace=tmp_path, data_dir=tmp_path,
     )
     diagnostics = []
-    original_chat = provider.chat_with_retry
+    responses = []
+    original_chat = provider.chat_stream_with_retry
 
     async def chat(**kwargs):
         response = await original_chat(**kwargs)
         diagnostics.append(deepcopy(response.provider_diagnostics))
+        responses.append(response)
         return response
 
-    provider.chat_with_retry = chat
+    provider.chat_stream_with_retry = chat
     try:
         result = await AgentRunner(provider).run(spec)
         assert result.final_content == "done"
@@ -200,10 +203,48 @@ async def test_native_compaction_keeps_one_thread_and_all_receipts(tmp_path, mod
         assert all(receipt in json.dumps(m) for m in receipts)
         assert diagnostics[-1]["native_compactions_completed"] == 2
         assert not any(d.get("context_rebased") for d in diagnostics)
-        assert result.usage["context_input_estimated"] == (mode == "no_usage")
+        assert responses[-1].provider_diagnostics["context_input_estimated"] == (mode == "no_usage")
         if mode != "no_usage":
-            assert result.usage["context_input_tokens"] == 1234
+            assert result.usage.context_tokens == 1234
         assert provider._turns == provider._turn_locks == {}
+    finally:
+        await provider.aclose()
+
+
+async def test_current_request_is_pinned_per_native_thread_across_compactions(tmp_path):
+    provider, capture = _provider(tmp_path)
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="read-only evidence")
+    requests = [
+        "Does the knowledge base contain the nested scrolling pattern?",
+        "Add the complete pattern to Compose; do not commit.",
+    ]
+    try:
+        for index, request in enumerate(requests):
+            result = await AgentRunner(provider).run(AgentRunSpec(
+                initial_messages=[
+                    {"role": "user", "content": "Update three skills"},
+                    {"role": "assistant", "content": "548 tests passed; files synchronized."},
+                    {"role": "user", "content": request},
+                ],
+                tools=tools, model="test", max_iterations=10, max_tool_result_chars=16000,
+                context_window_tokens=100000, context_block_limit=80000,
+                session_key="topic", turn_id=str(index), workspace=tmp_path, data_dir=tmp_path,
+            ))
+            assert result.stop_reason == "completed"
+        rpc = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        starts = [m["params"] for m in rpc if m.get("method") == "thread/start"]
+        assert len(starts) == 2  # One thread per outer turn, never per compaction.
+        for start, request in zip(starts, requests, strict=True):
+            instructions = start["baseInstructions"]
+            assert json.dumps({"role": "user", "text": request}) in instructions
+            assert "548 tests passed" not in instructions
+        assert requests[0] not in starts[1]["baseInstructions"]
+        assert requests[1] not in starts[0]["baseInstructions"]
+        assert sum(m.get("method") == "turn/start" for m in rpc) == 2
+        assert not any(m.get("method") == "turn/steer" for m in rpc)
+        assert tools.execute.await_count == 14
     finally:
         await provider.aclose()
 
@@ -254,7 +295,7 @@ async def test_initial_oversize_fails_before_launch(tmp_path):
 async def test_native_overflow_does_not_trigger_runner_local_rebuild():
     provider = MagicMock(spec=LLMProvider)
     provider.supports_native_context_compaction = True
-    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
         content="context length exceeded", finish_reason="error",
         error_code="context_length_exceeded", error_should_retry=False,
     ))
@@ -265,7 +306,7 @@ async def test_native_overflow_does_not_trigger_runner_local_rebuild():
         tools=tools, model="test", max_iterations=2, max_tool_result_chars=16000,
         context_window_tokens=100000,
     ))
-    assert provider.chat_with_retry.await_count == 1
+    assert provider.chat_stream_with_retry.await_count == 1
 
 
 def test_large_new_receipt_is_saved_before_compaction(tmp_path):
@@ -545,7 +586,7 @@ async def test_receipt_after_history_exceeds_start_budget_keeps_existing_thread(
     ))
     provider, capture = _provider(tmp_path, "normal")
     context = {"session_key": "topic", "turn_id": "large-receipt", "native_context": {
-        "context_window_tokens": 10000, "context_block_limit": 1000,
+        "context_window_tokens": 10000, "context_block_limit": 2500,
     }}
     messages = [{"role": "user", "content": "h" * 200}]
     try:
@@ -557,13 +598,13 @@ async def test_receipt_after_history_exceeds_start_budget_keeps_existing_thread(
             assert call.id == f"call-{n}"
             messages.extend([
                 {"role": "assistant", "tool_calls": [call.to_openai_tool_call()]},
-                {"role": "tool", "name": call.name, "tool_call_id": call.id, "content": "r" * 150},
+                {"role": "tool", "name": call.name, "tool_call_id": call.id, "content": "r" * 400},
             ])
             if n == 6:
                 messages.append({"role": "user", "content": "WORKER_COMPLETED",
                                  "injected_event": "subagent_result"})
                 with pytest.raises(ValueError, match="exceeds local budget"):
-                    codex_native_context.check_native_payload(provider, "test", messages, [], 1000)
+                    codex_native_context.check_native_payload(provider, "test", messages, [], 2500)
             response = await provider.chat(messages=messages, request_context=context)
             if n == 6:
                 assert response.finish_reason != "error", response.content
@@ -578,5 +619,78 @@ async def test_receipt_after_history_exceeds_start_budget_keeps_existing_thread(
             [{"type": "text", "text": "WORKER_COMPLETED"}],
         ]
         assert [m["id"] for m in rpc if "result" in m] == list(range(101, 108))
+    finally:
+        await provider.aclose()
+
+
+async def test_pinned_request_is_included_in_initial_budget(tmp_path, monkeypatch):
+    from nanobot.fork.providers import codex_native_context
+
+    monkeypatch.setattr(codex_native_context, "estimate_prompt_tokens_chain", lambda p, m, rows, t: (
+        sum(len(row.get("content") or "") for row in rows), "test",
+    ))
+    provider, capture = _provider(tmp_path)
+    try:
+        response = await provider.chat(
+            messages=[{"role": "user", "content": "request " * 70}], model="test",
+            request_context={"session_key": "topic", "turn_id": "pin-budget", "native_context": {
+                "context_window_tokens": 10000, "context_block_limit": 1000,
+            }},
+        )
+        assert response.finish_reason == "error"
+        assert "exceeds local budget" in response.content
+        assert not response.error_should_retry
+        assert not capture.exists()
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("strategy", ["legacy", "transactional"])
+async def test_runner_native_large_history_is_bounded_once_and_prefix_stays_stable(tmp_path, strategy):
+    from tests.fork.test_native_read_visibility import _history
+
+    provider, capture = _provider(tmp_path)
+    # Use the same deterministic accounting for the preparation and provider gate.
+    provider.estimate_prompt_tokens = lambda messages, tools, model: (
+        sum(len(str(m.get("content", ""))) // 4 + 8 for m in messages), "test",
+    )
+    initial = _history(140, 8000)
+    original = deepcopy(initial)
+    assert provider.estimate_prompt_tokens(initial, [], "test")[0] > 258400
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="needed fresh evidence " * 100)
+    consolidate = AsyncMock(side_effect=AssertionError("native history belongs to provider"))
+    requests = []
+    original_chat = provider.chat_stream_with_retry
+
+    async def chat(**kwargs):
+        requests.append(deepcopy(kwargs["messages"]))
+        return await original_chat(**kwargs)
+
+    provider.chat_stream_with_retry = chat
+    try:
+        result = await AgentRunner(provider).run(AgentRunSpec(
+            initial_messages=None,
+            transcript_input=TranscriptInput(history=initial[1:-1], current_message="continue"),
+            transcript_builder=lambda inputs: [initial[0], *inputs.history,
+                                               {"role": "user", "content": inputs.current_message}],
+            consolidate_history=consolidate,
+            tools=tools, model="test", max_iterations=10, max_tool_result_chars=16000,
+            context_window_tokens=272000, max_tokens=128000, context_strategy=strategy,
+            session_key="topic", turn_id="turn", workspace=tmp_path, data_dir=tmp_path,
+        ))
+        assert result.final_content == "done"
+        assert len(requests) == 8
+        assert len(requests[0]) == len(initial)
+        assert provider.estimate_prompt_tokens(requests[0], [], "test")[0] < 258400
+        for previous, current in zip(requests, requests[1:]):
+            assert current[:len(previous)] == previous
+        assert initial == original
+        assert result.messages[:len(original)] == original
+        consolidate.assert_not_called()
+        rpc = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        assert sum(m.get("method") == "thread/start" for m in rpc) == 1
+        assert tools.execute.await_count == 7
     finally:
         await provider.aclose()

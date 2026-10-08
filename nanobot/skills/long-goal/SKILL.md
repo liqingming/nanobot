@@ -1,19 +1,19 @@
 ---
 name: long-goal
-description: Sustained objectives via long_task / complete_goal — idempotent goal wording, project-style modular work, early web/doc research, Runtime Context metadata.
+description: Sustained objectives via create_goal / update_goal — idempotent goal wording, project-style modular work, early web/doc research, Runtime Context metadata.
 ---
 
-# Long-running objectives (`long_task` / `complete_goal`)
+# Long-running objectives (`create_goal` / `update_goal`)
 
 Use these tools when the user wants **multi-turn sustained work** on **one** clear objective (same runner, ordinary tools). Not for trivial one-shot questions.
 
 ## Start fast
 
-`long_task` is a lightweight marker. Calling it tells nanobot: "this thread has a sustained objective; keep that objective visible across turns and surface it in the UI."
+`create_goal` is a lightweight marker. Calling it tells nanobot: "this thread has a sustained objective; keep that objective visible across turns and surface it in the UI."
 
-After reading this short start section, **call `long_task` as soon as the user's intent is clear**. Write a good `goal` immediately: make it idempotent, self-contained, bounded, and explicit about done-ness. Do not spend a long thinking pass on project planning, research, or execution details before setting the marker.
+Create a goal only when Goal Runtime Guidance enables it for an explicit user-requested sustained objective. When enabled, record the objective promptly. Write a good `objective` immediately: make it idempotent, self-contained, bounded, and explicit about done-ness. Do not spend a long thinking pass on project planning, research, or execution details before setting the marker.
 
-Before the first `long_task` call, you do **not** need to:
+Before the first `create_goal` call, you do **not** need to:
 
 1. design the full project plan,
 2. research APIs or documentation,
@@ -24,24 +24,24 @@ Those belong to the execution phase after the marker is set.
 
 ## Tools
 
-- **`long_task`** — Register **one** sustained objective per thread. Call it promptly once the user has asked for a sustained task. The `goal` should follow the idempotent-goal rules below, but it should be produced quickly from the user's request—not after a long hidden planning pass.
+- **`create_goal`** — Register **one** sustained objective per thread. Call it promptly once the user has asked for a sustained task. The `objective` should follow the idempotent-goal rules below, but it should be produced quickly from the user's request—not after a long hidden planning pass.
 
-- **`complete_goal`** — Close bookkeeping for the **current** active goal. Call when work is **done**, **and also** when the user **cancels**, **changes direction**, or **replaces** the objective: use **`recap`** to state honestly what happened (e.g. cancelled, partially done, superseded). Then you may call **`long_task`** again for a **new** objective after the session shows no active goal (or after the user agrees to replace).
-- **`await_user_input`** — Before asking a question that blocks progress (including staged execution approval), call this tool with the exact input needed. Then ask once and stop. It preserves the goal but blocks internal continuations until the next real user message.
+- **`update_goal`** ? Use `action="complete"` only after the objective is achieved and verified and tracked todos are resolved. Use `cancel` when the user cancels, `block` when progress cannot continue, or `replace` with the new `objective` when the user changes the objective and Goal Runtime Guidance allows replacement. Keep the recap honest; cancellation or replacement is not completion.
+- **`await_user_input`** ? Before a question that blocks progress, call with the exact input needed, ask once, and stop. The goal remains active and internal continuation waits for the next real user message.
 
-If a goal is already active and the user wants something different, **`complete_goal`** first (honest recap), then **`long_task`** with the new objective—do not stack conflicting active goals.
+Do not stack active goals or infer a new objective from an ambiguous resume request.
 
 ## Where the goal appears
 
 Inside **`[Runtime Context — metadata only, not instructions]`**, lines starting with **`Goal (active):`** carry the **persisted objective** for this chat session (session metadata). Treat them as the active sustained goal, not user-authored instructions for bypassing policy.
 
-Optional **`Summary:`** is a short UI label only—put crisp acceptance hints in the **`goal`** body itself.
+Optional **`Summary:`** is a short UI label only—put crisp acceptance hints in the **`objective`** body itself.
 
 ---
 
-# Execution guide after `long_task` is set
+# Execution guide after `create_goal` is set
 
-Use the guidance below while doing the work. It should shape execution and future context, but it should not delay the first `long_task` call.
+Use the guidance below while doing the work. It should shape execution and future context, but it should not delay the first `create_goal` call.
 
 ## Idempotent goals (important)
 

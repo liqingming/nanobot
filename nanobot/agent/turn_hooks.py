@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -15,6 +14,7 @@ from nanobot.agent.hook import (
     AgentTurnHookFactory,
     CompositeHook,
 )
+from nanobot.events import NO_EVENTS, EventSink
 from nanobot.fork.agent.progress_hook import ForkAgentProgressHook as AgentProgressHook
 
 
@@ -22,9 +22,8 @@ from nanobot.fork.agent.progress_hook import ForkAgentProgressHook as AgentProgr
 class AgentTurnHookSpec:
     """Inputs needed to build the hook chain for one agent turn."""
 
-    on_progress: Callable[..., Awaitable[None]] | None = None
-    on_stream: Callable[[str], Awaitable[None]] | None = None
-    on_stream_end: Callable[..., Awaitable[None]] | None = None
+    events: EventSink = NO_EVENTS
+    streaming: bool = False
     channel: str = "cli"
     chat_id: str = "direct"
     message_id: str | None = None
@@ -41,18 +40,14 @@ class AgentTurnHookSpec:
     turn_hooks: list[AgentHook] = field(default_factory=list)
     ephemeral: bool = False
     run_extra_hooks_for_ephemeral: bool = False
+    attributes: dict[str, Any] | None = None
 
 
 def build_agent_turn_hook(spec: AgentTurnHookSpec) -> AgentHook:
     """Build the hook chain used by ``AgentRunner`` for one turn."""
     progress_hook = AgentProgressHook(
-        on_progress=spec.on_progress,
-        on_stream=spec.on_stream,
-        on_stream_end=spec.on_stream_end,
-        channel=spec.channel,
-        chat_id=spec.chat_id,
-        message_id=spec.message_id,
-        metadata=spec.metadata,
+        events=spec.events,
+        streaming=spec.streaming,
         session_key=spec.session_key,
         tool_hint_max_length=spec.tool_hint_max_length,
         tool_hint_formatter=spec.tool_hint_formatter,
@@ -63,13 +58,14 @@ def build_agent_turn_hook(spec: AgentTurnHookSpec) -> AgentHook:
         return progress_hook
 
     turn_context = AgentTurnHookContext(
-        on_progress=spec.on_progress,
+        events=spec.events,
         workspace=spec.workspace,
         channel=spec.channel,
         chat_id=spec.chat_id,
         message_id=spec.message_id,
         session_key=spec.session_key,
         metadata=dict(spec.metadata or {}),
+        attributes=dict(spec.attributes or {}),
         ephemeral=spec.ephemeral,
     )
     hook_chain: list[AgentHook] = [progress_hook]

@@ -6,13 +6,22 @@ import asyncio
 import os
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nanobot.agent.context import TranscriptInput
 from nanobot.bus.events import InboundMessage
-from nanobot.providers.base import LLMResponse
+from nanobot.providers.base import GenerationSettings, LLMResponse, LLMUsage
+
+_TEST_WORKSPACE = Path.cwd()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_loop_workspace(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_TEST_WORKSPACE", tmp_path / "workspace")
 
 
 def _make_loop():
@@ -23,13 +32,15 @@ def _make_loop():
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    workspace = MagicMock()
-    workspace.__truediv__ = MagicMock(return_value=MagicMock())
+    workspace = _TEST_WORKSPACE
+    provider.generation = GenerationSettings()
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager"):
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.close = AsyncMock()
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
+    loop._persist_user_message_early = MagicMock(return_value=False)
     return loop, bus
 
 
@@ -236,17 +247,27 @@ class TestRestartCommand:
         loop, _bus = _make_loop()
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}] * 3
+        session.metadata = {
+            "_last_usage": LLMUsage.reported(input_tokens=0, output_tokens=0).to_dict()
+        }
         loop.sessions.get_or_create.return_value = session
         loop._start_time = time.time() - 125
-        loop._last_usage = {"prompt_tokens": 0, "completion_tokens": 0}
         loop.consolidator.estimate_session_prompt_tokens = MagicMock(
             return_value=(20500, "tiktoken")
         )
         loop.subagents.get_running_count_by_session.return_value = 0
 
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/status")
+        runtime = loop.llm_runtime()
+        loop.set_runtime_model("replacement-model")
+        loop.set_runtime_context_window(10)
+        loop.provider.generation = SimpleNamespace(
+            temperature=1.0,
+            max_tokens=1,
+            reasoning_effort=None,
+        )
 
-        response = await loop._process_message(msg)
+        response = await loop._process_message(msg, runtime=runtime)
 
         assert response is not None
         assert "Model: test-model" in response.content
@@ -256,6 +277,10 @@ class TestRestartCommand:
         assert "Uptime: 2m 5s" in response.content
         assert "Tasks: 0 active" in response.content
         assert response.metadata == {"render_as": "text"}
+        loop.consolidator.estimate_session_prompt_tokens.assert_called_once_with(
+            session,
+            runtime=runtime,
+        )
 
     @pytest.mark.asyncio
     async def test_status_counts_running_dispatch_and_subagent_tasks(self):
@@ -273,7 +298,7 @@ class TestRestartCommand:
         finished_task.done.return_value = True
 
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/status")
-        loop._active_tasks[msg.session_key] = [running_task, finished_task]
+        loop._active_tasks[msg.session_key] = {running_task, finished_task}
         loop.subagents.get_running_count_by_session.return_value = 2
 
         response = await loop._process_message(msg)
@@ -292,29 +317,33 @@ class TestRestartCommand:
             "nanobot.agent.runner.estimate_message_tokens",
             lambda _message: 7,
         )
-        loop.provider.chat_with_retry = AsyncMock(side_effect=[
-            LLMResponse(content="first", usage={"prompt_tokens": 9, "completion_tokens": 4}),
-            LLMResponse(content="second", usage={}),
+        loop.provider.chat_stream_with_retry = AsyncMock(side_effect=[
+            LLMResponse(content="first", usage=LLMUsage.reported(input_tokens=9, output_tokens=4)),
+            LLMResponse(content="second", usage=None),
         ])
 
-        await loop._run_agent_loop([])
-        # runner seeds usage with {prompt:0, completion:0}; provider keys merge on top.
-        # upstream no longer auto-fills cache_* defaults.
-        assert loop._last_usage == {"prompt_tokens": 9, "completion_tokens": 4}
+        first = await loop._run_agent_loop(
+            TranscriptInput(history=[], current_message=None),
+            runtime=loop.llm_runtime(),
+        )
+        assert first.usage == LLMUsage.reported(input_tokens=9, output_tokens=4)
 
-        await loop._run_agent_loop([])
-        assert loop._last_usage["prompt_tokens"] == 123
-        assert loop._last_usage["completion_tokens"] == 7
-        assert loop._last_usage["estimated_tokens"] == 130
+        second = await loop._run_agent_loop(
+            TranscriptInput(history=[], current_message=None),
+            runtime=loop.llm_runtime(),
+        )
+        assert second.usage == LLMUsage.estimated(input_tokens=123, output_tokens=7)
 
 
     @pytest.mark.asyncio
-    async def test_status_falls_back_to_last_usage_when_context_estimate_missing(self):
+    async def test_status_falls_back_to_session_usage_when_context_estimate_missing(self):
         loop, _bus = _make_loop()
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}]
+        session.metadata = {
+            "_last_usage": LLMUsage.reported(input_tokens=1200, output_tokens=34).to_dict()
+        }
         loop.sessions.get_or_create.return_value = session
-        loop._last_usage = {"prompt_tokens": 1200, "completion_tokens": 34}
         loop.consolidator.estimate_session_prompt_tokens = MagicMock(
             return_value=(0, "none")
         )

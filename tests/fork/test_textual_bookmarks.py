@@ -308,6 +308,9 @@ async def test_bookmark_keyboard_bindings_work_with_focused_input(tmp_path) -> N
         tui.load_session_history(MESSAGES)
         output = tui._app.query_one("#output", _OutputLog)
 
+        await pilot.pause()
+        first = output.message_blocks()[0]
+        output.scroll_to(y=output.message_start_line(first["id"]), animate=False, immediate=True, force=True)
         await pilot.press("ctrl+b")
         await pilot.pause()
         assert len(tui._bookmarks) == 1
@@ -318,6 +321,7 @@ async def test_bookmark_keyboard_bindings_work_with_focused_input(tmp_path) -> N
         assert tui._popup_items
 
         await pilot.press("escape")
+        output.scroll_end(animate=False, immediate=True, force=True)
         await pilot.press("f6")
         await pilot.pause()
         line = output.bookmark_line(bookmark)
@@ -373,6 +377,7 @@ async def test_bookmark_marker_uses_padding_without_changing_cjk_content(tmp_pat
     tui = _make_tui(tmp_path)
     async with tui._app.run_test(size=(48, 18)) as pilot:
         tui.load_session_history([message])
+        await pilot.pause()
         output = tui._app.query_one("#output", _OutputLog)
         block = output.message_blocks()[0]
         target_line = output.message_start_line(block["id"])
@@ -393,6 +398,8 @@ async def test_bookmark_marker_uses_padding_without_changing_cjk_content(tmp_pat
         assert output.bookmark_line(bookmark) == target_line
         await pilot.pause()
 
+        output.scroll_to(y=target_line, animate=False, immediate=True, force=True)
+        await pilot.pause()
         screen_line = target_line - int(output.scroll_offset.y)
         full_width = output.size.width
         rendered = output.render_lines(Region(0, screen_line, full_width, 1))[0]
@@ -485,12 +492,14 @@ async def test_live_bookmark_restores_from_persisted_transcript_id(tmp_path) -> 
         }
     ]
     restored = _make_tui(tmp_path)
-    async with restored._app.run_test():
+    async with restored._app.run_test() as pilot:
         restored.load_session_history(persisted)
+        await pilot.pause()
         output = restored._app.query_one("#output", _OutputLog)
         restored_bookmark = restored._bookmarks[bookmark["bookmark_id"]]
         restored_line = output.bookmark_line(restored_bookmark)
         assert restored_line is not None
+        output.scroll_end(animate=False, immediate=True, force=True)
         assert restored.jump_to_previous_bookmark()
         assert output._bookmark_highlight == (restored_line, restored_line)
         screen_line = restored_line - int(output.scroll_offset.y)

@@ -28,7 +28,7 @@ def test_all_consumers_share_budget(limit, expected):
         context_block_limit=limit,
     )
     assert ContextGovernor.input_budget(config) == expected
-    assert consolidator._input_token_budget == expected
+    assert consolidator._legacy__input_token_budget == expected
     assert native_input_budget(provider, {"native_context": {
         "context_window_tokens": 10000, "context_block_limit": limit,
     }}) == expected
@@ -122,10 +122,16 @@ async def test_zero_budget_does_not_archive_history():
 
 @pytest.mark.parametrize("limit, expected", [(None, 6976), (2000, 2000), (20000, 6976)])
 def test_history_replay_uses_same_budget(limit, expected):
-    from nanobot.agent.loop import AgentLoop
 
-    loop = object.__new__(AgentLoop)
-    loop.provider = SimpleNamespace(generation=GenerationSettings(max_tokens=2000))
-    loop.context_window_tokens = 10000
-    loop.context_block_limit = limit
-    assert loop._replay_token_budget() == expected
+    from nanobot.utils.llm_runtime import LLMRuntime
+    provider = MagicMock(spec=LLMProvider)
+    provider.generation = GenerationSettings(max_tokens=2000)
+    provider.get_default_model.return_value = "test"
+    runtime = LLMRuntime.capture(provider, "test", context_window_tokens=10000)
+    config = ContextGovernanceConfig(
+        provider=runtime.provider, model=runtime.model, tools=None, workspace=None,
+        session_key=None, max_tool_result_chars=16000,
+        context_window_tokens=runtime.context_window_tokens,
+        max_tokens=runtime.generation.max_tokens, context_block_limit=limit,
+    )
+    assert ContextGovernor.input_budget(config) == expected

@@ -358,7 +358,8 @@ async def test_native_summary_refusal_is_diagnosed_without_executing_provider(se
 
 
 async def test_candidate_and_raw_archive_failures_are_distinguishable(setup, monkeypatch):
-    consolidator, sessions, session, _ = setup
+    consolidator, sessions, session, provider = setup
+    provider.chat_with_retry.return_value.content = "<continuation>Task remains pending.</continuation><memory-candidates>Keep the user restriction.</memory-candidates>"
     before = SummarySnapshot.capture(session)
     persisted = sessions._get_session_path(session.key).read_bytes()
     monkeypatch.setattr(consolidator.store, "append_history", MagicMock(side_effect=OSError("disk")))

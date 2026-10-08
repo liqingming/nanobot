@@ -113,7 +113,7 @@ async def test_consolidation_starts_at_preventive_high_water_mark(tmp_path, monk
 
 def test_ratio_propagated_from_config_schema() -> None:
     defaults = AgentDefaults()
-    assert defaults.consolidation_ratio == 0.5
+    assert defaults.consolidation_ratio == 0.25
     assert defaults.consolidation_trigger_ratio == 0.7
 
     defaults = AgentDefaults.model_validate({

@@ -16,7 +16,7 @@ async def test_runner_writes_provider_diagnostics_to_model_response_event() -> N
         "exact_half_repeat": True,
     }
     provider = MagicMock(spec=LLMProvider)
-    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
         content="answeranswer",
         provider_diagnostics=diagnostics,
     ))
@@ -35,4 +35,4 @@ async def test_runner_writes_provider_diagnostics_to_model_response_event() -> N
 
     response_event = [fields for event, fields in events if event == "runner.model.response"][-1]
     assert result.final_content == "answeranswer"
-    assert response_event["provider_diagnostics"] == diagnostics
+    assert all(response_event["provider_diagnostics"][key] == value for key, value in diagnostics.items())

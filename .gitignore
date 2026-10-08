@@ -16,6 +16,8 @@ webui/node_modules/
 webui/dist/
 webui/coverage/
 webui/.vite/
+tui/node_modules/
+tui/dist/
 *.tsbuildinfo
 
 # Python bytecode & caches
@@ -113,3 +115,8 @@ nanobot/fork/cmdSkins/*.[wW][eE][bB][pP]
 nanobot/fork/cmdSkins/*.[bB][mM][pP]
 nanobot/fork/cmdSkins/*.[gG][iI][fF]
 %SystemDrive%
+webui/.verify-*
+.playwright-cli/
+MagicMock
+docs
+.nanobot

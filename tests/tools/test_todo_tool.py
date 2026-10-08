@@ -85,6 +85,68 @@ async def test_todo_overwrite_replaces_full_list(tmp_path) -> None:
     assert session.todos[0]["content"] == "New only"
 
 
+@pytest.mark.asyncio
+async def test_todo_rejects_unrelated_plan_replay_within_same_turn(tmp_path) -> None:
+    sessions = SessionManager(tmp_path)
+    tool = TodoWriteTool(sessions=sessions)
+    tool.set_context(RequestContext(
+        channel="cli",
+        chat_id="test",
+        turn_id="turn-final-exe",
+        original_user_text="build the final exe",
+    ))
+    current = [
+        {"content": "Build release", "status": "in_progress"},
+        {"content": "Run regressions", "status": "pending"},
+        {"content": "Verify final exe", "status": "pending"},
+    ]
+    stale = [
+        {"content": "Implement coroutine support", "status": "completed"},
+        {"content": "Run regressions", "status": "completed"},
+        {"content": "Document coroutine boundaries", "status": "completed"},
+    ]
+
+    assert (await tool.execute(items=current)).startswith("Updated todo list")
+    result = await tool.execute(items=stale)
+
+    assert result.startswith("Error: refusing to replace")
+    assert "build the final exe" in result
+    session = sessions.get_or_create("cli:test")
+    assert [
+        (item["content"], item["status"])
+        for item in session.todos
+    ] == [
+        ("Build release", "in_progress"),
+        ("Run regressions", "pending"),
+        ("Verify final exe", "pending"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_todo_allows_new_turn_to_replace_previous_plan(tmp_path) -> None:
+    sessions = SessionManager(tmp_path)
+    tool = TodoWriteTool(sessions=sessions)
+    tool.set_context(RequestContext(
+        channel="cli",
+        chat_id="test",
+        turn_id="turn-one",
+    ))
+    await tool.execute(items=[{"content": "Old task", "status": "in_progress"}])
+
+    tool.set_context(RequestContext(
+        channel="cli",
+        chat_id="test",
+        turn_id="turn-two",
+    ))
+    result = await tool.execute(items=[{"content": "New task", "status": "in_progress"}])
+
+    assert result.startswith("Updated todo list")
+    session = sessions.get_or_create("cli:test")
+    assert [(item["content"], item["status"]) for item in session.todos] == [
+        ("New task", "in_progress"),
+    ]
+
+
 def test_todos_persist_across_session_reload(tmp_path) -> None:
     sessions = SessionManager(tmp_path)
     session = sessions.get_or_create("cli:test")

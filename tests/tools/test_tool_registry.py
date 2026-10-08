@@ -34,7 +34,6 @@ class _FakeTool(Tool):
     async def execute(self, **kwargs: Any) -> Any:
         return kwargs
 
-
 def _tool_names(definitions: list[dict[str, Any]]) -> list[str]:
     names: list[str] = []
     for definition in definitions:

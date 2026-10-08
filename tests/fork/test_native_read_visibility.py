@@ -17,6 +17,7 @@ from nanobot.utils.helpers import estimate_prompt_tokens_chain
 def _config(tmp_path, boundary, *, budget=100000):
     # 离线计数器：测试预算路径而非特定 tokenizer 的字节压缩比。
     provider = SimpleNamespace(
+        supports_native_context_compaction=True,
         estimate_prompt_tokens=lambda messages, tools, model: (
             sum(len(str(m.get("content", ""))) // 4 + 8 for m in messages), "test",
         ),
@@ -46,10 +47,11 @@ def _history(count, size):
     return messages
 
 
-def test_first_projection_keeps_more_than_64_old_bodies_and_stable_prefix(tmp_path):
+@pytest.mark.parametrize("strategy", ["legacy", "transactional"])
+def test_first_projection_keeps_more_than_64_old_bodies_and_stable_prefix(tmp_path, strategy):
     messages = _history(70, 100)
     original = deepcopy(messages)
-    config = _config(tmp_path, len(messages))
+    config = replace(_config(tmp_path, len(messages)), context_strategy=strategy)
     governor = ContextGovernor()
     # 证明本例真正覆盖原 64 条裁剪路径，而不是边界配置恰巧绕开它。
     assert len(governor.trim_historical_tool_exchanges(config, messages)) < len(messages)
@@ -69,10 +71,11 @@ def test_first_projection_keeps_more_than_64_old_bodies_and_stable_prefix(tmp_pa
     assert messages[:-1] == original
 
 
-def test_first_projection_still_applies_soft_budget_to_old_evidence(tmp_path):
+@pytest.mark.parametrize("strategy", ["legacy", "transactional"])
+def test_first_projection_still_applies_soft_budget_to_old_evidence(tmp_path, strategy):
     messages = _history(70, 600)
     original = deepcopy(messages)
-    config = _config(tmp_path, len(messages))
+    config = replace(_config(tmp_path, len(messages)), context_strategy=strategy)
     compacted = set()
     projected = NativeContextPreparation(ContextGovernor()).prepare_for_model(
         config, messages, compacted,
@@ -83,10 +86,11 @@ def test_first_projection_still_applies_soft_budget_to_old_evidence(tmp_path):
     assert messages == original
 
 
-def test_first_projection_still_compacts_to_hard_budget(tmp_path):
+@pytest.mark.parametrize("strategy", ["legacy", "transactional"])
+def test_first_projection_still_compacts_to_hard_budget(tmp_path, strategy):
     messages = _history(10, 1000)  # 总正文低于软阈值，只可能由硬预算触发。
     original = deepcopy(messages)
-    config = _config(tmp_path, len(messages), budget=1200)
+    config = replace(_config(tmp_path, len(messages), budget=1200), context_strategy=strategy)
     governor = ContextGovernor()
     compacted = set()
     assert estimate_prompt_tokens_chain(config.provider, config.model, messages, [])[0] > 1200

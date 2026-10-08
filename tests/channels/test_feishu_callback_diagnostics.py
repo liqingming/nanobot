@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.feishu import FeishuChannel, FeishuConfig
+from nanobot.channels.feishu.config import FeishuConfig
+from nanobot.channels.feishu.runtime import FeishuChannel
 
 
 def _make_channel() -> FeishuChannel:
@@ -41,7 +42,7 @@ class TestFeishuCallbackDiagnostics:
         completed = Future()
 
         with patch(
-            "nanobot.channels.feishu.asyncio.run_coroutine_threadsafe",
+            "nanobot.channels.feishu.runtime.asyncio.run_coroutine_threadsafe",
             return_value=completed,
         ) as schedule:
             channel._on_message_sync(_event())
@@ -61,7 +62,9 @@ class TestFeishuCallbackDiagnostics:
         channel._loop = MagicMock()
         channel._loop.is_running.return_value = False
 
-        with patch("nanobot.channels.feishu.asyncio.run_coroutine_threadsafe") as schedule:
+        with patch(
+            "nanobot.channels.feishu.runtime.asyncio.run_coroutine_threadsafe"
+        ) as schedule:
             channel._on_message_sync(_event("om_dropped"))
 
         schedule.assert_not_called()

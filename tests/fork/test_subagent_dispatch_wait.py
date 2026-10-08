@@ -6,9 +6,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nanobot.agent.context import TranscriptInput
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
@@ -56,10 +58,11 @@ async def runtime(tmp_path):
     queue = TrackingQueue()
     loop.runner.run = AsyncMock(return_value=AgentRunResult(final_content="", messages=[]))
     await loop._run_agent_loop(
-        [{"role": "user", "content": "task"}], session=session,
-        pending_queue=queue, channel="cli", chat_id="dispatch",
+        TranscriptInput(history=[], current_message="task"), session=session,
+        runtime=loop.runtime_for_session(session), pending_queue=queue,
+        request_context=RequestContext(channel="cli", chat_id="dispatch", session_key=session.key),
     )
-    callback = loop.runner.run.await_args.args[0].injection_callback
+    callback = loop.runner.run.await_args.args[0]
     return loop, session, queue, provider, callback
 
 
@@ -108,19 +111,20 @@ async def test_spawn_binds_before_waiting_and_final_wait_is_interruptible(tmp_pa
     if ending == "user_then_receipt":
         responses.append(LLMResponse(content="已收到用户约束，继续等待"))
     responses.append(LLMResponse(content="全部完成"))
-    provider.chat_with_retry = AsyncMock(side_effect=responses)
+    provider.chat_stream_with_retry = AsyncMock(side_effect=responses)
     spec = AgentRunSpec(
         initial_messages=[{"role": "user", "content": "task"}], tools=tools, model="test-model",
         max_iterations=6, max_tool_result_chars=16000, context_strategy="legacy",
         workspace=tmp_path, data_dir=tmp_path / "data", session_key=session.key,
-        injection_callback=callback,
+        injection_callback=callback.injection_callback,
+        terminal_injection_callback=callback.terminal_injection_callback,
     )
     task = asyncio.create_task(AgentRunner(provider).run(spec))
     try:
         # 旧实现会在 spawn 后等待 300 秒，bind 根本不会执行。
         await asyncio.wait_for(bound.wait(), timeout=2)
         await asyncio.wait_for(queue.waits.get(), timeout=2)
-        assert provider.chat_with_retry.await_count == 3
+        assert provider.chat_stream_with_retry.await_count == 3
         assert not task.done()
         if ending == "cancel":
             task.cancel()
@@ -132,7 +136,7 @@ async def test_spawn_binds_before_waiting_and_final_wait_is_interruptible(tmp_pa
                 channel="cli", sender_id="user", chat_id="dispatch", content="USER_CONSTRAINT",
             ))
             await asyncio.wait_for(queue.waits.get(), timeout=2)
-            assert provider.chat_with_retry.await_count == 4
+            assert provider.chat_stream_with_retry.await_count == 4
         release.set()
         result = await asyncio.wait_for(task, timeout=3)
         assert result.stop_reason == "completed"
@@ -158,12 +162,13 @@ async def test_error_does_not_wait_for_running_worker(tmp_path):
     worker = asyncio.create_task(asyncio.Event().wait())
     loop.subagents._running_tasks["worker"] = worker
     loop.subagents._session_tasks[session.key] = {"worker"}
-    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="failure", finish_reason="error"))
+    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(content="failure", finish_reason="error"))
     try:
         result = await asyncio.wait_for(AgentRunner(provider).run(AgentRunSpec(
             initial_messages=[{"role": "user", "content": "task"}], tools=ToolRegistry(),
             model="test-model", max_iterations=2, max_tool_result_chars=16000,
-            context_strategy="legacy", injection_callback=callback,
+            context_strategy="legacy", injection_callback=callback.injection_callback,
+        terminal_injection_callback=callback.terminal_injection_callback,
         )), timeout=2)
         assert result.stop_reason == "error"
         assert queue.waits.empty()
@@ -179,7 +184,7 @@ async def test_explicit_user_wait_does_not_block_on_worker(tmp_path):
     loop.subagents._running_tasks["worker"] = worker
     loop.subagents._session_tasks[session.key] = {"worker"}
     try:
-        assert await asyncio.wait_for(callback(wait_for_subagents=True), timeout=2) == []
+        assert await asyncio.wait_for(callback.terminal_injection_callback(), timeout=2) == []
         assert queue.waits.empty()
     finally:
         worker.cancel()

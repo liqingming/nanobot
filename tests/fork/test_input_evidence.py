@@ -228,7 +228,7 @@ async def test_process_direct_marks_sdk_even_with_cli_user_routing():
     loop._session_locks = {}
     loop._process_message = AsyncMock(return_value=None)
     events = SimpleNamespace(run_status_changed=AsyncMock(), clear_turn=Mock())
-    loop._runtime_events = lambda: events
+    loop.runtime_event_publisher = events
     await loop.process_direct("提交", metadata={"origin": "cli_interactive"})
     received = loop._process_message.call_args.args[0]
     assert received.receipt.origin == "sdk"

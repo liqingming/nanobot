@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 _STATUS_SYMBOLS = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
 _VALID_STATUSES = ("pending", "in_progress", "completed")
 MAX_TODO_ITEMS = 50
+_TODO_TURN_ID_KEY = "_nanobot_todo_turn_id"
 
 
 def format_todos(items: list[dict[str, Any]]) -> str:
@@ -134,6 +135,8 @@ class TodoWriteTool(Tool):
         self._channel = "cli"
         self._chat_id = "direct"
         self._session_key = "cli:direct"
+        self._turn_id: str | None = None
+        self._turn_objective: str | None = None
         # Track per-session "done count delta" between consecutive execute()
         # calls so summarize_result can show e.g. "+2" newly completed.
         self._done_count: dict[str, int] = {}
@@ -143,6 +146,8 @@ class TodoWriteTool(Tool):
         self._channel = ctx.channel
         self._chat_id = ctx.chat_id
         self._session_key = ctx.session_key or f"{ctx.channel}:{ctx.chat_id}"
+        self._turn_id = ctx.turn_id
+        self._turn_objective = ctx.original_user_text
 
     @property
     def name(self) -> str:
@@ -292,7 +297,52 @@ class TodoWriteTool(Tool):
         if errors:
             return "Error: " + "; ".join(errors)
 
+        same_turn = (
+            self._turn_id is not None
+            and session.metadata.get(_TODO_TURN_ID_KEY) == self._turn_id
+        )
+        previous_contents = {
+            str(item.get("content") or "").strip().casefold()
+            for item in prev_todos
+            if str(item.get("content") or "").strip()
+        }
+        new_contents = {
+            str(item.get("content") or "").strip().casefold()
+            for item in new_items
+            if str(item.get("content") or "").strip()
+        }
+        has_unfinished_work = any(
+            item.get("status") != "completed"
+            for item in prev_todos
+        )
+        overlap_count = len(previous_contents & new_contents)
+        overlap_base = min(len(previous_contents), len(new_contents))
+        suspicious_completed_replacement = (
+            bool(new_items)
+            and all(item.get("status") == "completed" for item in new_items)
+            and overlap_count * 2 < overlap_base
+        )
+        if (
+            same_turn
+            and has_unfinished_work
+            and new_contents
+            and (
+                previous_contents.isdisjoint(new_contents)
+                or suspicious_completed_replacement
+            )
+        ):
+            objective = (self._turn_objective or "").strip()
+            objective_hint = f" Current turn objective: {objective[:500]}" if objective else ""
+            return (
+                "Error: refusing to replace the active todo list with a completely "
+                "unrelated plan in the same turn. Update the current items, or finish "
+                "them before starting a new plan. This prevents a stale earlier task "
+                f"from replacing the user's current request.{objective_hint}"
+            )
+
         session.todos = new_items
+        if self._turn_id is not None:
+            session.metadata[_TODO_TURN_ID_KEY] = self._turn_id
         self._sessions.save(session)
 
         # Record done-count delta vs the previous execute() call for this

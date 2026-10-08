@@ -49,9 +49,11 @@ class ClaudeAIOAuthProvider(AnthropicProvider):
         default_model: str = "claude-sonnet-4-20250514",
         api_base: str | None = None,
         extra_headers: dict[str, str] | None = None,
+        *,
+        provider_name: str = "claude_ai_oauth",
     ):
         # Bypass AnthropicProvider.__init__; call the base to set api_key/api_base/generation.
-        LLMProvider.__init__(self, api_key=None, api_base=api_base)
+        LLMProvider.__init__(self, api_key=None, api_base=api_base, provider_name=provider_name)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
 

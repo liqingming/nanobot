@@ -52,7 +52,7 @@ def get_logs_dir() -> Path:
     return get_runtime_subdir("logs")
 
 
-def get_workspace_cache_dir(workspace: Path) -> Path:
+def get_workspace_cache_dir(workspace: Path, *, create: bool = True) -> Path:
     """Return the cache directory for a non-default workspace.
 
     All per-workspace nanobot metadata (sessions, memory, cron, skills, templates)
@@ -61,7 +61,8 @@ def get_workspace_cache_dir(workspace: Path) -> Path:
     resolved = str(workspace.resolve())
     h = hashlib.sha1(resolved.encode()).hexdigest()[:8]
     safe_name = re.sub(r"[^\w-]", "_", workspace.name) or "root"
-    return ensure_dir(Path.home() / ".nanobot" / "caches" / f"{safe_name}_{h}")
+    path = Path.home() / ".nanobot" / "caches" / f"{safe_name}_{h}"
+    return ensure_dir(path) if create else path
 
 
 def get_webui_dir() -> Path:
@@ -69,7 +70,7 @@ def get_webui_dir() -> Path:
     return get_runtime_subdir("webui")
 
 
-def get_workspace_path(workspace: str | None = None) -> Path:
+def get_workspace_path(workspace: str | Path | None = None) -> Path:
     """Resolve and ensure the agent workspace path."""
     path = Path(workspace).expanduser() if workspace else Path.home() / ".nanobot" / "workspace"
     return ensure_dir(path)

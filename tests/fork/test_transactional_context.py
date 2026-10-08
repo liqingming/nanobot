@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from nanobot.agent.context_governance import ContextGovernanceConfig
+from nanobot.agent.context_governance import (
+    ContextGovernanceConfig,
+    ContextGovernor,
+    ModelRequestState,
+)
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.config.schema import AgentDefaults
 from nanobot.fork.agent.context_budget import ContextBudgetError
@@ -24,6 +28,7 @@ from nanobot.fork.agent.transactional_context import (
     validate_strategy,
 )
 from nanobot.providers.base import LLMResponse
+from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.session.manager import Session
 
 
@@ -54,11 +59,14 @@ def config(tmp_path):
     provider.supports_native_context_compaction = False
     provider.estimate_prompt_tokens = count
     provider.chat_with_retry = AsyncMock(side_effect=summarize)
+    provider.chat_stream_with_retry = provider.chat_with_retry
     return ContextGovernanceConfig(
         provider=provider, model="test", tools=SimpleNamespace(get_definitions=lambda: []),
         workspace=tmp_path, data_dir=tmp_path, session_key="cli:topic",
         max_tool_result_chars=16000, context_window_tokens=20000,
         context_block_limit=4000, max_tokens=1000,
+        blocking_compaction_trigger_ratio=0.7,
+        blocking_compaction_target_ratio=0.5,
     )
 
 
@@ -88,10 +96,133 @@ async def test_commit_is_durable_keeps_protected_rows_and_raw_transcript(tmp_pat
     original = json.loads(Path(version["source_locator"]).read_text(encoding="utf-8"))
     assert original["messages"] == messages[2:4]
     assert cfg.provider.chat_with_retry.call_args.kwargs["tools"] is None
-    assert tx.usage == {"prompt_tokens": 12, "completion_tokens": 4}
+    assert tx.usage.input_tokens == 12 and tx.usage.output_tokens == 4
     again = await tx.prepare(cfg, messages + [{"role": "user", "content": "停止"}])
     assert tx.version == 1 and cfg.provider.chat_with_retry.await_count == 1
     assert again[-1]["content"] == "停止"
+
+
+async def test_local_projection_prepares_one_remote_recap_without_batch_model_calls(tmp_path):
+    cfg, messages = config(tmp_path), source()
+    tx = TransactionalContextPreparation(local_summary_only=True)
+
+    result = await tx.prepare(cfg, messages)
+
+    cfg.provider.chat_with_retry.assert_not_awaited()
+    assert tx.version == 1
+    assert any("代理已生成本地上下文索引" in str(row.get("content")) for row in result)
+    assert [row for row in result if row["role"] in {"system", "user"}] == [
+        row for row in messages if row["role"] in {"system", "user"}
+    ]
+
+
+async def test_internal_metadata_change_does_not_break_continuation(tmp_path):
+    cfg = replace(config(tmp_path), context_window_tokens=200000, context_block_limit=100000)
+    messages = source()
+    tx = TransactionalContextPreparation()
+
+    await tx.prepare(cfg, messages)
+    messages[-1]["_meta"] = {"provider_state_boundary": True}
+
+    result = await tx.prepare(cfg, messages + [{"role": "user", "content": "继续"}])
+
+    assert result[-1]["content"] == "继续"
+
+async def test_outer_compaction_rebases_transaction_before_next_tool_delta(tmp_path):
+    cfg = replace(config(tmp_path), context_window_tokens=200000, context_block_limit=100000)
+    accepted = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "continue the task"},
+    ]
+    raw_source = [
+        *accepted,
+        *(
+            {"role": "assistant", "content": f"old response {index}"}
+            for index in range(20)
+        ),
+    ]
+    transaction = TransactionalContextPreparation()
+    transaction.source = deepcopy(raw_source)
+    transaction.projected = deepcopy(accepted)
+    compaction = Mock()
+    state = ModelRequestState(
+        config=cfg,
+        conversation=ProviderConversationStateController(
+            provider=cfg.provider,
+            model=cfg.model,
+            messages=raw_source,
+        ),
+        compaction=compaction,
+        transaction=transaction,
+    )
+
+    state.accept_request(accepted, raw_boundary=len(raw_source))
+    latest_exchange = exchange(99, "evidence/system-map.md")
+    prepared = await transaction.prepare(cfg, [*accepted, *latest_exchange])
+
+    compaction.accept_request.assert_called_once_with(
+        accepted,
+        raw_boundary=len(raw_source),
+    )
+    assert prepared[-2:] == latest_exchange
+    assert transaction.source[-2:] == latest_exchange
+
+
+async def test_soft_pressure_does_not_make_summary_a_request_dependency(tmp_path):
+    cfg = replace(
+        config(tmp_path),
+        context_strategy="transactional",
+        blocking_compaction_trigger_ratio=0.95,
+    )
+    messages = [{"role": "system", "content": "system"}]
+    for index in range(5):
+        messages.extend([
+            {"role": "user", "content": f"question {index}"},
+            {"role": "assistant", "content": "a" * 2500},
+        ])
+    messages.append({"role": "user", "content": "simple follow-up"})
+    estimated, _ = count(messages, [])
+    assert 2800 < estimated <= 4000
+    cfg.provider.chat_with_retry.side_effect = RuntimeError("summary unavailable")
+
+    state = ModelRequestState(
+        config=cfg,
+        conversation=ProviderConversationStateController(
+            provider=cfg.provider, model=cfg.model, messages=messages,
+        ),
+    )
+    result, _ = await ContextGovernor().prepare_request(
+        state,
+        messages,
+        tool_definitions=[],
+    )
+
+    assert result == messages
+    cfg.provider.chat_with_retry.assert_not_awaited()
+
+
+async def test_plain_assistant_history_can_be_summarized_in_complete_batches(tmp_path):
+    cfg = config(tmp_path)
+    messages = [{"role": "system", "content": "system"}]
+    for index in range(8):
+        messages.extend([
+            {"role": "user", "content": f"question {index}"},
+            {"role": "assistant", "content": "a" * 2500},
+        ])
+    messages.append({"role": "user", "content": "simple follow-up"})
+    original = deepcopy(messages)
+    estimated, _ = count(messages, [])
+    assert estimated > 4000
+
+    result = await TransactionalContextPreparation().prepare(cfg, messages)
+
+    final_estimated, _ = count(result, [])
+    assert final_estimated <= 2000
+    assert cfg.provider.chat_with_retry.await_count >= 1
+    assert any("历史摘要" in str(row.get("content")) for row in result)
+    assert result[-1] == messages[-1]
+    assert messages == original
+
 
 
 @pytest.mark.parametrize("failure", ["error", "length", "empty", "invalid", "hash", "tool", "exception"])
@@ -170,10 +301,62 @@ async def test_no_storage_or_oversized_summary_input_does_not_call_model(tmp_pat
     cfg.provider.chat_with_retry.assert_not_called()
 
 
+async def test_oversized_history_is_summarized_in_bounded_batches(tmp_path):
+    cfg = config(tmp_path)
+    messages = [
+        {"role": "system", "content": "系统约束"},
+        {"role": "user", "content": "只检查，不修改"},
+    ]
+    for i in range(12):
+        messages.extend(exchange(i, "证据" * 2500))
+    messages.extend([
+        {"role": "user", "content": "继续检查"},
+        *exchange(99, "最新证据"),
+    ])
+    original = deepcopy(messages)
+    tx = TransactionalContextPreparation()
+
+    result = await tx.prepare(cfg, messages)
+
+    budget = 4000
+    estimated, _ = count(result, [])
+    assert estimated <= int(budget * 0.7)
+    assert cfg.provider.chat_with_retry.await_count > 1
+    assert messages == original
+    assert tx.version == 1
+    assert result[-2:] == messages[-2:]
+    assert any("历史摘要" in str(row.get("content")) for row in result)
+
+
+async def test_large_history_uses_local_fallback_when_summary_provider_fails(tmp_path):
+    cfg = config(tmp_path)
+    cfg.provider.chat_with_retry.side_effect = RuntimeError("provider unavailable")
+    messages = [
+        {"role": "system", "content": "系统约束"},
+        {"role": "user", "content": "只检查，不修改"},
+    ]
+    for i in range(20):
+        messages.extend(exchange(i, "证据" * 1200))
+    messages.extend([
+        {"role": "user", "content": "继续检查"},
+        *exchange(99, "最新证据"),
+    ])
+    tx = TransactionalContextPreparation()
+
+    result = await tx.prepare(cfg, messages)
+
+    assert tx.version == 1
+    assert cfg.provider.chat_with_retry.await_count >= 1
+    assert any("本地上下文索引" in str(row.get("content")) for row in result)
+    assert result[-2:] == messages[-2:]
+
+
 @pytest.mark.parametrize("rows", [
     exchange(1)[:1], exchange(1)[1:],
     exchange(1)[:1] + [{"role": "user", "content": "新消息"}] + exchange(1)[1:],
 ])
+
+
 async def test_incomplete_or_orphan_batches_stop_without_repair(tmp_path, rows):
     cfg = config(tmp_path)
     with pytest.raises(SummaryTransactionError):
@@ -205,22 +388,33 @@ def spec(cfg, messages, **kwargs):
         max_tool_result_chars=cfg.max_tool_result_chars, workspace=cfg.workspace,
         data_dir=cfg.data_dir, session_key=cfg.session_key,
         context_window_tokens=cfg.context_window_tokens,
-        context_block_limit=cfg.context_block_limit, max_tokens=cfg.max_tokens, **kwargs,
+        context_block_limit=cfg.context_block_limit, max_tokens=cfg.max_tokens,
+        blocking_compaction_trigger_ratio=cfg.blocking_compaction_trigger_ratio,
+        blocking_compaction_target_ratio=cfg.blocking_compaction_target_ratio,
+        **kwargs,
     )
 
 
-async def test_runner_summary_failure_is_safety_stop_not_injection_retry(tmp_path):
+async def test_runner_soft_summary_failure_falls_back_to_fitting_request(tmp_path):
     cfg = config(tmp_path)
     cfg.provider.chat_with_retry.side_effect = RuntimeError("摘要失败")
+    async def chat(**kwargs):
+        if kwargs["tools"] is None:
+            raise RuntimeError("summary failed")
+        return LLMResponse(content="done")
+
+    cfg.provider.chat_with_retry.side_effect = chat
     injected = AsyncMock(return_value=[{"role": "user", "content": "继续"}])
+    injected = AsyncMock(return_value=[])
     result = await AgentRunner(cfg.provider).run(spec(cfg, source(), injection_callback=injected))
-    assert result.context_safety_failure and result.stop_reason == "error"
-    assert cfg.provider.chat_with_retry.await_count == 1
-    injected.assert_not_called()
-    assert result.messages == source()
+    assert result.context_safety_failure is False
+    assert result.stop_reason == "completed"
+    assert cfg.provider.chat_with_retry.await_count == 2
+    injected.assert_awaited()
+    assert result.final_content == "done"
 
 
-async def test_provider_overflow_never_snips_or_drains_injections(tmp_path):
+async def test_provider_overflow_reprojects_once_without_draining_injections(tmp_path):
     cfg = config(tmp_path)
     cfg.provider.chat_with_retry.side_effect = None
     cfg.provider.chat_with_retry.return_value = LLMResponse(
@@ -231,8 +425,25 @@ async def test_provider_overflow_never_snips_or_drains_injections(tmp_path):
         cfg, [{"role": "user", "content": "检查"}], injection_callback=injected,
     ))
     assert result.context_safety_failure
-    assert cfg.provider.chat_with_retry.await_count == 1
+    assert cfg.provider.chat_with_retry.await_count == 2
     injected.assert_not_called()
+
+
+async def test_provider_overflow_can_recover_after_one_reprojection(tmp_path):
+    cfg = config(tmp_path)
+    cfg.provider.chat_with_retry.side_effect = [
+        LLMResponse(content="context limit", finish_reason="error",
+                    error_code="context_length_exceeded"),
+        LLMResponse(content="done"),
+    ]
+    injected = AsyncMock(return_value=[])
+
+    result = await AgentRunner(cfg.provider).run(spec(
+        cfg, [{"role": "user", "content": "inspect"}], injection_callback=injected,
+    ))
+
+    assert result.stop_reason == "completed"
+    assert result.final_content == "done"
 
 
 async def test_injection_failure_is_not_swallowed(tmp_path):
@@ -308,7 +519,7 @@ async def test_runner_complete_batches_then_summary_then_new_user_input(tmp_path
     assert main_calls[-1][-1]["content"] == "撤销继续执行；立即停止"
     assert any("历史摘要" in str(row.get("content")) for row in main_calls[-1])
     assert next(row["content"] for row in result.messages if row.get("tool_call_id") == "1") == "旧资料" * 4000
-    assert result.usage["completion_tokens"] >= 6
+    assert result.usage.output_tokens >= 6
 
 
 async def test_summary_timeout_and_later_failure_keep_committed_version(tmp_path):
@@ -334,8 +545,12 @@ async def test_summary_timeout_and_later_failure_keep_committed_version(tmp_path
 async def test_finalization_budget_guard_does_not_call_provider(tmp_path):
     cfg = config(tmp_path)
     runner = AgentRunner(cfg.provider)
+    state = ModelRequestState(
+        config=replace(cfg, context_strategy="transactional"),
+        conversation=ProviderConversationStateController(provider=cfg.provider, model=cfg.model, messages=[]),
+    )
     with pytest.raises(ContextBudgetError):
-        await runner._request_no_tools(spec(cfg, []), [{"role": "user", "content": "约束" * 20000}])
+        await runner._request_no_tools(spec(cfg, []), [{"role": "user", "content": "约束" * 20000}], request_state=state)
     cfg.provider.chat_with_retry.assert_not_called()
 
 
@@ -357,6 +572,7 @@ def test_new_persistence_keeps_long_receipt_and_user_marker_text(tmp_path):
 
 
 async def test_pending_input_evidence_survives_restart_and_failure_requeues_in_order(tmp_path, monkeypatch):
+    from nanobot.agent.context import TranscriptInput
     from nanobot.agent.context_artifacts import ContextState
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.events import InboundMessage
@@ -378,11 +594,11 @@ async def test_pending_input_evidence_survives_restart_and_failure_requeues_in_o
         rows = await request.injection_callback(limit=1)
         seen.extend(rows)
         from nanobot.agent.runner import AgentRunResult
-        return AgentRunResult(final_content="ok", messages=[*request.initial_messages, *rows])
+        return AgentRunResult(final_content="ok", messages=[*AgentRunner._initial_transcript_and_compaction(request)[0], *rows])
 
     loop.runner.run = run
     await loop._run_agent_loop(
-        [{"role": "user", "content": "初始"}], session=session, pending_queue=pending,
+        TranscriptInput(history=[], current_message="初始"), session=session, pending_queue=pending, runtime=loop.runtime_for_session(session),
     )
     loop.sessions.invalidate(session.key)
     loaded = loop.sessions.get_or_create(session.key)
@@ -395,7 +611,7 @@ async def test_pending_input_evidence_survives_restart_and_failure_requeues_in_o
     monkeypatch.setattr(loop.sessions, "save", Mock(side_effect=OSError("存储故障")))
     with pytest.raises(OSError):
         await loop._run_agent_loop(
-            [{"role": "user", "content": "初始"}], session=loaded, pending_queue=pending,
+            TranscriptInput(history=[], current_message="初始"), session=loaded, pending_queue=pending, runtime=loop.runtime_for_session(loaded),
         )
     assert [pending.get_nowait().content, pending.get_nowait().content] == ["撤销", "后续"]
 
@@ -436,3 +652,40 @@ async def test_unexpected_governance_error_cannot_fall_back_to_raw_request(tmp_p
     result = await AgentRunner(cfg.provider).run(spec(cfg, [{"role": "user", "content": "检查"}]))
     assert result.context_safety_failure and result.stop_reason == "error"
     cfg.provider.chat_with_retry.assert_not_called()
+
+
+async def test_finalization_supplement_overflow_keeps_source_and_stops(tmp_path):
+    cfg = replace(config(tmp_path), context_strategy="transactional")
+    original = [{"role": "user", "content": "Keep this original request."}]
+    state = ModelRequestState(
+        config=cfg,
+        conversation=ProviderConversationStateController(provider=cfg.provider, model=cfg.model, messages=[]),
+    )
+    with pytest.raises(ContextBudgetError):
+        await AgentRunner(cfg.provider)._request_no_tools(
+            spec(cfg, original), original, request_state=state,
+            request_supplements=[{"role": "user", "content": "finalization note " * 5000}],
+        )
+    assert state.transaction.source == original
+    cfg.provider.chat_stream_with_retry.assert_not_called()
+
+
+async def test_safety_stop_preserves_completed_request_usage_and_tool_receipts(tmp_path):
+    from nanobot.providers.base import LLMUsage, ToolCallRequest
+
+    cfg = config(tmp_path)
+    cfg.tools = Mock()
+    cfg.tools.get_definitions.return_value = []
+    cfg.tools.execute = AsyncMock(return_value="durable tool receipt")
+    cfg.provider.chat_stream_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content=None, tool_calls=[ToolCallRequest(id="safe", name="read_file", arguments={})],
+                    usage=LLMUsage.reported(input_tokens=100, output_tokens=10)),
+        LLMResponse(content="context limit", finish_reason="error", error_code="context_length_exceeded"),
+        LLMResponse(content="context limit", finish_reason="error", error_code="context_length_exceeded"),
+    ])
+    result = await AgentRunner(cfg.provider).run(replace(
+        spec(cfg, [{"role": "user", "content": "inspect"}]), max_iterations=3,
+    ))
+    assert result.context_safety_failure and result.stop_reason == "error"
+    assert result.usage.input_tokens == 100 and result.usage.output_tokens == 10
+    assert result.tool_events and result.messages[-1]["content"] == "durable tool receipt"

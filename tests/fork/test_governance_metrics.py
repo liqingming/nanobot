@@ -78,7 +78,7 @@ async def test_real_runner_reloads_body_and_reports_separate_peaks(tmp_path, str
             usage={"prompt_tokens": 900000, "completion_tokens": 10},
             provider_diagnostics={"context_input_tokens": 100 + i},
         ))
-    provider.chat_with_retry = AsyncMock(side_effect=responses)
+    provider.chat_stream_with_retry = AsyncMock(side_effect=responses)
     events = []
     result = await AgentRunner(provider).run(AgentRunSpec(
         initial_messages=[{"role": "system", "content": "system"},
@@ -98,9 +98,9 @@ async def test_real_runner_reloads_body_and_reports_separate_peaks(tmp_path, str
     assert summary["context_input_measured_samples"] == 3
     assert summary["context_input_estimated_peak_tokens"] is None
     assert summary["context_scope"] == ("native_checkpoint_copy" if native else "local_model_copy")
-    assert result.usage["context_input_tokens"] == 102
+    assert result.usage.context_tokens == 102
     # 原始累计消耗口径不被观察统计改变。
-    assert result.usage["prompt_tokens"] == 2700000
+    assert result.usage.input_tokens == 2700000
 
 
 @pytest.mark.parametrize("sync", ["start", "steered"])
