@@ -269,6 +269,98 @@ async def test_runner_summarizes_history_and_preserves_current_input(monkeypatch
     assert any(message.get("content") == old_answer for message in result.messages)
 
 
+async def test_transactional_compaction_commits_recap_and_continues_active_task(
+    monkeypatch,
+    tmp_path,
+):
+    provider = MagicMock(spec=LLMProvider)
+    provider.can_resume_conversation_state.return_value = False
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content=None,
+            tool_calls=[ToolCallRequest(id="call-1", name="inspect", arguments={})],
+        ),
+        LLMResponse(content="task completed after recap"),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="fresh tool evidence")
+    old_answer = "old answer " * 2_000
+    recap = "Active objective: inspect the project. Next action: run inspect and finish."
+
+    def estimate(_provider, _model, messages, _tools):
+        if messages and messages[0].get("content") == recap:
+            return 100, "test-counter"
+        if any("代理已生成本地上下文索引" in str(message.get("content")) for message in messages):
+            return 100, "test-counter"
+        if len(messages) == 2 and "source_sha256" in str(messages[1].get("content")):
+            return 300, "test-counter"
+        if any(message.get("content") in {old_answer, "inspect the project"} for message in messages):
+            return 600, "test-counter"
+        return 400, "test-counter"
+
+    monkeypatch.setattr(
+        "nanobot.agent.context_governance.estimate_prompt_tokens_chain",
+        estimate,
+    )
+    monkeypatch.setattr(
+        "nanobot.fork.agent.transactional_context.estimate_prompt_tokens_chain",
+        estimate,
+    )
+    consolidate = AsyncMock(return_value=recap)
+    requests: list[list[dict]] = []
+    original_request = provider.chat_stream_with_retry
+
+    async def capture_request(**kwargs):
+        requests.append(kwargs["messages"])
+        return await original_request(**kwargs)
+
+    provider.chat_stream_with_retry = capture_request
+
+    result = await AgentRunner().run(make_run_spec(
+        provider,
+        initial_messages=None,
+        transcript_input=TranscriptInput(
+            history=[
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": old_answer},
+            ],
+            current_message="inspect the project",
+        ),
+        transcript_builder=_build_transcript,
+        consolidate_history=consolidate,
+        tools=tools,
+        model="test-model",
+        context_window_tokens=1_624,
+        max_tokens=100,
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        context_strategy="transactional",
+        workspace=tmp_path,
+        session_key="cli:recap-test",
+    ))
+
+    consolidate.assert_awaited_once()
+    recap_source = consolidate.await_args.args[0]
+    assert [message.get("content") for message in recap_source[:2]] == [
+        "system", "old question",
+    ]
+    assert any("代理已生成本地上下文索引" in str(message.get("content")) for message in recap_source)
+    assert all(message.get("content") != "inspect the project" for message in recap_source)
+    assert result.summary_checkpoint is not None
+    assert result.summary_checkpoint.summary == recap
+    assert result.summary_checkpoint.transcript_boundary == 3
+    assert result.final_content == "task completed after recap"
+    assert tools.execute.await_count == 1
+    assert requests[0][:3] == [
+        {"role": "system", "content": recap},
+        {"role": "user", "content": SUMMARY_CONTINUATION_TEXT},
+        {"role": "user", "content": "inspect the project"},
+    ]
+    assert any(message.get("content") == "fresh tool evidence" for message in requests[1])
+    assert any(message.get("content") == "inspect the project" for message in result.messages)
+
+
 async def test_runner_rejects_oversized_delta_without_summarizable_history(monkeypatch):
     provider = MagicMock(spec=LLMProvider)
     provider.chat_stream_with_retry = AsyncMock()

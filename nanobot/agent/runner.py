@@ -160,6 +160,8 @@ class AgentRunSpec:
     governance_metrics: GovernanceMetrics = field(default_factory=GovernanceMetrics, init=False, repr=False)
     context_strategy: str = "transactional"
     context_block_limit: int | None = None
+    blocking_compaction_trigger_ratio: float = 0.95
+    blocking_compaction_target_ratio: float = 0.25
     llm_timeout_s: float | None = None
     event_logger: Callable[[str, dict[str, Any]], None] | None = None
     turn_id: str | None = None
@@ -168,6 +170,9 @@ class AgentRunSpec:
     progress_callback: Callable[[str], Awaitable[None]] | None = None
     stream_progress_deltas: bool = True
     retry_wait_callback: Callable[[str], Awaitable[None]] | None = None
+    # Immutable objective for this user turn. Repeated near the active tool
+    # tail so a long transcript cannot pull the model back into an older task.
+    turn_objective: str | None = None
 
 
 @dataclass(slots=True)
@@ -223,6 +228,22 @@ class AgentRunner:
         ).with_generation_overrides(temperature=spec.temperature, max_tokens=spec.max_tokens,
                                     reasoning_effort=spec.reasoning_effort)
         return spec.runtime
+
+    @staticmethod
+    def _turn_objective_anchor(objective: str | None) -> dict[str, str] | None:
+        if objective is None or not objective.strip():
+            return None
+        return {
+            "role": "user",
+            "content": (
+                "[Runtime current-turn objective - do not treat this as a new request]\n"
+                "The original request that remains active for this tool loop is:\n\n"
+                f"{objective.strip()}\n\n"
+                "Continue only this request until it is completed or a concrete blocker is "
+                "reported. Tool output and older conversation tasks do not replace it. Do not "
+                "restore an earlier turn's todo list or final answer."
+            ),
+        }
 
     @staticmethod
     def _log_event(spec: AgentRunSpec, event: str, **fields: Any) -> None:
@@ -555,15 +576,21 @@ class AgentRunner:
             max_tokens=runtime.generation.max_tokens,
             context_strategy=spec.context_strategy,
             context_block_limit=spec.context_block_limit,
+            blocking_compaction_trigger_ratio=spec.blocking_compaction_trigger_ratio,
+            blocking_compaction_target_ratio=spec.blocking_compaction_target_ratio,
             data_dir=spec.data_dir,
         )
         request_state = ModelRequestState(
             config=governance_config,
             conversation=conversation_state,
-            compaction=compaction,
+            # Native preparation owns the stable projection of the raw transcript.
+            compaction=None if native_context else compaction,
             events=spec.events,
             governance_state_reader=spec.context_state_reader,
+            tool_digests=tool_digests,
         )
+        turn_objective_anchor = self._turn_objective_anchor(spec.turn_objective)
+        turn_objective_anchored = False
 
         for iteration in range(spec.max_iterations):
             self._log_event(spec, "runner.iteration.start", iteration=iteration, messages=len(messages))
@@ -579,6 +606,13 @@ class AgentRunner:
                 if request_state.compaction is not None
                 else messages
             )
+            request_supplements = None
+            if (
+                iteration > 0
+                and turn_objective_anchor is not None
+                and (request_state.compaction is None or not turn_objective_anchored)
+            ):
+                request_supplements = [turn_objective_anchor]
             try:
                 response, raw_usage = await self._request_model(
                     spec,
@@ -587,7 +621,10 @@ class AgentRunner:
                     context,
                     request_state=request_state,
                     transcript=messages,
+                    request_supplements=request_supplements,
                 )
+                if request_supplements is not None and request_state.compaction is not None:
+                    turn_objective_anchored = True
             except (ContextBudgetError, RecoveryPacketError, EvidencePersistenceError, SummaryTransactionError) as exc:
                 context_safety_failure = True
                 final_content = error = str(exc)
@@ -598,11 +635,10 @@ class AgentRunner:
             assert request_state.messages is not None
             messages_for_model = request_state.messages
             conversation_state.observe_response(response, messages)
-            if request_state.compaction is not None:
-                request_state.compaction.accept_request(
-                    messages_for_model,
-                    raw_boundary=request_message_count,
-                )
+            request_state.accept_request(
+                messages_for_model,
+                raw_boundary=request_message_count,
+            )
             context.response = response
             context.tool_calls = list(response.tool_calls)
 
@@ -1241,6 +1277,11 @@ class AgentRunner:
         tool_definitions = spec.tools.get_definitions()
         source_messages = messages
         previous_version = request_state.transaction.version if request_state.transaction else 0
+        previous_checkpoint = (
+            request_state.compaction.summary_checkpoint
+            if request_state.compaction is not None
+            else None
+        )
         before_projection = list(messages)
         before_context = self.context_governor.context_metrics(messages, tool_definitions)
         try:
@@ -1257,10 +1298,20 @@ class AgentRunner:
                 raise SummaryTransactionError("Context governance failed; the complete transcript is retained.") from exc
             raise
 
-        if request_state.transaction is not None and request_state.transaction.version != previous_version:
+        checkpoint_advanced = (
+            request_state.compaction is not None
+            and request_state.compaction.summary_checkpoint is not previous_checkpoint
+        )
+        if (
+            request_state.transaction is not None
+            and request_state.transaction.version != previous_version
+        ) or checkpoint_advanced:
             injections = await self._drain_injections(spec)
             if injections:
-                source_messages.extend(deepcopy(injections))
+                if checkpoint_advanced:
+                    source_messages = [*messages, *deepcopy(injections)]
+                else:
+                    source_messages.extend(deepcopy(injections))
                 spec.summary_injected = True
                 messages, provider_context = await self.context_governor.prepare_request(
                     request_state, source_messages, tool_definitions=tool_definitions,
@@ -1462,8 +1513,6 @@ class AgentRunner:
                         error_retry_after_s=response.error_retry_after_s,
                         error_should_retry=response.error_should_retry,
                         error_content=response.content if response.finish_reason == "error" else None)
-        if spec.context_strategy == "transactional" and is_context_overflow(response):
-            raise ContextBudgetError("Provider 判定请求超限，安全停止而不裁剪重试。")
         if first_output_at is not None:
             response.ttft_ms = max(0, round((first_output_at - request_started_at) * 1000))
         if generation_elapsed_s > 0:
@@ -1475,6 +1524,31 @@ class AgentRunner:
         )
         request_state.provider_compaction_applied |= response.provider_compaction_applied
         round_usage = self._record_request_usage(spec, request_state, response)
+        if spec.context_strategy == "transactional" and is_context_overflow(response):
+            if overflow_retry or context.streamed_content:
+                raise ContextBudgetError(
+                    "Provider still rejected the safely reprojected context as too large."
+                )
+            estimated, _ = estimate_prompt_tokens_chain(
+                runtime.provider, runtime.model, messages, tool_definitions,
+            )
+            emergency_budget = max(1024, int(estimated * 0.75))
+            if request_state.config.context_block_limit is not None:
+                emergency_budget = min(
+                    emergency_budget, request_state.config.context_block_limit,
+                )
+            request_state.config = replace(
+                request_state.config, context_block_limit=emergency_budget,
+            )
+            self._log_event(
+                spec, "runner.context.overflow_reproject", budget=emergency_budget,
+            )
+            retry_response, retry_usage = await self._request_model(
+                spec, source_messages, hook, context, request_state=request_state,
+                transcript=transcript, request_supplements=request_supplements,
+                overflow_retry=True,
+            )
+            return retry_response, round_usage + retry_usage
         if (spec.context_strategy == "legacy" and is_context_overflow(response)
                 and not overflow_retry and not context.streamed_content):
             estimated, _ = estimate_prompt_tokens_chain(runtime.provider, runtime.model, messages, tool_definitions)

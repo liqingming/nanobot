@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Collection
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 from loguru import logger
 
 from nanobot.events import NO_EVENTS, EventSink
+from nanobot.fork.agent.context_budget import resolve_context_budget
 from nanobot.session.manager import Session, SessionManager
 from nanobot.session.summary import (
     SessionSummary,
@@ -21,20 +23,25 @@ if TYPE_CHECKING:
     from nanobot.utils.llm_runtime import LLMRuntime
 
 SessionEventFactory = Callable[[str], EventSink]
+BackgroundScheduler = Callable[[Coroutine[Any, Any, None]], asyncio.Task[Any] | None]
 
 
 class AutoCompact:
     _INTERNAL_SESSION_PREFIXES = ("dream:",)
+    _PRESSURE_TRIGGER_RATIO = 0.90
 
     def __init__(self, sessions: SessionManager, consolidator: Consolidator,
                  session_ttl_minutes: int = 0,
-                 bind_events: SessionEventFactory | None = None):
+                 bind_events: SessionEventFactory | None = None,
+                 session_lock_factory: Callable[[str], asyncio.Lock] | None = None):
         self.sessions = sessions
         self.consolidator = consolidator
         self._ttl = session_ttl_minutes
         self._archiving: set[str] = set()
+        self._pressure_tasks: dict[str, asyncio.Task[Any]] = {}
         self._summaries: dict[str, SessionSummary] = {}
         self._bind_events = bind_events
+        self._session_lock_factory = session_lock_factory
 
     def _is_expired(self, ts: datetime | str | None,
                     now: datetime | None = None) -> bool:
@@ -67,7 +74,7 @@ class AutoCompact:
 
     def check_expired(
         self,
-        schedule_background: Callable[[Coroutine[Any, Any, None]], None],
+        schedule_background: BackgroundScheduler,
         resolve_runtime: Callable[[Session], LLMRuntime],
         active_session_keys: Collection[str] = (),
     ) -> None:
@@ -90,28 +97,114 @@ class AutoCompact:
                 self._archiving.add(key)
                 schedule_background(self._archive(key, runtime=runtime))
 
+    def check_pressure(
+        self,
+        key: str,
+        runtime: LLMRuntime,
+        schedule_background: BackgroundScheduler,
+    ) -> None:
+        """Schedule a non-blocking high-water check after foreground work ends."""
+        if (
+            not key
+            or self._is_internal_session(key)
+            or key in self._archiving
+            or not self._has_unarchived_messages(key)
+        ):
+            return
+        self._archiving.add(key)
+        task = self._archive_if_pressure(key, runtime=runtime)
+        try:
+            scheduled = schedule_background(task)
+            if scheduled is not None:
+                self._pressure_tasks[key] = scheduled
+                scheduled.add_done_callback(
+                    lambda completed, session_key=key: self._pressure_tasks.pop(
+                        session_key, None,
+                    ) if self._pressure_tasks.get(session_key) is completed else None
+                )
+        except BaseException:
+            task.close()
+            self._archiving.discard(key)
+            raise
+
+    def cancel_pressure(self, key: str) -> None:
+        """Let new foreground work preempt an optional post-turn compaction."""
+        task = self._pressure_tasks.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _archive_if_pressure(self, key: str, *, runtime: LLMRuntime) -> None:
+        try:
+            lock = self._session_lock_factory(key) if self._session_lock_factory else None
+            if lock is None:
+                await self._archive_if_pressure_locked(key, runtime=runtime)
+            else:
+                async with lock:
+                    await self._archive_if_pressure_locked(key, runtime=runtime)
+        except Exception:
+            logger.exception("Post-turn compact: failed for {}", key)
+        finally:
+            self._archiving.discard(key)
+
+    async def _archive_if_pressure_locked(self, key: str, *, runtime: LLMRuntime) -> None:
+        session = self.sessions.get_or_create(key)
+        budget = resolve_context_budget(
+            runtime.provider,
+            runtime.context_window_tokens,
+            runtime.generation.max_tokens,
+        ).input_tokens
+        if budget is None or budget <= 0:
+            return
+        estimated, source = await asyncio.to_thread(
+            self.consolidator.estimate_session_prompt_tokens,
+            session,
+            runtime=runtime,
+        )
+        trigger = int(budget * self._PRESSURE_TRIGGER_RATIO)
+        logger.debug(
+            "Post-turn compact pressure {}: estimate={}/{} trigger={} via {}",
+            key,
+            estimated,
+            budget,
+            trigger,
+            source,
+        )
+        if estimated < trigger:
+            return
+        await self._archive_locked(key, runtime=runtime)
+
     async def _archive(self, key: str, *, runtime: LLMRuntime) -> None:
         if self._is_internal_session(key):
             self._archiving.discard(key)
             return
         try:
-            summary = await self.consolidator.compact_idle_session(
-                key,
-                runtime=runtime,
-                events=self._bind_events(key) if self._bind_events else NO_EVENTS,
-            )
-            if summary:
-                session = self.sessions.get_or_create(key)
-                stored = session_summary_from_metadata(
-                    session.metadata,
-                    fallback_last_active=session.updated_at,
-                )
-                if stored is not None:
-                    self._summaries[key] = stored
+            lock = self._session_lock_factory(key) if self._session_lock_factory else None
+            if lock is None:
+                await self._archive_locked(key, runtime=runtime)
+            else:
+                async with lock:
+                    await self._archive_locked(key, runtime=runtime)
         except Exception:
             logger.exception("Auto-compact: failed for {}", key)
         finally:
             self._archiving.discard(key)
+
+    async def _archive_locked(self, key: str, *, runtime: LLMRuntime) -> None:
+        """Archive while holding the same per-session lock as foreground turns."""
+        summary = await self.consolidator.compact_idle_session(
+            key,
+            runtime=runtime,
+            events=self._bind_events(key) if self._bind_events else NO_EVENTS,
+        )
+        if not summary:
+            return
+        session = self.sessions.get_or_create(key)
+        stored = session_summary_from_metadata(
+            session.metadata,
+            fallback_last_active=session.updated_at,
+        )
+        if stored is not None:
+            self._summaries[key] = stored
 
     def prepare_session(self, session: Session, key: str) -> tuple[Session, SessionSummary | None]:
         if self._is_internal_session(key):

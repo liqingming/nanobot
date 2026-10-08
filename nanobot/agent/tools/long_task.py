@@ -445,7 +445,7 @@ class AwaitUserInputTool(Tool, _GoalToolsMixin):
             "Pause the active sustained goal before asking the user for a required decision, "
             "approval, clarification, credential, or other reply. Call this immediately before "
             "your one user-facing question. Nanobot will not internally continue the goal until "
-            "the next real user message arrives; the goal itself remains active."
+            "the user explicitly replies with `/continue <answer>`; the goal itself remains active."
         )
 
     async def execute(self, reason: str, **kwargs: Any) -> str:
@@ -464,4 +464,4 @@ class AwaitUserInputTool(Tool, _GoalToolsMixin):
         discard_legacy_goal_state_key(sess.metadata)
         self._sessions.save(sess)
         await self._publish_goal_state_changed(sess.metadata)
-        return "Goal paused for the next real user message. Ask the user once, then stop."
+        return "Goal paused. Ask the user to reply with `/continue <answer>`, then stop."

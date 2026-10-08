@@ -800,6 +800,44 @@ async def test_codex_replayed_tool_turn_omits_server_item_ids(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_stateless_codex_provider_ignores_opaque_provider_state(monkeypatch) -> None:
+    _mock_codex_token(monkeypatch)
+    provider = OpenAICodexProvider(
+        default_model="openai-codex/gpt-5.6-sol", enable_native_context=False,
+    )
+    state = build_responses_state(
+        provider=provider._responses_state_provider(),
+        model="gpt-5.6-sol",
+        input_items=[{"type": "message", "role": "user", "content": "old context"}],
+        output_items=[{"type": "message", "role": "assistant",
+                       "content": [{"type": "output_text", "text": "old answer"}]}],
+    )
+    bodies: list[dict[str, Any]] = []
+
+    async def fake_request(url, headers, body, verify, proxy=None, **_kwargs):
+        bodies.append(body)
+        return provider_base.LLMResponse(content="done")
+
+    monkeypatch.setattr(
+        "nanobot.providers.openai_codex_provider._request_codex", fake_request,
+    )
+    response = await provider.chat(
+        [{"role": "user", "content": "current request"}],
+        provider_context=provider_base.ProviderCallContext(
+            conversation_state=state, session_id="topic",
+        ),
+    )
+
+    assert response.content == "done"
+    assert provider.supports_request_context is False
+    assert provider.supports_native_compaction() is False
+    assert bodies[0]["input"] == [{
+        "role": "user", "content": [{"type": "input_text", "text": "current request"}],
+    }]
+    assert "prompt_cache_key" not in bodies[0]
+
+
+@pytest.mark.asyncio
 async def test_codex_compacts_state_at_ninety_percent_before_next_request(
     monkeypatch,
 ) -> None:
@@ -1345,6 +1383,58 @@ def test_codex_model_catalog_clamps_configured_context_window(
 
     assert provider.resolve_context_window_tokens("gpt-5.6-sol", 1_000_000) == 372_000
     assert provider.input_token_budget(372_000, 65_536) == 353_400
+
+
+def test_codex_model_catalog_uses_extended_window_when_explicitly_configured(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "context_window": 272_000,
+                        "max_context_window": 872_000,
+                        "effective_context_window_percent": 95,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    provider = OpenAICodexProvider(default_model="gpt-5.6-sol")
+
+    assert provider.resolve_context_window_tokens("gpt-5.6-sol", 1_000_000) == 872_000
+    assert provider.input_token_budget(872_000, 65_536) == 828_400
+
+
+def test_codex_model_catalog_keeps_regular_window_for_smaller_configuration(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "context_window": 272_000,
+                        "max_context_window": 872_000,
+                        "effective_context_window_percent": 95,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    provider = OpenAICodexProvider(default_model="gpt-5.6-sol")
+
+    assert provider.resolve_context_window_tokens("gpt-5.6-sol", 200_000) == 200_000
+    assert provider.input_token_budget(200_000, 65_536) == 133_440
 
 
 def test_codex_model_catalog_falls_back_to_config_when_model_is_unknown(

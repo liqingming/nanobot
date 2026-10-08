@@ -76,6 +76,7 @@ class OpenAICodexProvider(LLMProvider):
         proxy: str | None = None,
         extra_body: dict[str, Any] | None = None,
         *,
+        enable_native_context: bool = True,
         provider_name: str = "openai_codex",
     ):
         super().__init__(api_key=None, api_base=None, provider_name=provider_name)
@@ -83,12 +84,14 @@ class OpenAICodexProvider(LLMProvider):
         self.proxy = proxy or None
         self._window_id = str(uuid.uuid4())
         self._turn_states: dict[tuple[str, str], str] = {}
-        self._context_window, self._effective_input_window = (
-            _load_codex_model_context(default_model)
+        self._context_window, self._effective_input_window = _load_codex_model_context(
+            default_model,
         )
 
         self._extra_body = dict(extra_body or {})
-        self._native_compaction_available = True
+        self._native_context_enabled = enable_native_context
+        self.supports_request_context = enable_native_context
+        self._native_compaction_available = enable_native_context
         self._ssl_contexts: dict[bool, ssl.SSLContext] = {}
 
     def _ssl_context(self, *, verify: bool) -> ssl.SSLContext:
@@ -102,7 +105,10 @@ class OpenAICodexProvider(LLMProvider):
             self._ssl_contexts[verify] = context
         return context
     def resolve_context_window_tokens(self, model: str, configured: int) -> int:
-        hard_window, effective_window = _load_codex_model_context(model)
+        hard_window, effective_window = _load_codex_model_context(
+            model,
+            configured=configured,
+        )
         self._context_window = hard_window
         self._effective_input_window = effective_window
         if hard_window:
@@ -146,6 +152,11 @@ class OpenAICodexProvider(LLMProvider):
         provider_context: ProviderCallContext | None = None,
     ) -> LLMResponse:
         """Shared request logic for both chat() and chat_stream()."""
+        if not self._native_context_enabled:
+            # Stateless mode deliberately ignores opaque provider state and
+            # routing metadata. Every request is assembled by nanobot instead.
+            request_context = None
+            provider_context = None
         model = model or self.default_model
         model_info = _load_codex_model_info(model)
         use_responses_lite = model_info.get("use_responses_lite") is True
@@ -423,6 +434,8 @@ class OpenAICodexProvider(LLMProvider):
         state: ProviderConversationState,
         model: str | None = None,
     ) -> bool:
+        if not self._native_context_enabled:
+            return False
         return responses_state_matches(
             state,
             provider=self._responses_state_provider(),
@@ -432,7 +445,7 @@ class OpenAICodexProvider(LLMProvider):
     def supports_native_compaction(self, model: str | None = None) -> bool:
         """Use the Codex backend's inline compaction trigger when needed."""
         _ = model
-        return self._native_compaction_available
+        return self._native_context_enabled and self._native_compaction_available
 
 
 def resolve_codex_first_event_timeout_s(
@@ -519,11 +532,25 @@ def _retained_compaction_messages(
     return retained_reversed
 
 
-def _load_codex_model_context(model: str) -> tuple[int | None, int | None]:
-    """Read the current Codex route limits from the CLI model catalog."""
+def _load_codex_model_context(
+    model: str,
+    *,
+    configured: int | None = None,
+) -> tuple[int | None, int | None]:
+    """Read the selected Codex route limit from the CLI model catalog.
+
+    The catalog can advertise a conservative default ``context_window`` and a
+    larger opt-in ``max_context_window``. A configuration above the default is
+    an explicit request for that extended route, while smaller configurations
+    continue to use the regular window.
+    """
     row = _load_codex_model_info(model)
     try:
-        hard = int(row.get("context_window") or row.get("max_context_window") or 0)
+        regular = int(row.get("context_window") or 0)
+        maximum = int(row.get("max_context_window") or 0)
+        hard = regular or maximum
+        if maximum > hard and configured is not None and configured > hard:
+            hard = maximum
         percent = int(row.get("effective_context_window_percent") or 100)
         if hard <= 0:
             return None, None

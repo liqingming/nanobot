@@ -68,6 +68,24 @@ def clear_goal_waiting_for_user(metadata: MutableMapping[str, Any]) -> bool:
     }
     discard_legacy_goal_state_key(metadata)
     return True
+
+
+def explicit_goal_resume_requested(
+    content: str | None,
+    message_metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return whether an inbound message explicitly resumes a waiting goal."""
+    if message_metadata and message_metadata.get("goal_reply") is True:
+        return True
+    original_command = str(
+        (message_metadata or {}).get("original_command") or ""
+    ).strip().casefold()
+    if original_command.split("@", 1)[0] == "/continue":
+        return True
+    first_token = str(content or "").strip().split(maxsplit=1)[0:1]
+    return bool(first_token and first_token[0].casefold().split("@", 1)[0] == "/continue")
+
+
 def explicit_goal_requested(message_metadata: Mapping[str, Any] | None) -> bool:
     """True when this turn was explicitly started by the ``/goal`` command."""
     if not message_metadata:

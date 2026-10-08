@@ -107,6 +107,47 @@ def _get_token_encoding() -> Any:
     return tiktoken.get_encoding("cl100k_base")
 
 
+@lru_cache(maxsize=2048)
+def _encoded_text_token_count(encoding: Any, text: str) -> int:
+    """Cache stable message fragments so growing prompts encode only new rows."""
+    return len(encoding.encode(text))
+
+
+def _message_token_payload(message: dict[str, Any]) -> str:
+    """Render all model-visible message fields for isolated token counting."""
+    content = message.get("content")
+    parts: list[str] = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for raw_part in cast(list[object], content):
+            part = cast(dict[str, Any], raw_part) if isinstance(raw_part, dict) else None
+            if part is not None and part.get("type") == "text":
+                text = part.get("text", "")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            else:
+                parts.append(json.dumps(raw_part, ensure_ascii=False))
+    elif content is not None:
+        parts.append(json.dumps(content, ensure_ascii=False))
+
+    for key in ("name", "tool_call_id"):
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    if message.get("tool_calls"):
+        parts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
+
+    reasoning_content = message.get("reasoning_content")
+    if isinstance(reasoning_content, str) and reasoning_content:
+        parts.append(reasoning_content)
+
+    response_items = message.get("response_items")
+    if response_items:
+        parts.append(json.dumps(response_items, ensure_ascii=False))
+    return "\n".join(parts)
+
+
 def _cache_tools_token_count(
     tools_id: int,
     fingerprint: tuple[int, ...],
@@ -739,53 +780,29 @@ def _estimate_prompt_tokens_with_source(
     Counts all fields that providers send to the LLM: content, tool_calls,
     reasoning_content, tool_call_id, name, plus per-message framing overhead.
     """
-    parts: list[str] = []
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, str):
-            parts.append(content)
-        elif isinstance(content, list):
-            for raw_part in cast(list[object], content):
-                part = cast(dict[str, Any], raw_part) if isinstance(raw_part, dict) else None
-                if part is not None and part.get("type") == "text":
-                    text = part.get("text", "")
-                    if isinstance(text, str) and text:
-                        parts.append(text)
-
-        tc = msg.get("tool_calls")
-        if tc:
-            parts.append(json.dumps(tc, ensure_ascii=False))
-
-        rc = msg.get("reasoning_content")
-        if isinstance(rc, str) and rc:
-            parts.append(rc)
-
-        response_items = msg.get("response_items")
-        if response_items:
-            parts.append(json.dumps(response_items, ensure_ascii=False))
-
-        for key in ("name", "tool_call_id"):
-            value = msg.get(key)
-            if isinstance(value, str) and value:
-                parts.append(value)
-
-    message_payload = "\n".join(parts)
+    payloads = [_message_token_payload(message) for message in messages]
+    nonempty_payloads = [payload for payload in payloads if payload]
     per_message_overhead = len(messages) * 4
     try:
         enc = _get_token_encoding()
         tool_tokens = (
-            _estimate_tools_tokens(enc, tools, leading_separator=bool(parts)) if tools else 0
+            _estimate_tools_tokens(enc, tools, leading_separator=bool(nonempty_payloads))
+            if tools
+            else 0
         )
-        message_tokens = len(enc.encode(message_payload)) if message_payload else 0
+        message_tokens = sum(
+            _encoded_text_token_count(enc, payload)
+            for payload in nonempty_payloads
+        )
         return message_tokens + tool_tokens + per_message_overhead, "tiktoken"
     except Exception:
         tool_payload = (
-            ("\n" if message_payload else "") + json.dumps(tools, ensure_ascii=False)
+            ("\n" if nonempty_payloads else "") + json.dumps(tools, ensure_ascii=False)
             if tools
             else ""
         )
-        payload = message_payload + tool_payload
-        estimated = len(payload.encode("utf-8"))
+        estimated = sum(len(payload.encode("utf-8")) for payload in nonempty_payloads)
+        estimated += len(tool_payload.encode("utf-8"))
         return estimated + per_message_overhead, "heuristic"
 
 
@@ -800,43 +817,12 @@ def estimate_prompt_tokens(
 
 def estimate_message_tokens(message: dict[str, Any]) -> int:
     """Estimate prompt tokens contributed by one persisted message."""
-    content = message.get("content")
-    parts: list[str] = []
-    if isinstance(content, str):
-        parts.append(content)
-    elif isinstance(content, list):
-        for raw_part in cast(list[object], content):
-            part = cast(dict[str, Any], raw_part) if isinstance(raw_part, dict) else None
-            if part is not None and part.get("type") == "text":
-                text = part.get("text", "")
-                if isinstance(text, str) and text:
-                    parts.append(text)
-            else:
-                parts.append(json.dumps(raw_part, ensure_ascii=False))
-    elif content is not None:
-        parts.append(json.dumps(content, ensure_ascii=False))
-
-    for key in ("name", "tool_call_id"):
-        value = message.get(key)
-        if isinstance(value, str) and value:
-            parts.append(value)
-    if message.get("tool_calls"):
-        parts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
-
-    rc = message.get("reasoning_content")
-    if isinstance(rc, str) and rc:
-        parts.append(rc)
-
-    response_items = message.get("response_items")
-    if response_items:
-        parts.append(json.dumps(response_items, ensure_ascii=False))
-
-    payload = "\n".join(parts)
+    payload = _message_token_payload(message)
     if not payload:
         return 4
     try:
         enc = _get_token_encoding()
-        return max(4, len(enc.encode(payload)) + 4)
+        return max(4, _encoded_text_token_count(enc, payload) + 4)
     except Exception:
         return max(4, len(payload.encode("utf-8")) + 4)
 

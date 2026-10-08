@@ -22,7 +22,11 @@ from weakref import WeakValueDictionary
 from filelock import FileLock
 from loguru import logger
 
-from nanobot.config.paths import get_legacy_sessions_dir, get_runtime_subdir
+from nanobot.config.paths import (
+    get_legacy_sessions_dir,
+    get_runtime_subdir,
+    get_workspace_cache_dir,
+)
 from nanobot.providers.base import ProviderConversationState
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
@@ -581,7 +585,13 @@ class SessionStore(Protocol):
 class JsonlSessionStore:
     """JSONL implementation of session persistence."""
 
-    def __init__(self, workspace: Path, *, sessions_root: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        sessions_root: Path | None = None,
+        workspace_state_root: Path | None = None,
+    ):
         canonical_workspace = Path(workspace).expanduser().resolve(strict=False)
         ensure_dir(canonical_workspace)
         root = (
@@ -589,25 +599,30 @@ class JsonlSessionStore:
             if sessions_root is not None
             else get_runtime_subdir("sessions").resolve(strict=False)
         )
-        if root == canonical_workspace or root.is_relative_to(canonical_workspace):
-            raise RuntimeError(
-                "session storage must be outside the agent workspace; "
-                "move --config outside --workspace or choose a nested workspace directory"
-            )
         ensure_dir(root)
         with suppress(OSError):
             os.chmod(root, 0o700)
         self.workspace = canonical_workspace
+        self.workspace_id_path = self._workspace_id_path(
+            canonical_workspace,
+            root,
+            workspace_state_root=workspace_state_root,
+        )
         self._migration_lock = FileLock(
             str(root / ".workspace-migration.lock"),
             timeout=_SESSION_MIGRATION_LOCK_TIMEOUT_SECONDS,
         )
         with self._migration_lock:
-            workspace_id = self._load_or_create_workspace_id(canonical_workspace, root)
+            workspace_id = self._load_or_create_workspace_id(
+                canonical_workspace,
+                root,
+                self.workspace_id_path,
+            )
             workspace_id = self._claim_workspace_namespace(
                 root,
                 canonical_workspace,
                 workspace_id,
+                self.workspace_id_path,
             )
             self.sessions_dir = ensure_dir(root / workspace_id)
             self.transcripts = TranscriptArchive(self.sessions_dir)
@@ -616,6 +631,7 @@ class JsonlSessionStore:
                 str(self.sessions_dir / _SESSION_FILES_LOCK_FILENAME)
             )
             with self._session_files_lock:
+                self._import_legacy_cache(root)
                 self._migrate_from_workspace(canonical_workspace)
 
     @contextmanager
@@ -663,12 +679,42 @@ class JsonlSessionStore:
         return value
 
     @staticmethod
-    def _workspace_id_path(workspace: Path) -> Path:
+    def _workspace_id_path(
+        workspace: Path,
+        root: Path,
+        *,
+        workspace_state_root: Path | None,
+    ) -> Path:
+        """Locate workspace identity state outside the user's project tree."""
+        if workspace_state_root is not None:
+            state_dir = Path(workspace_state_root).expanduser()
+            if state_dir.is_symlink():
+                raise RuntimeError(f"workspace state directory must not be a symlink: {state_dir}")
+            state_dir = state_dir.resolve(strict=False)
+            ensure_dir(state_dir)
+            return state_dir / _WORKSPACE_ID_FILE
+
+        # Direct SessionManager users may share one sessions root across many
+        # workspaces. Keep a path-keyed registry there instead of polluting each
+        # project with a .nanobot directory.
+        identity_key = hashlib.sha256(str(workspace).encode()).hexdigest()
+        state_dir = root / ".workspace-identities"
+        ensure_dir(state_dir)
+        return state_dir / f"{identity_key}.id"
+
+    @staticmethod
+    def _legacy_workspace_id_path(workspace: Path) -> Path:
         state_dir = workspace / _WORKSPACE_STATE_DIR
         if state_dir.is_symlink():
             raise RuntimeError(f"workspace state directory must not be a symlink: {state_dir}")
-        ensure_dir(state_dir)
         return state_dir / _WORKSPACE_ID_FILE
+
+    @classmethod
+    def _remove_legacy_workspace_id(cls, marker: Path) -> None:
+        marker.unlink()
+        cls._fsync_directory(marker.parent)
+        with suppress(OSError):
+            marker.parent.rmdir()
 
     @classmethod
     def _find_workspace_namespace(cls, workspace: Path, root: Path) -> str | None:
@@ -702,10 +748,31 @@ class JsonlSessionStore:
         return matches[0] if matches else None
 
     @classmethod
-    def _load_or_create_workspace_id(cls, workspace: Path, root: Path) -> str:
-        marker = cls._workspace_id_path(workspace)
+    def _load_or_create_workspace_id(
+        cls,
+        workspace: Path,
+        root: Path,
+        marker: Path,
+    ) -> str:
         if marker.exists() or marker.is_symlink():
-            return cls._read_workspace_id(marker)
+            workspace_id = cls._read_workspace_id(marker)
+            legacy_marker = cls._legacy_workspace_id_path(workspace)
+            if legacy_marker.exists() or legacy_marker.is_symlink():
+                legacy_workspace_id = cls._read_workspace_id(legacy_marker)
+                if legacy_workspace_id != workspace_id:
+                    raise RuntimeError(
+                        "workspace identity markers disagree; preserve both files and "
+                        "restore the correct identity before starting nanobot"
+                    )
+                cls._remove_legacy_workspace_id(legacy_marker)
+            return workspace_id
+
+        legacy_marker = cls._legacy_workspace_id_path(workspace)
+        if legacy_marker.exists() or legacy_marker.is_symlink():
+            workspace_id = cls._read_workspace_id(legacy_marker)
+            cls._write_text_atomic(marker, f"{workspace_id}\n")
+            cls._remove_legacy_workspace_id(legacy_marker)
+            return workspace_id
 
         recovered = cls._find_workspace_namespace(workspace, root)
         if recovered is not None:
@@ -736,8 +803,8 @@ class JsonlSessionStore:
         return workspace_id
 
     @classmethod
-    def _replace_workspace_id(cls, workspace: Path, workspace_id: str) -> None:
-        cls._write_text_atomic(cls._workspace_id_path(workspace), f"{workspace_id}\n")
+    def _replace_workspace_id(cls, marker: Path, workspace_id: str) -> None:
+        cls._write_text_atomic(marker, f"{workspace_id}\n")
 
     @classmethod
     def _write_workspace_marker(cls, sessions_dir: Path, workspace: Path) -> None:
@@ -749,6 +816,7 @@ class JsonlSessionStore:
         root: Path,
         workspace: Path,
         workspace_id: str,
+        workspace_id_path: Path,
     ) -> str:
         """Bind a stable workspace ID, rotating copied live workspaces apart."""
         for _attempt in range(3):
@@ -790,7 +858,7 @@ class JsonlSessionStore:
 
             # Both paths exist and are different: this is a copy, not a move.
             workspace_id = secrets.token_hex(16)
-            cls._replace_workspace_id(workspace, workspace_id)
+            cls._replace_workspace_id(workspace_id_path, workspace_id)
 
         raise RuntimeError(f"could not allocate an isolated session namespace for {workspace}")
 
@@ -938,6 +1006,77 @@ class JsonlSessionStore:
             return True
         except OSError:
             return False
+
+    def _import_legacy_cache(self, root: Path) -> None:
+        """Import the fork's flat cache once, retaining old absolute evidence paths.
+
+        Called under both migration and destination session locks. Never import
+        an arbitrary shared sessions root into the first workspace that opens it.
+        """
+        expected = get_workspace_cache_dir(self.workspace, create=False) / "sessions"
+        if root != expected.resolve(strict=False):
+            return
+        marker = self.sessions_dir / ".legacy-cache-imported"
+        if marker.exists() or not any(root.glob("*.jsonl")):
+            return
+        pending = [
+            path for path in root.iterdir()
+            if (path.is_file() and path.suffix == ".jsonl")
+            or path.name == ".transcripts"
+            or (path.is_dir() and not path.name.startswith(".")
+                and not _WORKSPACE_ID_RE.fullmatch(path.name))
+        ]
+        try:
+            while pending:
+                src = pending.pop()
+                if src.is_symlink() or getattr(src, "is_junction", lambda: False)():
+                    logger.warning("Skipping linked legacy cache entry: {}", src)
+                    continue
+                if src.is_dir():
+                    pending.extend(src.iterdir())
+                    continue
+                if not src.is_file() or src.suffix in {".lock", ".tmp"}:
+                    continue
+                relative = src.relative_to(root)
+                if src.parent == root:
+                    snapshot = self._session_file_snapshot(src)
+                    if snapshot is None:
+                        raise OSError(f"invalid or changing legacy session: {src}")
+                    with src.open(encoding="utf-8") as handle:
+                        metadata = _json_object(json.loads(handle.readline()))
+                    key = metadata.get("key")
+                    if metadata.get("_type") != "metadata" or not isinstance(key, str) or not key:
+                        raise OSError(f"legacy session has no valid key: {src}")
+                    relative = Path(f"{self.storage_key(key)}.jsonl")
+                else:
+                    before = src.stat(follow_symlinks=False)
+                    with src.open("rb") as handle:
+                        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                    snapshot = _SessionFileSnapshot(
+                        digest=digest, size=before.st_size, mtime_ns=before.st_mtime_ns,
+                        updated_at=before.st_mtime, device=before.st_dev, inode=before.st_ino,
+                    )
+                dst = self.sessions_dir / relative
+                if any(
+                    parent.is_symlink() or getattr(parent, "is_junction", lambda: False)()
+                    for parent in (dst, *dst.parents)
+                    if parent != self.sessions_dir and parent.is_relative_to(self.sessions_dir)
+                ):
+                    raise OSError(f"linked legacy cache destination: {dst}")
+                if dst.exists():
+                    # New-version data wins; the original remains available in root.
+                    continue
+                ensure_dir(dst.parent)
+                tmp = self._prepare_copy(src, dst.parent, snapshot)
+                try:
+                    os.replace(tmp, dst)
+                    self._fsync_directory(dst.parent)
+                finally:
+                    tmp.unlink(missing_ok=True)
+            self._write_text_atomic(marker, "Imported flat cache; originals retained.\n")
+        except (OSError, ValueError, TypeError) as exc:
+            # No completion marker: a later startup can retry after a failed copy.
+            logger.warning("Legacy cache import incomplete for {}: {}", self.workspace, exc)
 
     def _migrate_from_workspace(self, workspace: Path) -> None:
         """Durably copy legacy sessions out of the workspace, then remove the source."""
@@ -1756,11 +1895,17 @@ class SessionManager:
         *,
         store: SessionStore | None = None,
         sessions_root: Path | None = None,
+        workspace_state_root: Path | None = None,
     ):
         self.workspace = workspace
-        self._jsonl_store = JsonlSessionStore(workspace, sessions_root=sessions_root)
+        self._jsonl_store = JsonlSessionStore(
+            workspace,
+            sessions_root=sessions_root,
+            workspace_state_root=workspace_state_root,
+        )
         self._store: SessionStore = store if store is not None else self._jsonl_store
         self.sessions_dir = self._jsonl_store.sessions_dir
+        self.workspace_id_path = self._jsonl_store.workspace_id_path
         self.legacy_sessions_dir = self._jsonl_store.legacy_sessions_dir
         self._cache: OrderedDict[str, Session] = OrderedDict()
         # Preserve identity for sessions held by active callers without retaining idle ones.

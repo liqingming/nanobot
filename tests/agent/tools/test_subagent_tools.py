@@ -92,6 +92,36 @@ async def test_run_inline_returns_structured_error(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_inline_reports_iteration_limit_as_incomplete(tmp_path):
+    """Iteration exhaustion must not be announced as successful completion."""
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.agent.tools.registry import is_tool_error_result
+    from nanobot.bus.queue import MessageBus
+
+    manager = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    manager.runner.run = AsyncMock(return_value=AgentRunResult(
+        messages=[],
+        stop_reason="max_iterations",
+        final_content=None,
+        error=None,
+        tool_events=[],
+    ))
+
+    result = await manager.run_inline(
+        task=_task("review this"),
+        session_key="test:c1",
+        runtime=_runtime(MagicMock()),
+    )
+
+    assert "iteration limit" in result
+    assert is_tool_error_result(result)
+
+
+@pytest.mark.asyncio
 async def test_subagent_exec_tool_receives_allowed_env_keys(tmp_path):
     """allowed_env_keys from ExecToolConfig must be forwarded to the subagent's ExecTool."""
     from nanobot.agent.subagent import SubagentManager, SubagentStatus

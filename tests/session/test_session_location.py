@@ -1,4 +1,4 @@
-"""Session storage location: outside the agent workspace (ADR-0001)."""
+"""Session storage location and workspace identity behavior."""
 
 from __future__ import annotations
 
@@ -57,13 +57,14 @@ def test_sessions_are_stored_outside_workspace(tmp_path: Path) -> None:
     workspace_sessions = workspace / "sessions"
     assert not workspace_sessions.exists() or not any(workspace_sessions.glob("*.jsonl"))
 
-    # The out-of-workspace store records which workspace it belongs to and the
-    # workspace carries only a non-secret stable identity marker.
+    # The out-of-workspace store records which workspace it belongs to and keeps
+    # the stable identity marker outside the project too.
     marker = manager.sessions_dir / ".workspace"
     assert marker.read_text(encoding="utf-8").strip() == str(workspace.resolve())
-    workspace_id = (workspace / ".nanobot" / "workspace-id").read_text(encoding="utf-8").strip()
+    workspace_id = manager.workspace_id_path.read_text(encoding="utf-8").strip()
     assert manager.sessions_dir.name == workspace_id
     assert manager.sessions_dir.parent.name == "sessions"
+    assert not (workspace / ".nanobot").exists()
 
     # And it must still round-trip through a fresh manager for the same workspace.
     reloaded = SessionManager(workspace=workspace).get_or_create("telegram:1")
@@ -78,9 +79,10 @@ def test_workspace_identity_marker_contains_no_session_content(tmp_path: Path) -
     session.add_message("user", secret)
     manager.save(session)
 
-    marker = workspace / ".nanobot" / "workspace-id"
+    marker = manager.workspace_id_path
     assert marker.read_text(encoding="utf-8").strip() == manager.sessions_dir.name
     assert secret not in marker.read_text(encoding="utf-8")
+    assert not (workspace / ".nanobot").exists()
     assert not any(
         secret in path.read_text(encoding="utf-8")
         for path in workspace.rglob("*")
@@ -120,33 +122,50 @@ def test_sessions_follow_active_custom_config_data_root(
     manager = SessionManager(
         workspace=tmp_path / "workspace-b",
         sessions_root=data_dir / "sessions",
+        workspace_state_root=data_dir,
     )
     session = manager.get_or_create("telegram:custom")
     session.add_message("user", "custom-instance")
     manager.save(session)
 
     assert manager.sessions_dir.parent == custom_instance / "sessions"
+    assert manager.workspace_id_path == custom_instance / "workspace-id"
     assert manager._get_session_path(session.key).exists()
     assert not (default_home / ".nanobot" / "sessions").exists()
 
 
-def test_session_root_inside_workspace_fails_closed(tmp_path: Path) -> None:
+def test_session_root_inside_workspace_is_allowed(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
+    sessions_root = workspace / ".nanobot" / "sessions"
 
-    with pytest.raises(RuntimeError, match="must be outside the agent workspace"):
-        SessionManager(workspace=workspace, sessions_root=workspace / "sessions")
+    manager = SessionManager(workspace=workspace, sessions_root=sessions_root)
+    session = manager.get_or_create("cli:direct")
+    session.add_message("user", "in-workspace session")
+    manager.save(session)
+
+    reloaded = SessionManager(workspace=workspace, sessions_root=sessions_root)
+    assert reloaded.get_or_create("cli:direct").messages[-1]["content"] == "in-workspace session"
 
 
 def test_workspace_move_preserves_session_identity(tmp_path: Path) -> None:
     original = tmp_path / "project-old"
-    manager = SessionManager(workspace=original)
+    topic_cache = tmp_path / "topic-cache"
+    manager = SessionManager(
+        workspace=original,
+        sessions_root=topic_cache / "sessions",
+        workspace_state_root=topic_cache,
+    )
     session = manager.get_or_create("telegram:1")
     session.add_message("user", "survives-move")
     manager.save(session)
 
     moved = tmp_path / "project-new"
     original.rename(moved)
-    reloaded = SessionManager(workspace=moved)
+    reloaded = SessionManager(
+        workspace=moved,
+        sessions_root=topic_cache / "sessions",
+        workspace_state_root=topic_cache,
+    )
 
     assert reloaded.sessions_dir == manager.sessions_dir
     assert reloaded.get_or_create("telegram:1").messages[-1]["content"] == "survives-move"
@@ -162,14 +181,13 @@ def test_deleted_workspace_identity_marker_is_recovered(tmp_path: Path) -> None:
     session.add_message("user", "survives-cleanup")
     manager.save(session)
 
-    shutil.rmtree(workspace / ".nanobot")
+    manager.workspace_id_path.unlink()
     reloaded = SessionManager(workspace=workspace)
 
     assert reloaded.sessions_dir == manager.sessions_dir
     assert reloaded.get_or_create("telegram:1").messages[-1]["content"] == "survives-cleanup"
-    assert (workspace / ".nanobot" / "workspace-id").read_text(encoding="utf-8").strip() == (
-        manager.sessions_dir.name
-    )
+    assert reloaded.workspace_id_path.read_text(encoding="utf-8").strip() == manager.sessions_dir.name
+    assert not (workspace / ".nanobot").exists()
 
 
 def test_copied_workspace_gets_isolated_session_identity(tmp_path: Path) -> None:
@@ -186,9 +204,55 @@ def test_copied_workspace_gets_isolated_session_identity(tmp_path: Path) -> None
 
     assert copied_manager.sessions_dir != manager.sessions_dir
     assert copied_manager.get_or_create("telegram:1").messages == []
-    assert (copied / ".nanobot" / "workspace-id").read_text(encoding="utf-8") != (
-        original / ".nanobot" / "workspace-id"
-    ).read_text(encoding="utf-8")
+    assert copied_manager.workspace_id_path.read_text(encoding="utf-8") != (
+        manager.workspace_id_path.read_text(encoding="utf-8")
+    )
+    assert not (original / ".nanobot").exists()
+    assert not (copied / ".nanobot").exists()
+
+
+def test_legacy_workspace_identity_is_moved_to_topic_cache(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    legacy_marker = workspace / ".nanobot" / "workspace-id"
+    legacy_marker.parent.mkdir(parents=True)
+    workspace_id = uuid.uuid4().hex
+    legacy_marker.write_text(f"{workspace_id}\n", encoding="utf-8")
+    topic_cache = tmp_path / "topic-cache"
+
+    manager = SessionManager(
+        workspace=workspace,
+        sessions_root=topic_cache / "sessions",
+        workspace_state_root=topic_cache,
+    )
+
+    assert manager.workspace_id_path == topic_cache / "workspace-id"
+    assert manager.workspace_id_path.read_text(encoding="utf-8").strip() == workspace_id
+    assert manager.sessions_dir.name == workspace_id
+    assert not legacy_marker.exists()
+    assert not (workspace / ".nanobot").exists()
+
+
+def test_matching_legacy_identity_is_cleaned_after_interrupted_migration(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    topic_cache = tmp_path / "topic-cache"
+    manager = SessionManager(
+        workspace=workspace,
+        sessions_root=topic_cache / "sessions",
+        workspace_state_root=topic_cache,
+    )
+    legacy_marker = workspace / ".nanobot" / "workspace-id"
+    legacy_marker.parent.mkdir(parents=True)
+    legacy_marker.write_text(manager.workspace_id_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    restarted = SessionManager(
+        workspace=workspace,
+        sessions_root=topic_cache / "sessions",
+        workspace_state_root=topic_cache,
+    )
+
+    assert restarted.sessions_dir == manager.sessions_dir
+    assert not legacy_marker.exists()
+    assert not (workspace / ".nanobot").exists()
 
 
 def test_equivalent_workspace_paths_share_one_store(tmp_path: Path) -> None:

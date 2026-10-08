@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -31,6 +32,7 @@ _STRIP_SKILL_FRONTMATTER = re.compile(
 )
 _SKILL_NAME = re.compile(r"^(?!.*--)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _SKILL_REFERENCE = re.compile(r"(?<![\w$])\$([A-Za-z0-9_-]+)")
+_METADATA_STAT_TTL_SECONDS = 5.0
 
 
 def parse_skill_metadata(content: str) -> dict[str, object] | None:
@@ -95,6 +97,47 @@ class SkillsLoader:
         # fresh read + yaml.safe_load on every call, and build_skills_summary /
         # list_skills / the per-turn skill-match hint invoke it per skill.
         self._meta_cache: dict[str, tuple[float, dict | None]] = {}
+        # A system prompt asks for the same metadata several times in quick
+        # succession. On Windows, even cached Path.stat()/is_file() calls are
+        # expensive enough to add hundreds of milliseconds per message. Keep
+        # mtime-based invalidation, but coalesce freshness checks briefly.
+        self._meta_checked_at: dict[str, float] = {}
+        # Populated by list_skills before metadata/availability checks. Without
+        # this index, each skill metadata lookup recursively rescans every root,
+        # turning prompt construction into O(skill_count�) filesystem work.
+        self._skill_path_cache: dict[str, Path] = {}
+        self._skill_list_cache: tuple[
+            tuple[tuple[str, int | None], ...],
+            list[dict[str, str]],
+        ] | None = None
+        self._skill_roots_signature_cache: tuple[tuple[str, int | None], ...] | None = None
+        self._skill_roots_checked_at = 0.0
+        self._bin_availability_cache: dict[str, tuple[str | None, bool]] = {}
+
+    def _skill_roots_signature(self) -> tuple[tuple[str, int | None], ...]:
+        """Track inventory changes without recursively rescanning every skill."""
+        now = time.monotonic()
+        if (
+            self._skill_roots_signature_cache is not None
+            and now - self._skill_roots_checked_at < _METADATA_STAT_TTL_SECONDS
+        ):
+            return self._skill_roots_signature_cache
+        roots = [
+            *(root for _source, root in self.extra_skill_roots),
+            self.workspace_skills,
+            self.builtin_skills,
+        ]
+        signature: list[tuple[str, int | None]] = []
+        for root in roots:
+            try:
+                modified = root.stat().st_mtime_ns
+            except OSError:
+                modified = None
+            signature.append((str(root), modified))
+        result = tuple(signature)
+        self._skill_roots_signature_cache = result
+        self._skill_roots_checked_at = now
+        return result
 
     def _skill_aliases(self) -> dict[str, str]:
         """Return compatibility aliases owned by installed CLI Apps."""
@@ -133,40 +176,54 @@ class SkillsLoader:
         """
         from nanobot.agent.plugins import enabled_agent_plugin_skills
 
-        skills: list[dict[str, str]] = []
-        seen_names: set[str] = set()
-        for source, root in self.extra_skill_roots:
-            entries = self._skill_entries_from_dir(root, source, skip_names=seen_names)
+        signature = self._skill_roots_signature()
+        cached = self._skill_list_cache
+        if cached is not None and cached[0] == signature:
+            skills = [dict(skill) for skill in cached[1]]
+        else:
+            skills = []
+            seen_names: set[str] = set()
+            for source, root in self.extra_skill_roots:
+                entries = self._skill_entries_from_dir(root, source, skip_names=seen_names)
+                skills.extend(entries)
+                seen_names.update(entry["name"] for entry in entries)
+
+            entries = self._skill_entries_from_dir(
+                self.workspace_skills, "workspace", skip_names=seen_names,
+            )
             skills.extend(entries)
             seen_names.update(entry["name"] for entry in entries)
+            plugin_skills = enabled_agent_plugin_skills(self.workspace)
+            for name, path in plugin_skills:
+                if name in seen_names:
+                    continue
+                skills.append(
+                    {
+                        "name": name,
+                        "path": str(path),
+                        "source": "plugin",
+                    }
+                )
+                seen_names.add(name)
+            if self.builtin_skills and self.builtin_skills.exists():
+                skills.extend(
+                    self._skill_entries_from_dir(
+                        self.builtin_skills, "builtin", skip_names=seen_names,
+                    )
+                )
 
-        entries = self._skill_entries_from_dir(self.workspace_skills, "workspace", skip_names=seen_names)
-        skills.extend(entries)
-        seen_names.update(entry["name"] for entry in entries)
-        plugin_skills = enabled_agent_plugin_skills(self.workspace)
-        for name, path in plugin_skills:
-            if name in seen_names:
-                continue
-            skills.append(
-                {
-                    "name": name,
-                    "path": str(path),
-                    "source": "plugin",
-                }
-            )
-            seen_names.add(name)
-        if self.builtin_skills and self.builtin_skills.exists():
-            skills.extend(
-                self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=seen_names)
-            )
+            if self.disabled_skills:
+                disabled = set(self.disabled_skills)
+                for legacy, canonical in self._skill_aliases().items():
+                    if legacy in disabled or canonical in disabled:
+                        disabled.update((legacy, canonical))
+                skills = [s for s in skills if s["name"] not in disabled]
+            self._skill_list_cache = (signature, [dict(skill) for skill in skills])
 
-        if self.disabled_skills:
-            disabled = set(self.disabled_skills)
-            for legacy, canonical in self._skill_aliases().items():
-                if legacy in disabled or canonical in disabled:
-                    disabled.update((legacy, canonical))
-            skills = [s for s in skills if s["name"] not in disabled]
-
+        self._skill_path_cache = {
+            skill["name"]: Path(skill["path"])
+            for skill in skills
+        }
         if filter_unavailable:
             return [skill for skill in skills if self._check_requirements(self._get_skill_meta(skill["name"]))]
         return skills
@@ -196,6 +253,9 @@ class SkillsLoader:
         return "\n".join(lines)
 
     def _resolve_skill_path(self, name: str) -> Path | None:
+        cached = self._skill_path_cache.get(name)
+        if cached is not None:
+            return cached
         skills = self.list_skills(filter_unavailable=False)
         available = {entry["name"] for entry in skills}
         resolved = name if name in available else self._skill_aliases().get(name, name)
@@ -347,7 +407,7 @@ class SkillsLoader:
         """Get a description of missing requirements."""
         required_bins, required_env_vars = self._requirement_lists(skill_meta)
         return ", ".join(
-            [f"CLI: {command_name}" for command_name in required_bins if not shutil.which(command_name)]
+            [f"CLI: {command_name}" for command_name in required_bins if not self._has_required_bin(command_name)]
             + [f"ENV: {env_name}" for env_name in required_env_vars if not os.environ.get(env_name)]
         )
 
@@ -363,7 +423,7 @@ class SkillsLoader:
         return {
             "bins": bins,
             "env": env,
-            "missing_bins": [value for value in bins if not shutil.which(value)],
+            "missing_bins": [value for value in bins if not self._has_required_bin(value)],
             "missing_env": [value for value in env if not os.environ.get(value)],
         }
 
@@ -404,10 +464,20 @@ class SkillsLoader:
         payload = data_object.get("nanobot", data_object.get("openclaw", {}))
         return cast(dict[str, Any], payload) if isinstance(payload, dict) else {}
 
+    def _has_required_bin(self, command_name: str) -> bool:
+        """Reuse command availability until PATH itself changes."""
+        path_value = os.environ.get("PATH")
+        cached = self._bin_availability_cache.get(command_name)
+        if cached is not None and cached[0] == path_value:
+            return cached[1]
+        available = shutil.which(command_name) is not None
+        self._bin_availability_cache[command_name] = (path_value, available)
+        return available
+
     def _check_requirements(self, skill_meta: dict[str, Any]) -> bool:
         """Check if skill requirements are met (bins, env vars)."""
         required_bins, required_env_vars = self._requirement_lists(skill_meta)
-        return all(shutil.which(cmd) for cmd in required_bins) and all(
+        return all(self._has_required_bin(cmd) for cmd in required_bins) and all(
             os.environ.get(var) for var in required_env_vars
         )
 
@@ -446,11 +516,21 @@ class SkillsLoader:
         path = self._resolve_skill_path(name)
         if path is None:
             return None
+        cached = self._meta_cache.get(name)
+        now = time.monotonic()
+        if (
+            cached is not None
+            and now - self._meta_checked_at.get(name, 0.0) < _METADATA_STAT_TTL_SECONDS
+        ):
+            return cached[1]
         try:
             mtime = path.stat().st_mtime
         except OSError:
+            self._meta_cache.pop(name, None)
+            self._meta_checked_at.pop(name, None)
+            self._skill_path_cache.pop(name, None)
             return None
-        cached = self._meta_cache.get(name)
+        self._meta_checked_at[name] = now
         if cached is not None and cached[0] == mtime:
             return cached[1]
         meta = self._parse_skill_metadata(path)

@@ -1,7 +1,9 @@
 """Direct unit tests for AutoCompact class methods in isolation."""
 
+import asyncio
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -12,6 +14,14 @@ from nanobot.session.manager import Session, SessionManager
 
 def _runtime(_session: Session | None = None):
     return MagicMock(name="runtime")
+
+
+def _pressure_runtime():
+    return SimpleNamespace(
+        provider=object(),
+        context_window_tokens=100_000,
+        generation=SimpleNamespace(max_tokens=10_000),
+    )
 
 
 def _make_session(
@@ -97,6 +107,51 @@ class TestInit:
         mock_c = MagicMock()
         ac = _make_autocompact(consolidator=mock_c)
         assert ac.consolidator is mock_c
+
+
+class TestPostTurnPressure:
+    async def test_foreground_work_can_cancel_pressure_task(self):
+        ac = _make_autocompact()
+        task = asyncio.create_task(asyncio.sleep(60))
+        ac._pressure_tasks["cli:test"] = task
+
+        ac.cancel_pressure("cli:test")
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert task.cancelled()
+        assert "cli:test" not in ac._pressure_tasks
+
+    async def test_below_high_water_does_not_compact(self):
+        session = _make_session(messages=[{"role": "user", "content": "hello"}])
+        sessions = MagicMock(spec=SessionManager)
+        sessions.get_or_create.return_value = session
+        consolidator = MagicMock()
+        consolidator.estimate_session_prompt_tokens.return_value = (70_000, "test")
+        consolidator.compact_idle_session = AsyncMock(return_value="Summary.")
+        ac = _make_autocompact(sessions=sessions, consolidator=consolidator)
+
+        await ac._archive_if_pressure("cli:test", runtime=_pressure_runtime())
+
+        consolidator.compact_idle_session.assert_not_awaited()
+        assert "cli:test" not in ac._archiving
+
+    async def test_above_high_water_compacts_after_turn(self):
+        session = _make_session(messages=[{"role": "user", "content": "hello"}])
+        sessions = MagicMock(spec=SessionManager)
+        sessions.get_or_create.return_value = session
+        consolidator = MagicMock()
+        consolidator.estimate_session_prompt_tokens.return_value = (85_000, "test")
+        consolidator.compact_idle_session = AsyncMock(return_value="Summary.")
+        ac = _make_autocompact(sessions=sessions, consolidator=consolidator)
+
+        await ac._archive_if_pressure("cli:test", runtime=_pressure_runtime())
+
+        consolidator.compact_idle_session.assert_awaited_once_with(
+            "cli:test",
+            runtime=ANY,
+            events=NO_EVENTS,
+        )
+        assert "cli:test" not in ac._archiving
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +592,27 @@ class TestArchiveDelegates:
         await ac._archive("cli:test", runtime=_runtime())
 
         assert "cli:test" not in ac._archiving
+
+    @pytest.mark.asyncio
+    async def test_archive_waits_for_foreground_session_lock(self):
+        ac = _make_autocompact()
+        lock = asyncio.Lock()
+        ac._session_lock_factory = lambda _key: lock
+        ac._archiving.add("cli:test")
+
+        await lock.acquire()
+        task = asyncio.create_task(ac._archive("cli:test", runtime=_runtime()))
+        await asyncio.sleep(0)
+
+        ac.consolidator.compact_idle_session.assert_not_awaited()
+        assert "cli:test" in ac._archiving
+
+        lock.release()
+        await task
+
+        ac.consolidator.compact_idle_session.assert_awaited_once()
+        assert "cli:test" not in ac._archiving
+
 
 
 # ---------------------------------------------------------------------------

@@ -276,6 +276,133 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
 
 
 @pytest.mark.asyncio
+async def test_runner_reanchors_current_turn_objective_after_tool_execution():
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+    captured_second_call: list[dict] = []
+    call_count = 0
+
+    async def chat_stream_with_retry(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="list_dir",
+                        arguments={"path": "."},
+                    )
+                ],
+            )
+        captured_second_call[:] = kwargs["messages"]
+        return LLMResponse(content="built the final exe")
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="existing old exe")
+
+    result = await AgentRunner().run(make_run_spec(
+        provider,
+        initial_messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "previous coroutine task"},
+            {"role": "assistant", "content": "previous coroutine answer"},
+            {"role": "user", "content": "build the final exe"},
+        ],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        turn_objective="build the final exe",
+    ))
+
+    anchors = [
+        message["content"]
+        for message in captured_second_call
+        if message.get("role") == "user"
+        and isinstance(message.get("content"), str)
+        and "[Runtime current-turn objective" in message["content"]
+    ]
+    assert len(anchors) == 1
+    assert "build the final exe" in anchors[0]
+    assert "Do not restore an earlier turn's todo list" in anchors[0]
+    assert not any(
+        "[Runtime current-turn objective" in str(message.get("content"))
+        for message in result.messages
+    )
+    assert result.final_content == "built the final exe"
+
+
+@pytest.mark.asyncio
+async def test_turn_objective_anchor_is_retained_once_across_compacted_iterations():
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+    captured_calls: list[list[dict]] = []
+    call_count = 0
+
+    async def chat_stream_with_retry(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        captured_calls.append(list(kwargs["messages"]))
+        if call_count < 3:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id=f"call_{call_count}",
+                        name="list_dir",
+                        arguments={"path": f"./{call_count}"},
+                    )
+                ],
+            )
+        return LLMResponse(content="done")
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="tool result")
+    transcript = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old task"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "build the final exe"},
+    ]
+
+    result = await AgentRunner().run(make_run_spec(
+        provider,
+        initial_messages=None,
+        transcript_input=TranscriptInput(
+            history=transcript[1:3],
+            current_message="build the final exe",
+        ),
+        transcript_builder=lambda _input: list(transcript),
+        consolidate_history=AsyncMock(return_value=None),
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        turn_objective="build the final exe",
+    ))
+
+    for request in captured_calls[1:]:
+        anchors = [
+            message
+            for message in request
+            if "[Runtime current-turn objective" in str(message.get("content"))
+        ]
+        assert len(anchors) == 1
+    assert not any(
+        "[Runtime current-turn objective" in str(message.get("content"))
+        for message in result.messages
+    )
+
+
+@pytest.mark.asyncio
 async def test_runner_replays_provider_state_without_chat_projection_duplicates():
     from nanobot.agent.runner import AgentRunner
 

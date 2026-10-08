@@ -403,7 +403,7 @@ class SubagentManager:
             raise
         try:
             result = await inline_task
-            if status.phase == "error" or status.stop_reason == "error":
+            if status.phase == "error" or status.stop_reason in {"error", "tool_error", "max_iterations"}:
                 return ToolResult.error(result)
             return result
         finally:
@@ -511,13 +511,16 @@ class SubagentManager:
                     context_strategy=self.context_strategy,
                     fail_on_tool_error=self.fail_on_tool_error,
                     hook=_SubagentHook(task_id, status),
-                    max_iterations_message="Task completed but no final response was generated.",
+                    max_iterations_message=(
+                        "Task stopped after reaching its iteration limit before completion."
+                    ),
                     finalize_on_max_iterations=False,
                     error_message=None,
                     checkpoint_callback=_on_checkpoint,
                     session_key=sess_key,
                     event_logger=diagnostics,
                     turn_id=diagnostics.turn_id,
+                    turn_objective=task,
                     workspace=root,
                     data_dir=self.data_dir,
                     llm_timeout_s=self._llm_wall_timeout_for_session(sess_key) if self._llm_wall_timeout_for_session else None,
@@ -530,12 +533,19 @@ class SubagentManager:
                 if token is not None:
                     reset_workspace_scope(token)
                 reset_request_context(request_token)
-            status.phase = "done"
             status.stop_reason = result.stop_reason
-            outcome = "error" if result.stop_reason in {"error", "tool_error"} else "completed"
+            failed = result.stop_reason in {"error", "tool_error", "max_iterations"}
+            status.phase = "error" if failed else "done"
+            outcome = "error" if failed else "completed"
 
-            if result.stop_reason == "error":
-                final_result = result.error or "Error: subagent execution failed."
+            if failed:
+                if result.stop_reason == "max_iterations":
+                    final_result = (
+                        result.final_content
+                        or "Error: subagent reached its iteration limit before completion."
+                    )
+                else:
+                    final_result = result.error or "Error: subagent execution failed."
                 final_status = "error"
             else:
                 final_result = result.final_content or "Task completed but no final response was generated."

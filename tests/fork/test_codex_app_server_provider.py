@@ -37,6 +37,7 @@ from nanobot.fork.providers.codex_app_server_provider import (
 )
 from nanobot.providers.base import ToolCallRequest
 from nanobot.providers.factory import make_provider
+from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 from nanobot.security.workspace_access import (
     bind_workspace_scope,
     build_workspace_scope,
@@ -2080,7 +2081,7 @@ async def test_concurrent_turn_keys_use_independent_protocol_sessions(tmp_path: 
     assert provider._turns == {}
 
 
-def test_factory_routes_openai_codex_to_fork_without_eager_binary_lookup() -> None:
+def test_factory_defaults_to_nanobot_owned_codex_context() -> None:
     config = Config.model_validate(
         {
             "agents": {
@@ -2092,8 +2093,28 @@ def test_factory_routes_openai_codex_to_fork_without_eager_binary_lookup() -> No
         }
     )
     provider = make_provider(config)
+    assert isinstance(provider, OpenAICodexProvider)
+    assert provider.supports_request_context is False
+    assert provider.supports_native_compaction() is False
+    assert provider.can_resume_conversation_state(object()) is False
+
+
+def test_factory_keeps_codex_native_context_as_explicit_opt_in() -> None:
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "openai-codex",
+                    "model": "openai-codex/gpt-5.6-sol",
+                }
+            },
+            "providers": {
+                "openai_codex": {"useNativeContext": True},
+            },
+        }
+    )
+    provider = make_provider(config)
     assert isinstance(provider, CodexAppServerProvider)
-    assert provider.__class__.__name__ == "OpenAICodexProvider"
     assert provider._app_server_command is None
 
 

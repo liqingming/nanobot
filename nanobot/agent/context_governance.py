@@ -22,7 +22,7 @@ from loguru import logger
 from nanobot.agent.context import TranscriptInput
 from nanobot.events import NO_EVENTS, ContextCompactionEvent, EventSink
 from nanobot.fork.agent.context_budget import ContextBudgetError, resolve_context_budget
-from nanobot.fork.agent.native_context import uses_native_context
+from nanobot.fork.agent.native_context import NativeContextPreparation, uses_native_context
 from nanobot.fork.agent.recovery_packet import RecoveryPacketError
 from nanobot.fork.agent.summary_transaction import SummaryTransactionError
 from nanobot.fork.agent.tool_evidence import (
@@ -152,6 +152,8 @@ class ContextGovernanceConfig:
     context_strategy: str = "legacy"
     context_block_limit: int | None = None
     inflight_start_index: int = 0
+    blocking_compaction_trigger_ratio: float = 0.95
+    blocking_compaction_target_ratio: float = 0.25
 
 
 @dataclass(slots=True)
@@ -236,6 +238,21 @@ class ModelRequestState:
     events: EventSink = NO_EVENTS
     governance_state_reader: Callable[[], Any] | None = None
     transaction: TransactionalContextPreparation | None = None
+    native_preparation: NativeContextPreparation | None = None
+    tool_digests: dict[str, ToolDigest] | None = None
+
+    def accept_request(
+        self,
+        model_messages: list[dict[str, Any]],
+        *,
+        raw_boundary: int,
+    ) -> None:
+        """Advance all context layers from the same accepted request boundary."""
+        if self.compaction is None:
+            return
+        self.compaction.accept_request(model_messages, raw_boundary=raw_boundary)
+        if self.transaction is not None:
+            self.transaction.rebase(model_messages)
 
 
 class ContextGovernor:
@@ -367,7 +384,7 @@ class ContextGovernor:
         *,
         tool_digests: dict[str, ToolDigest] | None = None,
     ) -> list[dict[str, Any]]:
-        if config.context_strategy == "transactional":
+        if config.context_strategy == "transactional" and not uses_native_context(config.provider):
             TransactionalContextPreparation._validate_pairs(messages)
             return self.apply_tool_result_budget(config, messages)
         updated = self.strip_placeholder_assistant_messages(messages)
@@ -562,6 +579,7 @@ class ContextGovernor:
         pressure: tuple[int, str],
         *,
         tool_definitions: list[dict[str, Any]] | None,
+        transactional_projection: bool = False,
     ) -> list[dict[str, Any]]:
         """Replace accepted history H with a checkpoint while preserving delta."""
         measured, _source = pressure
@@ -571,10 +589,24 @@ class ContextGovernor:
         )
         try:
             delta_messages = compaction.delta_after_accepted(messages)
-            consolidation_prefix = self.prepare_messages_for_model(
-                state.config,
-                compaction.accepted_messages,
-            )
+            transaction = None
+            if transactional_projection:
+                # A transactional projection is intentionally turn-local.  Reduce
+                # an oversized accepted prefix in bounded batches first, then turn
+                # that projection into the durable recap used by later turns.
+                transaction = TransactionalContextPreparation(
+                    state.governance_state_reader,
+                    local_summary_only=True,
+                )
+                consolidation_prefix = await transaction.prepare(
+                    state.config,
+                    compaction.accepted_messages,
+                )
+            else:
+                consolidation_prefix = self.prepare_messages_for_model(
+                    state.config,
+                    compaction.accepted_messages,
+                )
             summary = await compaction.consolidate_history(
                 deepcopy(consolidation_prefix),
                 compaction.active_summary,
@@ -610,6 +642,12 @@ class ContextGovernor:
                 summary=summary,
                 transcript_boundary=compaction.raw_accepted_boundary,
             )
+            if transaction is not None:
+                # Continue the current tool loop from the recap immediately.  The
+                # raw transcript remains available for persistence and audit, while
+                # subsequent requests append only the post-checkpoint delta.
+                transaction.rebase(prepared)
+                state.transaction = transaction
         except (Exception, asyncio.CancelledError) as exc:
             await state.events.emit(
                 ContextCompactionEvent(
@@ -637,12 +675,96 @@ class ContextGovernor:
         """Prepare, compact or fit, and record the exact provider payload."""
         native_context = uses_native_context(state.config.provider)
         transactional = validate_strategy(state.config.context_strategy) == "transactional" and not native_context
-        if transactional:
+        if native_context:
+            if state.native_preparation is None:
+                state.native_preparation = NativeContextPreparation(self)
+            # Freeze the initial projection; only govern new evidence on continuation.
+            prepared = state.native_preparation.prepare_for_model(
+                state.config, messages, set(), tool_digests=state.tool_digests,
+            )
+        elif transactional:
             if state.transaction is None:
                 state.transaction = TransactionalContextPreparation(state.governance_state_reader)
             # Keep the full source prefix stable; the transaction only replaces model copies.
-            prepared = await state.transaction.prepare(state.config, messages)
-            prepared = self.ensure_request_fits(state.config, prepared, tool_definitions=tool_definitions)
+            needs_compaction = state.transaction.needs_compaction(state.config, messages)
+            if needs_compaction and state.compaction is not None:
+                measured, source = estimate_prompt_tokens_chain(
+                    state.config.provider,
+                    state.config.model,
+                    messages,
+                    tool_definitions,
+                )
+                try:
+                    prepared = await self._compact_request_history(
+                        state,
+                        state.compaction,
+                        messages,
+                        (measured, source),
+                        tool_definitions=tool_definitions,
+                        transactional_projection=True,
+                    )
+                except (
+                    EvidencePersistenceError,
+                    RecoveryPacketError,
+                    SummaryTransactionError,
+                    ContextBudgetError,
+                    ContextWindowExceededError,
+                ) as exc:
+                    # A durable recap is preferred, but failure must not make an
+                    # otherwise safe in-turn projection unavailable.
+                    logger.warning(
+                        "Durable transactional checkpoint skipped; using the current-turn "
+                        "projection: {}",
+                        exc,
+                    )
+                    prepared = await state.transaction.prepare(state.config, messages)
+                    prepared = self.ensure_request_fits(
+                        state.config,
+                        prepared,
+                        tool_definitions=tool_definitions,
+                    )
+            else:
+                compaction_id = uuid4().hex if needs_compaction else None
+                if compaction_id is not None:
+                    await state.events.emit(
+                        ContextCompactionEvent(compaction_id=compaction_id, phase="started"),
+                    )
+                try:
+                    prepared = await state.transaction.prepare(state.config, messages)
+                    prepared = self.ensure_request_fits(
+                        state.config, prepared, tool_definitions=tool_definitions,
+                    )
+                except asyncio.CancelledError:
+                    if compaction_id is not None:
+                        await state.events.emit(
+                            ContextCompactionEvent(compaction_id=compaction_id, phase="cancelled"),
+                        )
+                    raise
+                except (
+                    EvidencePersistenceError, RecoveryPacketError,
+                    SummaryTransactionError, ContextBudgetError,
+                ) as exc:
+                    if compaction_id is not None:
+                        await state.events.emit(
+                            ContextCompactionEvent(compaction_id=compaction_id, phase="failed"),
+                        )
+                    # A proactive summary is an optimization, not a prerequisite for
+                    # an otherwise valid request. Preserve strict pair validation,
+                    # then keep the last complete projection when it still fits the
+                    # hard provider budget.
+                    TransactionalContextPreparation._validate_pairs(messages)
+                    try:
+                        prepared = self.ensure_request_fits(
+                            state.config, messages, tool_definitions=tool_definitions,
+                        )
+                    except ContextWindowExceededError:
+                        raise exc
+                    logger.warning("Transactional compaction skipped under soft pressure: {}", exc)
+                else:
+                    if compaction_id is not None:
+                        await state.events.emit(
+                            ContextCompactionEvent(compaction_id=compaction_id, phase="succeeded"),
+                        )
         else:
             try:
                 prepared = self.prepare_messages_for_model(state.config, messages)

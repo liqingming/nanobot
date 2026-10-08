@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nanobot.agent.context import TranscriptInput
 from nanobot.agent.context_governance import ContextGovernanceConfig, ContextGovernor
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.fork.agent.native_context import NativeContextPreparation, uses_native_context
@@ -640,5 +641,56 @@ async def test_pinned_request_is_included_in_initial_budget(tmp_path, monkeypatc
         assert "exceeds local budget" in response.content
         assert not response.error_should_retry
         assert not capture.exists()
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.parametrize("strategy", ["legacy", "transactional"])
+async def test_runner_native_large_history_is_bounded_once_and_prefix_stays_stable(tmp_path, strategy):
+    from tests.fork.test_native_read_visibility import _history
+
+    provider, capture = _provider(tmp_path)
+    # Use the same deterministic accounting for the preparation and provider gate.
+    provider.estimate_prompt_tokens = lambda messages, tools, model: (
+        sum(len(str(m.get("content", ""))) // 4 + 8 for m in messages), "test",
+    )
+    initial = _history(140, 8000)
+    original = deepcopy(initial)
+    assert provider.estimate_prompt_tokens(initial, [], "test")[0] > 258400
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="needed fresh evidence " * 100)
+    consolidate = AsyncMock(side_effect=AssertionError("native history belongs to provider"))
+    requests = []
+    original_chat = provider.chat_stream_with_retry
+
+    async def chat(**kwargs):
+        requests.append(deepcopy(kwargs["messages"]))
+        return await original_chat(**kwargs)
+
+    provider.chat_stream_with_retry = chat
+    try:
+        result = await AgentRunner(provider).run(AgentRunSpec(
+            initial_messages=None,
+            transcript_input=TranscriptInput(history=initial[1:-1], current_message="continue"),
+            transcript_builder=lambda inputs: [initial[0], *inputs.history,
+                                               {"role": "user", "content": inputs.current_message}],
+            consolidate_history=consolidate,
+            tools=tools, model="test", max_iterations=10, max_tool_result_chars=16000,
+            context_window_tokens=272000, max_tokens=128000, context_strategy=strategy,
+            session_key="topic", turn_id="turn", workspace=tmp_path, data_dir=tmp_path,
+        ))
+        assert result.final_content == "done"
+        assert len(requests) == 8
+        assert len(requests[0]) == len(initial)
+        assert provider.estimate_prompt_tokens(requests[0], [], "test")[0] < 258400
+        for previous, current in zip(requests, requests[1:]):
+            assert current[:len(previous)] == previous
+        assert initial == original
+        assert result.messages[:len(original)] == original
+        consolidate.assert_not_called()
+        rpc = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        assert sum(m.get("method") == "thread/start" for m in rpc) == 1
+        assert tools.execute.await_count == 7
     finally:
         await provider.aclose()

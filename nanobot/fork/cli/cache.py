@@ -25,8 +25,8 @@ def cache_migrate(
     old = Path(old_path).expanduser().resolve()
     new = Path(new_path).expanduser().resolve()
 
-    old_cache = get_workspace_cache_dir(old)
-    new_cache = get_workspace_cache_dir(new)
+    old_cache = get_workspace_cache_dir(old, create=False)
+    new_cache = get_workspace_cache_dir(new, create=False)
 
     if old_cache == new_cache:
         console.print("[yellow]Both paths resolve to the same cache directory — nothing to do.[/yellow]")

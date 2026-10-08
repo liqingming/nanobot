@@ -5,7 +5,7 @@ Fork additions (kept in core so pydantic can validate):
     ``tui_skin_enabled``, ``promote_pending_on_restart`` — fork self-learning / TUI / consolidation
     knobs. (``pending_promote_threshold_chars`` removed after upstream
     Consolidator+Dream merge made it obsolete.)
-  * ``AgentDefaults.max_tool_iterations`` default 40 → 1000.
+  * Ordinary and sustained-goal turns use separate iteration budgets.
   * ``ProvidersConfig.claude_ai`` — fork claude.ai OAuth provider entry.
 """
 from __future__ import annotations
@@ -146,7 +146,8 @@ class AgentDefaults(Base):
     context_strategy: Literal["transactional", "legacy"] = "transactional"
     temperature: float = 0.1
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
-    max_tool_iterations: int = 1000  # fork: bump default 200 → 1000 to accommodate long sustained tasks
+    max_tool_iterations: int = 200
+    max_sustained_goal_iterations: int = 1000
     max_concurrent_subagents: int = Field(default=1, ge=1)
     # 普通工具错误交给 Agent 检查并恢复；需要严格失败时仍可由调用方显式开启。
     fail_on_tool_error: bool = False
@@ -178,12 +179,12 @@ class AgentDefaults(Base):
         serialization_alias="idleCompactAfterMinutes",
     )  # Auto-compact idle threshold in minutes (0 = disabled)
     consolidation_ratio: float = Field(
-        default=0.5,
+        default=0.25,
         ge=0.1,
         le=0.95,
         validation_alias=AliasChoices("consolidationRatio"),
         serialization_alias="consolidationRatio",
-    )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
+    )  # Consolidation target ratio (0.25 = 25% of budget retained after compression)
     consolidation_trigger_ratio: float = Field(
         default=0.7,
         ge=0.2,
@@ -280,6 +281,14 @@ class ProviderConfig(Base):
     extra_query: dict[str, str] | None = None  # Extra query params (e.g. api-version for Azure-style gateways)
     proxy: str | None = None  # Explicit HTTP proxy; image downloads trust its DNS and egress
     thinking_style: str | None = None  # Thinking/reasoning style for custom providers
+    # Codex-only escape hatch. The default keeps conversation state and native
+    # server compaction under nanobot's control; enable explicitly to use the
+    # retained app-server/native implementation.
+    use_native_context: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("useNativeContext", "use_native_context"),
+        serialization_alias="useNativeContext",
+    )
 
     # Valid values mirror the keys of _THINKING_STYLE_MAP in
     # nanobot/providers/openai_compat_provider.py. Kept duplicated here to

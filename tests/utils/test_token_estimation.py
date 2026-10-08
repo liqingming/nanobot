@@ -153,3 +153,28 @@ def test_estimate_prompt_tokens_recomputes_when_tool_items_change(monkeypatch) -
     after_tools = "\n" + json.dumps(tools, ensure_ascii=False)
     assert before_tools in fake_encoding.encoded
     assert after_tools in fake_encoding.encoded
+
+
+def test_estimate_prompt_tokens_encodes_only_new_messages(monkeypatch) -> None:
+    helpers._get_token_encoding.cache_clear()
+    helpers._encoded_text_token_count.cache_clear()
+
+    class FakeEncoding:
+        def __init__(self) -> None:
+            self.encoded: list[str] = []
+
+        def encode(self, text: str) -> list[int]:
+            self.encoded.append(text)
+            return list(range(max(1, len(text) // 4)))
+
+    fake_encoding = FakeEncoding()
+    monkeypatch.setattr(helpers.tiktoken, "get_encoding", lambda _name: fake_encoding)
+    messages = [{"role": "user", "content": "stable-history"}]
+
+    estimate_prompt_tokens(messages)
+    estimate_prompt_tokens(messages)
+    messages.append({"role": "assistant", "content": "new-response"})
+    estimate_prompt_tokens(messages)
+
+    assert fake_encoding.encoded.count("stable-history") == 1
+    assert fake_encoding.encoded.count("new-response") == 1

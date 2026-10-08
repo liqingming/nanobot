@@ -12,6 +12,7 @@ from nanobot.session.goal_state import (
     GOAL_STATE_KEY,
     clear_goal_waiting_for_user,
     explicit_goal_requested,
+    explicit_goal_resume_requested,
     sustained_goal_turn,
 )
 from nanobot.session.turn_continuation import (
@@ -195,3 +196,15 @@ async def test_waiting_goal_does_not_schedule_internal_continuation_and_resumes_
     assert ctx.pending_queue.empty()
     assert clear_goal_waiting_for_user(meta) is True
     assert meta[GOAL_STATE_KEY]["awaiting_user_input"] is False
+
+
+def test_waiting_goal_requires_explicit_resume_boundary():
+    assert explicit_goal_resume_requested("inspect an unrelated file") is False
+    assert explicit_goal_resume_requested("/continue start phase one") is True
+    assert explicit_goal_resume_requested("/CONTINUE@nanobot approved") is True
+    assert explicit_goal_resume_requested(
+        "approved", {"goal_reply": True},
+    ) is True
+    assert explicit_goal_resume_requested(
+        "approved", {"original_command": "/continue"},
+    ) is True

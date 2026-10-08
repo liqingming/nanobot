@@ -105,10 +105,12 @@ from nanobot.session import turn_continuation
 from nanobot.session.automation_turns import automation_history_overrides
 from nanobot.session.goal_state import (
     clear_goal_waiting_for_user,
+    explicit_goal_resume_requested,
     goal_state_raw,
     goal_state_runtime_lines,
     parse_goal_state,
     runner_wall_llm_timeout_s,
+    sustained_goal_turn,
     sustained_goal_waiting_for_user,
 )
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META
@@ -341,9 +343,10 @@ class AgentLoop:
         fail_on_tool_error: bool | None = None,
         enable_learning: bool = True,
         skill_roots: list[str] | None = None,
-        consolidation_ratio: float = 0.5,
+        consolidation_ratio: float = 0.25,
         consolidation_trigger_ratio: float = 0.7,
         nudge_after_empty_tools_message: str | None = None,
+        max_sustained_goal_iterations: int | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -365,6 +368,11 @@ class AgentLoop:
         initial_model = model or provider.get_default_model()
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
+        )
+        self.max_sustained_goal_iterations = (
+            max_sustained_goal_iterations
+            if max_sustained_goal_iterations is not None
+            else defaults.max_sustained_goal_iterations
         )
         initial_context_window = (
             context_window_tokens
@@ -438,7 +446,11 @@ class AgentLoop:
             data_dir=_data, skill_roots=skill_roots,
             topic_memory_factory=TopicMemoryFactory(_data) if enable_learning else None,
         )
-        self.sessions = session_manager or SessionManager(workspace, sessions_root=_data / "sessions")
+        self.sessions = session_manager or SessionManager(
+            workspace,
+            sessions_root=_data / "sessions",
+            workspace_state_root=_data,
+        )
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore(max_sessions=SESSION_CACHE_MAX_SIZE)
@@ -469,6 +481,7 @@ class AgentLoop:
         self._running = False
         self._runtime_context_providers: list[RuntimeContextProvider] = []
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
+        self._post_turn_compaction_runtimes: dict[str, LLMRuntime] = {}
         self._discarding_sessions: set[str] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._close_lock = asyncio.Lock()
@@ -525,6 +538,7 @@ class AgentLoop:
             consolidator=self.consolidator,
             session_ttl_minutes=session_ttl_minutes,
             bind_events=self._idle_events,
+            session_lock_factory=self._get_session_lock,
         )
         self._idle_compact_check_interval_s = idle_compact_check_interval_seconds
         self._next_idle_compact_check_at = time.monotonic()
@@ -562,6 +576,7 @@ class AgentLoop:
             extra["session_manager"] = SessionManager(
                 config.workspace_path,
                 sessions_root=data_dir / "sessions" if data_dir is not None else None,
+                workspace_state_root=data_dir,
             )
         provider = extra.pop("provider", None) or make_provider(config)
         resolved = config.resolve_preset()
@@ -578,6 +593,7 @@ class AgentLoop:
             workspace=config.workspace_path,
             model=model,
             max_iterations=defaults.max_tool_iterations,
+            max_sustained_goal_iterations=defaults.max_sustained_goal_iterations,
             max_concurrent_subagents=defaults.max_concurrent_subagents,
             context_window_tokens=context_window_tokens,
             max_tool_result_chars=defaults.max_tool_result_chars,
@@ -609,6 +625,19 @@ class AgentLoop:
     def _sync_subagent_runtime_limits(self) -> None:
         """Keep subagent runtime limits aligned with mutable loop settings."""
         self.subagents.max_iterations = self.max_iterations
+
+    def _max_iterations_for_turn(
+        self,
+        session_metadata: Mapping[str, Any] | None,
+        request_metadata: Mapping[str, Any],
+    ) -> int:
+        """Resolve the explicit, sustained-goal, or ordinary turn budget."""
+        requested = request_metadata.get("max_iterations")
+        if type(requested) is int and requested > 0:
+            return requested
+        if sustained_goal_turn(session_metadata, message_metadata=request_metadata):
+            return self.max_sustained_goal_iterations
+        return self.max_iterations
 
     def invalidate_runtime_config(self) -> None:
         """Invalidate runtime config for lazy refresh at the next admission."""
@@ -973,6 +1002,7 @@ class AgentLoop:
 
     def _track_active_task(self, key: str, task: asyncio.Task[Any]) -> None:
         """Track active session work until its task group becomes empty."""
+        self.auto_compact.cancel_pressure(key)
         tasks = self._active_tasks.setdefault(key, set())
         tasks.add(task)
         task.add_done_callback(partial(self._active_task_done, key, tasks))
@@ -987,6 +1017,16 @@ class AgentLoop:
         self._active_task_request_ids.pop(task, None)
         if not tasks and self._active_tasks.get(key) is tasks:
             self._active_tasks.pop(key, None)
+            runtime = self._post_turn_compaction_runtimes.pop(key, None)
+            if runtime is not None:
+                try:
+                    self.auto_compact.check_pressure(
+                        key,
+                        runtime,
+                        self.schedule_background,
+                    )
+                except Exception:
+                    logger.exception("Could not schedule post-turn compaction for {}", key)
 
     async def _cancel_active_tasks(self, key: str) -> int:
         """Cancel and await all active work for *key*.
@@ -1112,7 +1152,10 @@ class AgentLoop:
                 pending_msg = capture_input(pending_msg)
                 evidence = None
                 if pending_msg.is_user_input and session is not None:
-                    clear_goal_waiting_for_user(session.metadata)
+                    if explicit_goal_resume_requested(
+                        pending_msg.content, pending_msg.metadata,
+                    ):
+                        clear_goal_waiting_for_user(session.metadata)
                     evidence = build_input_evidence(pending_msg, data_dir=self.context.data_dir, session_key=session.key)
                     state = ContextState.from_metadata(session.metadata)
                     state.evidence[evidence.evidence_id] = evidence
@@ -1311,8 +1354,10 @@ class AgentLoop:
             state.revision += 1
             session.metadata[CONTEXT_STATE_KEY] = state.to_metadata()
 
-        requested_iterations = request_metadata.get("max_iterations")
-        effective_iterations = requested_iterations if type(requested_iterations) is int and requested_iterations > 0 else self.max_iterations
+        effective_iterations = self._max_iterations_for_turn(
+            session_metadata,
+            request_metadata,
+        )
         try:
             for scope in turn_scopes or ():
                 turn_scope_stack.enter_context(scope)
@@ -1354,6 +1399,7 @@ class AgentLoop:
                 fail_on_tool_error=self.fail_on_tool_error,
                 event_logger=_event_logger,
                 turn_id=request_ctx.turn_id,
+                turn_objective=request_ctx.original_user_text or transcript_input.current_message,
                 context_delta_callback=_context_delta,
                 context_state_reader=(lambda: {"metadata": session.metadata, "todos": session.todos}) if session is not None else None,
                 llm_timeout_s=runner_wall_llm_timeout_s(self.sessions, active_session_key, metadata=session_metadata, message_metadata=request_metadata),
@@ -1417,7 +1463,7 @@ class AgentLoop:
                 result.stop_reason = "completed"
                 result.error = None
         if result.stop_reason == "max_iterations":
-            logger.warning("Max iterations ({}) reached", self.max_iterations)
+            logger.warning("Max iterations ({}) reached", effective_iterations)
             should_stream = turn_continuation.should_stream_budget_response(
                 stop_reason=result.stop_reason,
                 pending_queue_available=pending_queue is not None and session is not None,
@@ -1791,11 +1837,12 @@ class AgentLoop:
         if errors:
             raise BaseExceptionGroup("failed to close agent resources", errors)
 
-    def schedule_background(self, coro: Coroutine[Any, Any, Any]) -> None:
+    def schedule_background(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def stop(self) -> None:
         """Stop the agent loop."""
@@ -1988,7 +2035,9 @@ class AgentLoop:
             else:
                 ctx.session = self.sessions.get_or_create(ctx.session_key)
         session = ctx.session
-        if ctx.original_user_text is not None:
+        if ctx.original_user_text is not None and explicit_goal_resume_requested(
+            ctx.msg.content, ctx.msg.metadata,
+        ):
             clear_goal_waiting_for_user(session.metadata)
         ctx.ephemeral = ctx.ephemeral or not session.policy.persist
         tools = ctx.tools or self.tools
@@ -2283,6 +2332,8 @@ class AgentLoop:
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
+        if not ctx.ephemeral:
+            self._post_turn_compaction_runtimes[ctx.session_key] = ctx.require_runtime()
         if not ctx.ephemeral:
             await self.runtime_event_publisher.session_turn_persisted(
                 ctx.msg,

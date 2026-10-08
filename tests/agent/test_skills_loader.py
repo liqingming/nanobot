@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,78 @@ def test_list_skills_merges_workspace_and_builtin(tmp_path: Path) -> None:
     ]
 
 
+def test_available_skill_listing_does_not_rescan_roots_per_metadata_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "ws"
+    skills_root = workspace / "skills"
+    _write_skill(skills_root, "alpha")
+    _write_skill(skills_root, "beta")
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    original = loader._skill_entries_from_dir
+    scans = 0
+
+    def count_scans(*args, **kwargs):
+        nonlocal scans
+        scans += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "_skill_entries_from_dir", count_scans)
+
+    assert len(loader.list_skills(filter_unavailable=True)) == 2
+    assert scans == 2  # workspace + builtin, independent of the number of skills
+    assert len(loader.list_skills(filter_unavailable=True)) == 2
+    assert scans == 2
+
+
+def test_skill_list_cache_invalidates_when_root_inventory_changes(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    skills_root = workspace / "skills"
+    _write_skill(skills_root, "alpha")
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+
+    assert [entry["name"] for entry in loader.list_skills(False)] == ["alpha"]
+    _write_skill(skills_root, "beta")
+    loader._skill_roots_checked_at = 0.0
+
+    assert [entry["name"] for entry in loader.list_skills(False)] == ["alpha", "beta"]
+
+
+def test_metadata_cache_coalesces_repeated_stat_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "ws"
+    skill_path = _write_skill(workspace / "skills", "alpha")
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader.list_skills(filter_unavailable=False)
+    original_stat = Path.stat
+    stat_calls = 0
+
+    def count_skill_stats(path: Path, *args, **kwargs):
+        nonlocal stat_calls
+        if path == skill_path:
+            stat_calls += 1
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", count_skill_stats)
+
+    assert loader.get_skill_metadata("alpha") is None
+    assert loader.get_skill_metadata("alpha") is None
+    assert stat_calls == 1
+
+    loader._meta_checked_at["alpha"] = 0.0
+    assert loader.get_skill_metadata("alpha") is None
+    assert stat_calls == 2
+
+
 def test_list_skills_builtin_omitted_when_dir_missing(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     ws_skills = workspace / "skills"
@@ -232,6 +305,29 @@ def test_list_skills_filter_unavailable_includes_when_bin_requirement_met(
     assert entries == [
         {"name": "has_bin", "path": str(skill_path), "source": "workspace"},
     ]
+
+
+def test_required_bin_check_is_cached_until_path_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_which(_cmd: str) -> str:
+        nonlocal calls
+        calls += 1
+        return "/fake/tool"
+
+    monkeypatch.setattr("nanobot.agent.skills.shutil.which", fake_which)
+    loader = SkillsLoader(tmp_path)
+
+    assert loader._has_required_bin("tool")
+    assert loader._has_required_bin("tool")
+    assert calls == 1
+
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    assert loader._has_required_bin("tool")
+    assert calls == 2
 
 
 def test_list_skills_filter_unavailable_false_keeps_unmet_requirements(
@@ -303,6 +399,7 @@ def test_list_skills_openclaw_metadata_parsed_for_requirements(
         "nanobot.agent.skills.shutil.which",
         lambda cmd: "/x" if cmd == "nanobot_oc_bin" else None,
     )
+    loader._bin_availability_cache.clear()
     entries = loader.list_skills(filter_unavailable=True)
     assert entries == [
         {"name": "openclaw_skill", "path": str(skill_path), "source": "workspace"},

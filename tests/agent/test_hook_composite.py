@@ -610,3 +610,18 @@ async def test_agent_loop_no_hooks_backward_compat(tmp_path):
         "或者把任务拆成更小的步骤。"
     )
     assert result.tools_used == ["list_dir", "list_dir"]
+
+
+def test_agent_loop_uses_separate_iteration_budget_for_sustained_goals(tmp_path):
+    from nanobot.config.schema import AgentDefaults
+
+    defaults = AgentDefaults()
+    loop = _make_loop(tmp_path)
+    loop.max_iterations = 7
+    loop.max_sustained_goal_iterations = 70
+
+    assert defaults.max_tool_iterations == 200
+    assert defaults.max_sustained_goal_iterations == 1000
+    assert loop._max_iterations_for_turn({}, {}) == 7
+    assert loop._max_iterations_for_turn({}, {"goal_requested": True}) == 70
+    assert loop._max_iterations_for_turn({}, {"goal_requested": True, "max_iterations": 3}) == 3

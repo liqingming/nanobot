@@ -173,14 +173,25 @@ def _make_provider_core(
         from nanobot.fork.providers.codex_app_server_provider import CodexAppServerProvider
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
-        # Arbitrary Responses payload overrides require the HTTP transport.
-        codex_provider = OpenAICodexProvider if p and p.extra_body else CodexAppServerProvider
-        provider = codex_provider(
-            default_model=model,
-            proxy=getattr(p, "proxy", None) if p else None,
-            extra_body=p.extra_body if p else None,
-            provider_name=provider_name,
-        )
+        # Keep the app-server/native implementation available as an explicit
+        # escape hatch. The default is stateless so nanobot owns the transcript,
+        # memory, compaction, and tool loop.
+        use_native_context = bool(p and p.use_native_context)
+        if use_native_context:
+            provider = CodexAppServerProvider(
+                default_model=model,
+                proxy=getattr(p, "proxy", None) if p else None,
+                extra_body=p.extra_body if p else None,
+                provider_name=provider_name,
+            )
+        else:
+            provider = OpenAICodexProvider(
+                default_model=model,
+                proxy=getattr(p, "proxy", None) if p else None,
+                extra_body=p.extra_body if p else None,
+                enable_native_context=False,
+                provider_name=provider_name,
+            )
     elif backend == "xai_grok":
         from nanobot.providers.xai_grok_provider import XAIGrokProvider
 

@@ -419,7 +419,11 @@ def agent(
         agent_loop = AgentLoop.from_config(
             config, bus,
             data_dir=data_dir,
-            session_manager=SessionManager(config.workspace_path, sessions_root=data_dir / "sessions"),
+            session_manager=SessionManager(
+                config.workspace_path,
+                sessions_root=data_dir / "sessions",
+                workspace_state_root=data_dir,
+            ),
             tool_registry=tools,
             cron_service=cron,
             image_generation_provider_configs=image_gen_provider_configs(config),
@@ -727,6 +731,18 @@ def agent(
                 is_processing = True
                 tui.set_is_processing(True)
                 _set_activity_phase("prepare_turn")
+                if _pre_submitted[0]:
+                    _pre_submitted[0] = False
+                else:
+                    _pending_transcript_ids["user"] = uuid.uuid4().hex
+                    _pending_transcript_ids["assistant"] = uuid.uuid4().hex
+                    tui.add_user_echo(text, message_id=_pending_transcript_ids["user"])
+                    tui.stream_start()
+                # Exceed prompt_toolkit's max_render_postpone_time (0.01s) so the
+                # thinking animation is guaranteed to reach the screen before the
+                # bus receives the message and the LLM starts responding.
+                await asyncio.sleep(0.015)
+                _set_activity_phase("agent_processing")
                 # Hide stale todos at the start of a fresh user turn. Keep the
                 # persisted list intact so the model still sees prior context;
                 # TodoWriteTool will make the bar visible again when it publishes
@@ -745,18 +761,6 @@ def agent(
                         _todo_bar_waiting_for_new_plan[0] = True
                 except Exception:
                     pass
-                if _pre_submitted[0]:
-                    _pre_submitted[0] = False
-                else:
-                    _pending_transcript_ids["user"] = uuid.uuid4().hex
-                    _pending_transcript_ids["assistant"] = uuid.uuid4().hex
-                    tui.add_user_echo(text, message_id=_pending_transcript_ids["user"])
-                    tui.stream_start()
-                # Exceed prompt_toolkit's max_render_postpone_time (0.01s) so the
-                # thinking animation is guaranteed to reach the screen before the
-                # bus receives the message and the LLM starts responding.
-                await asyncio.sleep(0.015)
-                _set_activity_phase("agent_processing")
                 await bus.publish_inbound(capture_input(InboundMessage(
                     channel=cli_channel,
                     sender_id="user",
