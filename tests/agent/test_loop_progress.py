@@ -1,6 +1,7 @@
 """Tests for structured tool-event progress metadata emitted by AgentLoop."""
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,6 +23,7 @@ from nanobot.bus.outbound_events import (
     TurnEndEvent,
 )
 from nanobot.bus.queue import MessageBus
+from nanobot.fork.agent.recovery_packet import RecoveryPacketError
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.session.webui_turns import WebuiTurnCoordinator, WebuiTurnRoutePolicy
@@ -1104,10 +1106,16 @@ class TestToolEventProgress:
         assert turn_end_msgs[0].chat_id == "chat1"
         assert outbound.index(done_msgs[0]) < outbound.index(turn_end_msgs[0])
 
+    @pytest.mark.parametrize(("error", "expected_content"), [
+        (RuntimeError("boom"), "Sorry, I encountered an error."),
+        (RecoveryPacketError("recovery packet too large"), "recovery packet too large"),
+    ])
     @pytest.mark.asyncio
     async def test_websocket_dispatch_publishes_turn_end_after_error(
         self,
         tmp_path: Path,
+        error: Exception,
+        expected_content: str,
     ) -> None:
         bus = MessageBus()
         provider = MagicMock()
@@ -1116,7 +1124,7 @@ class TestToolEventProgress:
         _attach_webui_runtime_events(loop, bus)
 
         async def raise_from_turn(*_args, **_kwargs):
-            raise RuntimeError("boom")
+            raise error
 
         loop._process_message = raise_from_turn  # type: ignore[method-assign]
 
@@ -1131,7 +1139,7 @@ class TestToolEventProgress:
         while bus.outbound_size > 0:
             outbound.append(await bus.consume_outbound())
 
-        error_msgs = [m for m in outbound if m.content == "Sorry, I encountered an error."]
+        error_msgs = [m for m in outbound if m.content == expected_content]
         turn_end_msgs = [m for m in outbound if isinstance(m.event, TurnEndEvent)]
         statuses = [m for m in outbound if isinstance(m.event, GoalStatusEvent)]
 
@@ -1142,6 +1150,14 @@ class TestToolEventProgress:
         assert [m.event.status for m in statuses if isinstance(m.event, GoalStatusEvent)] == ["idle"]
         assert outbound.index(error_msgs[0]) < outbound.index(turn_end_msgs[0])
         assert outbound.index(turn_end_msgs[0]) < outbound.index(statuses[-1])
+
+        log_path = loop.sessions.get_session_runtime_log_path("websocket:chat1")
+        events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        errors = [event for event in events if event["event"] == "turn.processing.error"]
+        assert len(errors) == 1
+        assert errors[0]["exception_type"] == type(error).__name__
+        assert errors[0]["exception"] == str(error)
+        assert f"{type(error).__name__}: {error}" in errors[0]["traceback"]
 
     @pytest.mark.asyncio
     async def test_webui_title_generation_runs_after_turn_end(self, tmp_path: Path) -> None:

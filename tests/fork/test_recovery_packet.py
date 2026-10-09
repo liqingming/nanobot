@@ -1,5 +1,6 @@
 """恢复字段不截断、来源不升级、摘要提交不绕过完整性保护。"""
 
+from copy import deepcopy
 from dataclasses import asdict
 
 import pytest
@@ -8,6 +9,7 @@ from nanobot.agent.context_artifacts import (
     CONTEXT_STATE_KEY,
     ContextState,
     DecisionEntry,
+    EvidenceRef,
     ToolDigestBuilder,
     render_active_context,
 )
@@ -78,6 +80,54 @@ def test_referenced_evidence_survives_recent_evidence_limit():
     restored = ContextState.from_metadata({CONTEXT_STATE_KEY: state.to_metadata()})
     assert first in restored.evidence
     assert len(restored.evidence) == 41
+
+
+def test_large_evidence_history_uses_bounded_index_without_changing_metadata():
+    state = ContextState()
+    for i in range(100):
+        evidence_id = f"input-{i}"
+        state.evidence[evidence_id] = EvidenceRef(
+            evidence_id=evidence_id,
+            tool_call_id="",
+            kind="input_snapshot",
+            locator=f"cache/{evidence_id}.txt",
+            sha256=f"{i:064x}",
+            input_source={"receipt": "x" * 800},
+        )
+    state.decisions = [DecisionEntry("D", "active", "verify first input", evidence_ids=["input-0"])]
+    metadata = {CONTEXT_STATE_KEY: state.to_metadata()}
+    before = deepcopy(metadata)
+
+    view = render_active_context(metadata)
+
+    assert len(view) <= MAX_RECOVERY_CHARS
+    assert '"id": "input-0"' in view
+    assert '"id": "input-99"' in view
+    assert '"id": "input-50"' not in view
+    assert "evidence.index:" in view and "omitted" in view
+    assert "recovery.sha256:" in view
+    assert metadata == before
+
+
+def test_oversized_unreferenced_evidence_does_not_block_recovery():
+    evidence = EvidenceRef(
+        evidence_id="large-input",
+        tool_call_id="",
+        kind="input_snapshot",
+        locator="cache/large-input.txt",
+        sha256="a" * 64,
+        input_source={"receipt": "x" * MAX_RECOVERY_CHARS},
+    )
+    metadata = {
+        CONTEXT_STATE_KEY: ContextState(evidence={evidence.evidence_id: evidence}).to_metadata(),
+        "goal_state": {"status": "active", "objective": "continue"},
+    }
+
+    view = render_active_context(metadata)
+
+    assert "task.objective:\ncontinue" in view
+    assert "evidence.index: 0 shown; 1 omitted" in view
+    assert len(view) <= MAX_RECOVERY_CHARS
 
 
 @pytest.mark.parametrize("metadata", [

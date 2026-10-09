@@ -83,6 +83,7 @@ from nanobot.fork.agent.learning import (
     _compress_tool_sequence,
     detect_user_delta,
 )
+from nanobot.fork.agent.recovery_packet import RecoveryPacketError
 from nanobot.fork.agent.summary_transaction import SummaryTransactionError
 from nanobot.llm_usage.context import source_from_request
 from nanobot.providers.base import LLMProvider, LLMUsage, ProviderConversationState
@@ -143,7 +144,7 @@ from nanobot.utils.progress_events import output_events
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
-from nanobot.utils.session_runtime_log import append_session_runtime_log
+from nanobot.utils.session_runtime_log import append_session_runtime_log, exception_fields
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -1731,8 +1732,17 @@ class AgentLoop:
                     raise
                 except Exception as exc:
                     logger.exception("Error processing message for session {}", session_key)
+                    append_session_runtime_log(
+                        self.sessions.get_session_runtime_log_path(session_key),
+                        "turn.processing.error",
+                        session_key=session_key,
+                        turn_request_id=msg.metadata.get("_turn_request_id"),
+                        **exception_fields(exc),
+                    )
                     await delivery.fail(
-                        content=str(exc) if isinstance(exc, SummaryTransactionError) else None,
+                        content=str(exc) if isinstance(
+                            exc, (SummaryTransactionError, RecoveryPacketError)
+                        ) else None,
                         publish_completion=not turn_continuation.internal_continuation_pending(
                             msg.metadata
                         )

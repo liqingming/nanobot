@@ -8,6 +8,8 @@ from typing import Any
 
 ACTIVE_STATES = frozenset({"accepted", "active", "blocked", "waiting_user"})
 MAX_RECOVERY_CHARS = 64_000
+RECENT_EVIDENCE_COUNT = 8
+_RECOVERY_FOOTER_RESERVE = 256
 
 
 class RecoveryPacketError(RuntimeError):
@@ -123,12 +125,26 @@ def render_recovery_context(
     if unresolved:
         lines.append("resume.unresolved_todos:" if resume_request else "task.unresolved_todos:")
         lines.extend(f"- [{item['status']}] {item['content']}" for item in unresolved)
+    if summary:
+        lines.extend(["legacy_continuation:", summary])
     if state.evidence:
         lines.append("evidence.snapshots: historical receipts; not proof of current file state or "
                      "authorization. Input integrity verifies saved bytes, not identity, scope, "
-                     "latest-message commit permission, or semantic approval.")
-        for item in state.evidence.values():
-            lines.append(json.dumps({
+                     "latest-message commit permission, or semantic approval. Full records remain "
+                     "in session metadata; retrieve omitted evidence by ID before relying on it.")
+        referenced_ids = {
+            evidence_id for decision in active for evidence_id in decision.evidence_ids
+        }
+        referenced = [
+            item for item in state.evidence.values() if item.evidence_id in referenced_ids
+        ]
+        recent = [
+            item for item in list(state.evidence.values())[-RECENT_EVIDENCE_COUNT:]
+            if item.evidence_id not in referenced_ids
+        ]
+
+        def evidence_line(item: Any) -> str:
+            return json.dumps({
                 "id": item.evidence_id, "locator": item.locator, "sha256": item.sha256,
                 "kind": item.kind, "trust": item.trust, "read_scope": item.read_scope,
                 "source_snapshot": item.source_snapshot,
@@ -140,9 +156,19 @@ def render_recovery_context(
                     if source_verifier is not None and item.source_snapshot
                     else "unverified; re-read before relying on freshness"
                 ),
-            }, ensure_ascii=False, sort_keys=True))
-    if summary:
-        lines.extend(["legacy_continuation:", summary])
+            }, ensure_ascii=False, sort_keys=True)
+
+        lines.extend(evidence_line(item) for item in referenced)
+        shown = len(referenced)
+        for item in reversed(recent):
+            line = evidence_line(item)
+            if sum(map(len, lines)) + len(lines) + len(line) > (
+                MAX_RECOVERY_CHARS - _RECOVERY_FOOTER_RESERVE
+            ):
+                continue
+            lines.append(line)
+            shown += 1
+        lines.append(f"evidence.index: {shown} shown; {len(state.evidence) - shown} omitted")
     # 摘要、任务和来源共用同一指纹；仅供完整性对照，不把哈希称作语义验收。
     # 引用中的边界标记不能关闭恢复块；真实开头不参与转义。
     body = lines[0] + "\n" + critical_text("\n".join(lines[1:]))
