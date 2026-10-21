@@ -173,25 +173,37 @@ def _make_provider_core(
         from nanobot.fork.providers.codex_app_server_provider import CodexAppServerProvider
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
-        # Keep the app-server/native implementation available as an explicit
-        # escape hatch. The default is stateless so nanobot owns the transcript,
-        # memory, compaction, and tool loop.
-        use_native_context = bool(p and p.use_native_context)
-        if use_native_context:
-            provider = CodexAppServerProvider(
+        # Client relay mode is process-wide: every OpenAI Codex provider created
+        # from this config keeps its agent/tool loop local and delegates only the
+        # provider call to the configured relay.
+        if config.codex_relay.mode == "client":
+            from nanobot.fork.providers.codex_relay import CodexRelayProvider
+
+            provider = CodexRelayProvider(
                 default_model=model,
-                proxy=getattr(p, "proxy", None) if p else None,
-                extra_body=p.extra_body if p else None,
+                relay_config=config.codex_relay,
                 provider_name=provider_name,
             )
         else:
-            provider = OpenAICodexProvider(
-                default_model=model,
-                proxy=getattr(p, "proxy", None) if p else None,
-                extra_body=p.extra_body if p else None,
-                enable_native_context=False,
-                provider_name=provider_name,
-            )
+            # Keep the app-server/native implementation available as an explicit
+            # escape hatch. The default is stateless so nanobot owns the transcript,
+            # memory, compaction, and tool loop.
+            use_native_context = bool(p and p.use_native_context)
+            if use_native_context:
+                provider = CodexAppServerProvider(
+                    default_model=model,
+                    proxy=getattr(p, "proxy", None) if p else None,
+                    extra_body=p.extra_body if p else None,
+                    provider_name=provider_name,
+                )
+            else:
+                provider = OpenAICodexProvider(
+                    default_model=model,
+                    proxy=getattr(p, "proxy", None) if p else None,
+                    extra_body=p.extra_body if p else None,
+                    enable_native_context=False,
+                    provider_name=provider_name,
+                )
     elif backend == "xai_grok":
         from nanobot.providers.xai_grok_provider import XAIGrokProvider
 

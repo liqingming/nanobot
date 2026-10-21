@@ -380,12 +380,45 @@ def serve(
     port = port if port is not None else api_cfg.port
     timeout = timeout if timeout is not None else api_cfg.timeout
     api_key = api_cfg.api_key.strip() if api_cfg.api_key else ""
+    relay_cfg = runtime_config.codex_relay
+    if relay_cfg.mode == "server" and not api_key:
+        # The existing serve listener has one authentication boundary. Reuse the
+        # relay key for every route rather than exposing the normal API unauthenticated.
+        api_key = relay_cfg.api_key.strip()
     if not is_loopback_host(host) and not api_key:
         console.print(
             f"[red]Error: host {host} is available beyond this device but api_key is not set. "
             "Set api.api_key in config to prevent unauthenticated access.[/red]"
         )
         raise typer.Exit(1)
+
+    model_name, preset_tag = _model_display(runtime_config)
+    if relay_cfg.mode == "server":
+        console.print(f"{__logo__} Starting OpenAI Codex Provider relay")
+        console.print(f"  [cyan]Health[/cyan]     : http://{host}:{port}/health")
+        console.print(f"  [cyan]Relay[/cyan]      : http://{host}:{port}/v1/codex/relay")
+        console.print(f"  [cyan]Model[/cyan]      : {model_name}{preset_tag}")
+        console.print(f"  [cyan]Timeout[/cyan]    : {timeout}s")
+        if not is_loopback_host(host):
+            console.print(
+                "[yellow]Relay is available beyond this device "
+                "(authentication required).[/yellow]"
+            )
+        console.print()
+        api_app = create_app(
+            None,
+            model_name=model_name,
+            request_timeout=timeout,
+            api_key=api_key,
+            codex_relay=relay_cfg,
+        )
+
+        def _log_relay_aiohttp(message: object) -> None:
+            logger.info("{}", message)
+
+        web.run_app(api_app, host=host, port=port, print=_log_relay_aiohttp)
+        return
+
     data_dir = get_workspace_cache_dir(runtime_config.workspace_path)
     sync_workspace_templates(data_dir)
     bus = MessageBus()
@@ -405,7 +438,6 @@ def serve(
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1) from exc
 
-    model_name, preset_tag = _model_display(runtime_config)
     console.print(f"{__logo__} Starting OpenAI-compatible API server")
     console.print(f"  [cyan]Endpoint[/cyan] : http://{host}:{port}/v1/chat/completions")
     console.print(f"  [cyan]Model[/cyan]    : {model_name}{preset_tag}")
@@ -418,11 +450,13 @@ def serve(
         )
     console.print()
 
-    api_app = create_app(
-        agent_loop, model_name=model_name, request_timeout=timeout,
-        api_key=api_key,
-        prepare_agent=mcp_provider.connect,
-    )
+    api_app_kwargs: dict[str, Any] = {
+        "model_name": model_name,
+        "request_timeout": timeout,
+        "api_key": api_key,
+        "prepare_agent": mcp_provider.connect,
+    }
+    api_app = create_app(agent_loop, **api_app_kwargs)
 
     async def on_startup(_app: Any) -> None:
         await mcp_provider.connect()

@@ -3137,12 +3137,14 @@ def _patch_serve_runtime(monkeypatch, config: Config, seen: dict[str, object]) -
         request_timeout: float,
         api_key: str = "",
         prepare_agent=None,
+        codex_relay=None,
     ):
         seen["agent_loop"] = agent_loop
         seen["model_name"] = model_name
         seen["request_timeout"] = request_timeout
         seen["api_key"] = api_key
         seen["prepare_agent"] = prepare_agent
+        seen["codex_relay"] = codex_relay
         return _FakeApiApp()
 
     def _fake_run_app(api_app, host: str, port: int, print):
@@ -4726,3 +4728,28 @@ def test_provider_login_openai_codex_tolerates_oauth_functions_without_proxy(mon
 
     assert result.exit_code == 0
     assert called == {"login": True}
+
+
+def test_serve_server_relay_uses_relay_key_and_existing_listener(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = _write_instance_config(tmp_path)
+    config = Config.model_validate(
+        {
+            "api": {"host": "0.0.0.0", "port": 18900},
+            "codexRelay": {"mode": "server", "apiKey": " relay-secret "},
+        }
+    )
+    seen: dict[str, object] = {}
+    _patch_serve_runtime(monkeypatch, config, seen)
+
+    result = runner.invoke(app, ["serve", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    assert seen["host"] == "0.0.0.0"
+    assert seen["api_key"] == "relay-secret"
+    assert seen["codex_relay"] is config.codex_relay
+    assert seen["agent_loop"] is None
+    assert "workspace" not in seen
+    assert seen["api_app"].on_startup == []
+    assert seen["api_app"].on_cleanup == []

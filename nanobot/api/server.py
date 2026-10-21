@@ -39,6 +39,7 @@ from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
+    from nanobot.config.schema import CodexRelayConfig
 
 __all__ = (
     "MAX_FILE_SIZE",
@@ -556,27 +557,35 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 def create_app(
-    agent_loop: "AgentLoop",
+    agent_loop: "AgentLoop | None",
     model_name: str = "nanobot",
     request_timeout: float = 120.0,
     api_key: str = "",
     prepare_agent: Callable[[], Awaitable[None]] | None = None,
+    codex_relay: "CodexRelayConfig | None" = None,
 ) -> web.Application:
     """Create the aiohttp application.
 
     Args:
-        agent_loop: An initialized AgentLoop instance.
+        agent_loop: An initialized AgentLoop instance, or None for provider-only relay mode.
         model_name: Model name reported in responses.
         request_timeout: Per-request timeout in seconds.
         api_key: Optional API key for Bearer-token authentication on API routes.
         prepare_agent: Optional application-owned readiness callback run before each turn.
+        codex_relay: Optional server-mode Codex relay configuration.
     """
+    relay_only = codex_relay is not None and codex_relay.mode == "server"
+    if agent_loop is None and not relay_only:
+        raise ValueError("agent_loop is required outside provider-only relay mode")
+
     app = web.Application(client_max_size=20 * 1024 * 1024)  # 20MB for base64 images
-    app[_AGENT_LOOP_KEY] = agent_loop
-    app[_MODEL_NAME_KEY] = model_name
-    app[_REQUEST_TIMEOUT_KEY] = request_timeout
-    app[_SESSION_LOCKS_KEY] = {}  # per-user locks, keyed by session_key
-    app[_PREPARE_AGENT_KEY] = prepare_agent
+    if not relay_only:
+        assert agent_loop is not None
+        app[_AGENT_LOOP_KEY] = agent_loop
+        app[_MODEL_NAME_KEY] = model_name
+        app[_REQUEST_TIMEOUT_KEY] = request_timeout
+        app[_SESSION_LOCKS_KEY] = {}  # per-user locks, keyed by session_key
+        app[_PREPARE_AGENT_KEY] = prepare_agent
 
     @web.middleware
     async def auth_middleware(
@@ -586,18 +595,33 @@ def create_app(
         # Allow unauthenticated health checks.
         if request.path == "/health":
             return await handler(request)
-        if not api_key:
+        route_api_key = api_key
+        if (
+            request.path == "/v1/codex/relay"
+            and codex_relay is not None
+            and codex_relay.mode == "server"
+        ):
+            route_api_key = codex_relay.api_key.strip()
+        if not route_api_key:
             return await handler(request)
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return _error_json(401, "Missing Authorization header. Use: Bearer <api_key>")
-        if not constant_time_text_equal(auth[len("Bearer "):], api_key):
+        if not constant_time_text_equal(auth[len("Bearer "):], route_api_key):
             return _error_json(401, "Invalid API key")
         return await handler(request)
 
     app.middlewares.append(auth_middleware)
 
-    app.router.add_post("/v1/chat/completions", handle_chat_completions)
-    app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
+    if relay_only:
+        assert codex_relay is not None
+        from nanobot.fork.api.codex_relay import create_codex_relay_handler
+
+        # Relay mode is provider-only. Do not expose the normal AgentLoop API on
+        # the OAuth host, otherwise relay clients could execute central tools.
+        app.router.add_post("/v1/codex/relay", create_codex_relay_handler(codex_relay))
+    else:
+        app.router.add_post("/v1/chat/completions", handle_chat_completions)
+        app.router.add_get("/v1/models", handle_models)
     return app

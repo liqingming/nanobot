@@ -414,6 +414,48 @@ class HeartbeatConfig(Base):
     interval_s: int = 30 * 60  # 30 minutes
 
 
+class CodexRelayConfig(Base):
+    """Process-wide OpenAI Codex transport mode.
+
+    Client mode affects every OpenAI Codex provider created from this config.
+    Server mode exposes the relay on the existing ``nanobot serve`` listener.
+    """
+
+    mode: Literal["off", "client", "server"] = "off"
+    endpoint: str = ""
+    api_key: str = Field(default="", repr=False)
+    request_timeout: float = Field(default=600.0, gt=0, le=3600)
+    max_concurrency: int = Field(default=4, ge=1, le=128)
+    allowed_models: list[str] = Field(default_factory=list)
+    allow_insecure_http: bool = False
+
+    @model_validator(mode="after")
+    def validate_mode_settings(self) -> "CodexRelayConfig":
+        from urllib.parse import urlparse
+
+        if self.mode == "off":
+            return self
+        if not self.api_key.strip():
+            raise ValueError("codexRelay.apiKey is required when relay mode is enabled")
+        if self.mode == "server":
+            return self
+
+        endpoint = self.endpoint.strip().rstrip("/")
+        if not endpoint:
+            raise ValueError("codexRelay.endpoint is required in client mode")
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("codexRelay.endpoint must be an absolute HTTP(S) URL")
+        is_loopback = parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}
+        if parsed.scheme != "https" and not is_loopback and not self.allow_insecure_http:
+            raise ValueError(
+                "codexRelay.endpoint must use HTTPS for a remote host; "
+                "set allowInsecureHttp only on a trusted private network"
+            )
+        self.endpoint = endpoint
+        return self
+
+
 class ApiConfig(Base):
     """OpenAI-compatible API server configuration."""
 
@@ -544,6 +586,11 @@ class Config(_ResolvedToolConfig, BaseSettings):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+    codex_relay: CodexRelayConfig = Field(
+        default_factory=CodexRelayConfig,
+        validation_alias=AliasChoices("codexRelay", "codex_relay"),
+        serialization_alias="codexRelay",
+    )
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
@@ -552,6 +599,32 @@ class Config(_ResolvedToolConfig, BaseSettings):
         validation_alias=AliasChoices("modelPresets", "model_presets"),
         serialization_alias="modelPresets",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def use_server_relay_key_for_wildcard_api(cls, value: object) -> object:
+        """Keep the shared serve listener authenticated with one relay secret."""
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        relay_value = data.get("codexRelay", data.get("codex_relay"))
+        api_value = data.get("api")
+        if not isinstance(relay_value, dict) or not isinstance(api_value, dict):
+            return data
+        relay = cast(dict[str, Any], relay_value)
+        api = dict(cast(dict[str, Any], api_value))
+        relay_key = relay.get("apiKey", relay.get("api_key"))
+        api_key = api.get("apiKey", api.get("api_key"))
+        if (
+            relay.get("mode") == "server"
+            and api.get("host") in {"0.0.0.0", "::"}
+            and not (isinstance(api_key, str) and api_key.strip())
+            and isinstance(relay_key, str)
+            and relay_key.strip()
+        ):
+            api["apiKey"] = relay_key.strip()
+            data["api"] = api
+        return data
 
     def __init__(self, **values: Any) -> None:
         if not type(self).__pydantic_complete__:
