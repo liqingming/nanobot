@@ -382,6 +382,50 @@ if _TEXTUAL_AVAILABLE:
                 self.scroll_end(animate=False, immediate=True, force=True)
             return result
 
+        def trim_to_recent(
+            self, *, max_lines: int = 8000, max_records: int = 2048,
+            max_chars: int = 1_000_000,
+        ) -> bool:
+            """Bound the displayed output; older turns remain in the session archive."""
+            if not self._record_spans or len(self._record_spans) != len(self._logical_records):
+                return False
+            kept_lines = 0
+            kept_chars = 0
+            cut = len(self._logical_records)
+            for index in range(len(self._logical_records) - 1, -1, -1):
+                start, end = self._record_spans[index]
+                content = self._logical_records[index]["content"]
+                chars = len(content) if isinstance(content, (str, Text)) else len(str(content))
+                if cut < len(self._logical_records) and (
+                    kept_lines + end - start > max_lines
+                    or len(self._logical_records) - index > max_records
+                    or kept_chars + chars > max_chars
+                ):
+                    break
+                cut = index
+                kept_lines += end - start
+                kept_chars += chars
+            if cut == 0:
+                return False
+
+            self._logical_records = self._logical_records[cut:]
+            kept_ids = {id(record) for record in self._logical_records}
+            blocks = []
+            for block in self._message_blocks:
+                block["records"] = [
+                    record for record in block["records"] if id(record) in kept_ids
+                ]
+                if block["records"]:
+                    blocks.append(block)
+            self._message_blocks = blocks
+            self._reflow(
+                max(1, self.scrollable_content_region.width),
+                preserve_view=False,
+                notify_reflow=False,
+            )
+            self.scroll_end(animate=False, immediate=True, force=True)
+            return True
+
         def clear(self) -> Any:
             if self._record_writes:
                 self._logical_records.clear()
@@ -2824,6 +2868,13 @@ class TextualTUI(TUIBase):
         self._clear_initial_thinking_placeholder()
         ts = ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._write_response(content, ts, metadata, message_id=message_id)
+        try:
+            out = self._app.query_one("#output", _OutputLog)
+            if out.trim_to_recent():
+                self._tool_placeholder_line = len(out.lines)
+                self._stream_header_line = 0
+        except Exception:
+            logger.exception("Failed to trim terminal output history")
 
     def add_progress(
         self, text: str, tool_events: list[dict[str, Any]] | None = None

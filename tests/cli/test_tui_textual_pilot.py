@@ -1433,6 +1433,29 @@ async def test_output_history_reflows_when_terminal_width_changes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_output_history_trim_keeps_recent_records_and_reflow() -> None:
+    tui = TextualTUI()
+    app = tui._app
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        app.clear_output()
+        out = app.query_one("#output")
+        for index in range(20):
+            out.write(f"record {index}: " + "content " * 8)
+
+        assert out.trim_to_recent(max_lines=8, max_records=8, max_chars=1000)
+        assert len(out._logical_records) == len(out._record_spans) <= 8
+        assert "record 19" in _output_log_text(out)
+        assert "record 0" not in _output_log_text(out)
+
+        await pilot.resize_terminal(50, 24)
+        await pilot.pause()
+        assert len(out._logical_records) == len(out._record_spans)
+        assert "record 19" in _output_log_text(out)
+        assert "record 0" not in _output_log_text(out)
+
+
+@pytest.mark.asyncio
 async def test_output_resize_preserves_manual_reading_record() -> None:
     tui = TextualTUI()
     tui.set_commands([])

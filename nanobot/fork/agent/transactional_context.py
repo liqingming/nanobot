@@ -269,9 +269,9 @@ class TransactionalContextPreparation:
             ) from exc
 
     async def prepare(self, config: Any, messages: list[dict]) -> list[dict]:
-        snapshot = deepcopy(messages)
-        state_snapshot = deepcopy(self.state_reader()) if self.state_reader else None
-        projected = deepcopy(self.projected + messages[len(self.source):])
+        # The committed projection is private to this transaction. Only the new
+        # suffix needs copying until a summary transaction actually starts.
+        projected = [*self.projected, *deepcopy(messages[len(self.source):])]
         # 不在这里修造工具回执：不完整批次必须由真实检查点恢复后再来。
         self._validate_pairs(projected)
         budget = resolve_context_budget(
@@ -279,7 +279,6 @@ class TransactionalContextPreparation:
             config.context_block_limit,
         ).input_tokens
         definitions = config.tools.get_definitions()
-        definitions_snapshot = deepcopy(definitions)
         estimated, _ = estimate_prompt_tokens_chain(
             config.provider, config.model, projected, definitions,
         )
@@ -292,8 +291,14 @@ class TransactionalContextPreparation:
         )
         trigger = int(budget * trigger_ratio) if budget else 0
         if budget is None or estimated <= trigger:
-            self.source, self.projected = snapshot, projected
+            # source is only used as a delta boundary on this path. There is no
+            # await before it is replaced, so a shallow list is sufficient.
+            self.source, self.projected = list(messages), projected
             return deepcopy(projected)
+
+        snapshot = deepcopy(messages)
+        state_snapshot = deepcopy(self.state_reader()) if self.state_reader else None
+        definitions_snapshot = deepcopy(definitions)
 
         # 最新完整交换和其后的插话全部保留；用户/系统消息从不由模型摘要替换。
         last_exchange = next((
