@@ -871,7 +871,9 @@ class AgentRunner:
                         evidence_error = EvidencePersistenceError(
                             "工具证据保存或登记失败，已保留原始回执；停止后续模型请求。"
                         )
-                        logger.error("Tool evidence failed for {}: {}", tool_call.id, type(exc).__name__)
+                        logger.opt(exception=exc).error(
+                            "Tool evidence failed for {}: {}", tool_call.id, type(exc).__name__
+                        )
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,

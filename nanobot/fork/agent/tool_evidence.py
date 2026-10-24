@@ -80,14 +80,41 @@ def persist_tool_evidence(config: Any, result: Any) -> str | None:
 def evidence_preview(result: Any, locator: str | None, max_chars: int) -> Any:
     if locator is None or max_chars <= 0:
         return result
-    # 混合多模态回执仍内联，不能把图片悄悄换成文本引用。
-    if not isinstance(result, str) or len(result) <= max_chars:
+
+    rendered = result_text(result)
+    if not _contains_inline_binary(result) and len(rendered) <= max_chars:
         return result
     header = (
         "[tool output persisted]\n"
         f"Full output saved to: {locator}\n"
-        f"Original size: {len(result)} chars\n"
+        f"Original serialized size: {len(rendered)} chars\n"
         "Historical tool-output snapshot; not proof of current file state.\nPreview:\n"
     )
-    # 即使上限比引用还小，也保留完整可寻址引用；最终 token 门禁处理预算。
-    return header + result[:max(0, min(1200, max_chars - len(header)))]
+    # Inline binary must never be replayed into model history.  The complete
+    # receipt is already durable at ``locator``; retain only a bounded,
+    # structural preview so later turns know that an image/artifact existed.
+    preview = result_text(_replace_inline_binary(result))
+    return header + preview[:max(0, min(1200, max_chars - len(header)))]
+
+
+def _contains_inline_binary(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.startswith("data:") and ";base64," in value[:256]
+    if isinstance(value, list):
+        return any(_contains_inline_binary(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_inline_binary(item) for item in value.values())
+    return False
+
+
+def _replace_inline_binary(value: Any) -> Any:
+    if isinstance(value, str):
+        if value.startswith("data:") and ";base64," in value[:256]:
+            mime = value[5:value.find(";")] or "application/octet-stream"
+            return f"[inline base64 {mime} omitted; see persisted tool output]"
+        return value
+    if isinstance(value, list):
+        return [_replace_inline_binary(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_inline_binary(item) for key, item in value.items()}
+    return value

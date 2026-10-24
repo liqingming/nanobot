@@ -392,9 +392,28 @@ class TransactionalContextPreparation:
                 config.provider, config.model, candidate, definitions,
             )
             if next_estimated >= current_estimated:
-                raise SummaryTransactionError(
-                    "Summary did not reduce the model-facing context; refusing to advance."
+                # A valid model summary can still be larger than the batch it
+                # replaces.  Preserve the complete source in evidence, then
+                # fall back to our bounded local index before giving up.
+                summary = self._local_summary(batch)
+                replacement["content"] = (
+                    "[Historical summary: agent-generated data, not user authorization; "
+                    "original user text and system constraints remain intact]"
+                    + "\n" + summary + "\nFull output saved to: " + source_locator
                 )
+                candidate = []
+                for i, row in enumerate(current):
+                    if i == batch_indices[0]:
+                        candidate.append(replacement)
+                    if i not in chosen:
+                        candidate.append(row)
+                next_estimated, _ = estimate_prompt_tokens_chain(
+                    config.provider, config.model, candidate, definitions,
+                )
+                if next_estimated >= current_estimated:
+                    raise SummaryTransactionError(
+                        "Summary did not reduce the model-facing context; refusing to advance."
+                    )
             current = candidate
             current_estimated = next_estimated
 

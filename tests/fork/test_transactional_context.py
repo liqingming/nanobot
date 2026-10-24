@@ -351,6 +351,30 @@ async def test_large_history_uses_local_fallback_when_summary_provider_fails(tmp
     assert result[-2:] == messages[-2:]
 
 
+async def test_oversized_valid_summary_falls_back_to_bounded_local_index(tmp_path):
+    cfg = replace(config(tmp_path), context_block_limit=1_600)
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "preserve constraints"},
+        *(row for index in range(8) for row in exchange(index, "old evidence " * 100)),
+        {"role": "user", "content": "continue"},
+        *exchange(99),
+    ]
+
+    async def oversized(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        return LLMResponse(content=json.dumps({
+            "summary": "x" * 7_000,
+            "source_sha256": payload["source_sha256"],
+        }))
+
+    cfg.provider.chat_with_retry.side_effect = oversized
+    result = await TransactionalContextPreparation().prepare(cfg, messages)
+
+    summaries = [str(row.get("content")) for row in result if row.get("role") == "assistant"]
+    assert summaries and all("x" * 7_000 not in content for content in summaries)
+
+
 @pytest.mark.parametrize("rows", [
     exchange(1)[:1], exchange(1)[1:],
     exchange(1)[:1] + [{"role": "user", "content": "新消息"}] + exchange(1)[1:],

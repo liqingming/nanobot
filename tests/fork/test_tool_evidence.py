@@ -12,7 +12,11 @@ from nanobot.agent.context_artifacts import ToolDigestBuilder
 from nanobot.agent.context_governance import ContextGovernor
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.fork.agent import tool_evidence
-from nanobot.fork.agent.tool_evidence import EvidencePersistenceError, persist_tool_evidence
+from nanobot.fork.agent.tool_evidence import (
+    EvidencePersistenceError,
+    evidence_preview,
+    persist_tool_evidence,
+)
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
@@ -73,6 +77,26 @@ def test_no_storage_never_truncates_only_copy():
     cfg = SimpleNamespace(data_dir=None, workspace=None, session_key=None, max_tool_result_chars=32)
     raw = "唯一原文" * 1000
     assert ContextGovernor.normalize_tool_result(cfg, "id", "exec", raw) == raw
+
+
+def test_evidence_preview_replaces_nested_inline_base64_with_durable_reference(tmp_path):
+    cfg = config(tmp_path)
+    raw = [{
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64," + "a" * 20_000},
+        "metadata": {"thumbnail": "data:image/jpeg;base64," + "b" * 20_000},
+    }]
+    locator = persist_tool_evidence(cfg, raw)
+
+    preview = evidence_preview(raw, locator, 512)
+
+    assert isinstance(preview, str)
+    assert locator in preview
+    assert "inline base64 image/png omitted" in preview
+    assert "a" * 100 not in preview
+    assert Path(locator).read_text(encoding="utf-8") == json.dumps(
+        raw, ensure_ascii=False, sort_keys=True
+    )
 
 
 async def test_batch_evidence_failure_keeps_all_results_and_checkpoints_without_model_retry(
