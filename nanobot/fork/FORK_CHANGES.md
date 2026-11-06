@@ -179,9 +179,33 @@
 
 - upstream 如果已有新的 runtime events/tool events，应把 fork 的格式化能力接到新事件管线，而不是保留旧重复通道。
 
-## 4. 7 月新增和近期必须补保的能力
+## 4. 9 月新增和近期必须补保的能力
 
-### 4.1 CLI 默认行为：`nanobot` 等同 `nanobot agent`
+### 4.1 本机跨 serve Agent 会话并发闸门
+
+主要文件：
+
+- `nanobot/fork/agent_concurrency.py`
+- `nanobot/api/server.py`
+- `nanobot/cli/commands.py`
+- `tests/fork/test_agent_concurrency.py`
+
+能力：
+
+- 通过 SQLite lease 在多个 Windows Nanobot serve 进程之间共享 `maxSessions` 上限。
+- 等待任务按创建顺序排队；请求取消、超时和服务异常退出后可清理或通过 lease 过期恢复。
+- API 会话执行前获取槽位，执行结束后释放；Codex Relay 纯转发模式不占用槽位。
+- upstream 同步时优先保留 `nanobot/fork/agent_concurrency.py`，只重新移植 `api/server.py` 的可选 `concurrency_gate` 接入和 `cli/commands.py` 的 CLI 参数。
+
+同步注意：
+
+- `create_app()` 的 `concurrency_gate` 必须保持可选，未传入时不得改变 upstream API 行为。
+- `--concurrency-config` 只加载 fork 专用 JSON；配置缺失时限制关闭。
+- 平台服务脚本通过该参数传入共享的 `nanobot-platform/config/fork-concurrency.json`，不能为每个实例生成独立状态库。
+
+### 4.2 7 月新增和近期必须补保的能力
+
+### 4.3 CLI 默认行为：`nanobot` 等同 `nanobot agent`
 
 主要文件：
 
@@ -197,7 +221,7 @@
 
 - upstream 如果改 Typer callback 或 command 分发，必须保留无参启动 agent 的默认路径。
 
-### 4.2 运行日志写入话题目录
+### 4.4 运行日志写入话题目录
 
 主要文件：
 
@@ -218,7 +242,7 @@
 - upstream 如果删除 `nanobot/utils/session_runtime_log.py`，应保留 fork 版本，或迁移到 upstream 新的 run records/logging 机制。
 - `AgentLoop` 状态机重构时，要把 `append_session_runtime_log()` 接回每个关键节点。
 
-### 4.3 模型错误可见化和任务级自动恢复
+### 4.5 模型错误可见化和任务级自动恢复
 
 主要文件：
 

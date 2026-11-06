@@ -356,6 +356,11 @@ def serve(
     port: int | None = typer.Option(None, "--port", "-p", help="API server port"),
     host: str | None = typer.Option(None, "--host", "-H", help="Bind address"),
     timeout: float | None = typer.Option(None, "--timeout", "-t", help="Per-request timeout (seconds)"),
+    concurrency_config: str | None = typer.Option(
+        None,
+        "--concurrency-config",
+        help="Fork concurrency configuration JSON shared by local Nanobot services",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show nanobot runtime logs"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
@@ -369,6 +374,7 @@ def serve(
 
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
+    from nanobot.fork.agent_concurrency import AgentConcurrencyGate, load_agent_concurrency_config
     from nanobot.providers.image_generation import image_gen_provider_configs
     from nanobot.session.manager import SessionManager
 
@@ -419,6 +425,10 @@ def serve(
         web.run_app(api_app, host=host, port=port, print=_log_relay_aiohttp)
         return
 
+    concurrency = AgentConcurrencyGate(
+        load_agent_concurrency_config(Path(concurrency_config).expanduser() if concurrency_config else None),
+        instance_id=f"{host}:{port}",
+    )
     data_dir = get_workspace_cache_dir(runtime_config.workspace_path)
     sync_workspace_templates(data_dir)
     bus = MessageBus()
@@ -455,6 +465,7 @@ def serve(
         "request_timeout": timeout,
         "api_key": api_key,
         "prepare_agent": mcp_provider.connect,
+        "concurrency_gate": concurrency,
     }
     api_app = create_app(agent_loop, **api_app_kwargs)
 

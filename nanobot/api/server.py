@@ -11,6 +11,7 @@ import contextlib
 import json as _json
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
 from aiohttp import web
@@ -40,6 +41,7 @@ from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
     from nanobot.config.schema import CodexRelayConfig
+    from nanobot.fork.agent_concurrency import AgentConcurrencyGate
 
 __all__ = (
     "MAX_FILE_SIZE",
@@ -56,6 +58,7 @@ _AGENT_LOOP_KEY = web.AppKey[Any]("agent_loop")
 _MODEL_NAME_KEY = web.AppKey[str]("model_name")
 _REQUEST_TIMEOUT_KEY = web.AppKey[float]("request_timeout")
 _SESSION_LOCKS_KEY = web.AppKey[dict[str, asyncio.Lock]]("session_locks")
+_CONCURRENCY_GATE_KEY = web.AppKey[Any]("concurrency_gate")
 _PREPARE_AGENT_KEY = web.AppKey[Callable[[], Awaitable[None]] | None]("prepare_agent")
 _MISSING = object()
 
@@ -95,6 +98,15 @@ async def _prepare_agent(app: Any) -> None:
     )
     if prepare is not None:
         await prepare()
+
+
+@asynccontextmanager
+async def _optional_lease(lease: Any):
+    if lease is None:
+        yield
+        return
+    async with lease:
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +424,12 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
         "session_locks",
     )
     session_lock = session_locks.setdefault(session_key, asyncio.Lock())
+    concurrency_gate: AgentConcurrencyGate | None = _app_value(
+        request.app,
+        _CONCURRENCY_GATE_KEY,
+        "concurrency_gate",
+        None,
+    )
 
     logger.info(
         "API request session_key={} media={} text={} stream={}",
@@ -451,19 +469,27 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
             nonlocal stream_failed
             try:
                 async with session_lock:
-                    async with asyncio.timeout(timeout_s):
-                        await _prepare_agent(request.app)
-                        response = await agent_loop.process_direct(
-                            content=text,
-                            media=media_paths if media_paths else None,
-                            session_key=session_key,
-                            channel="api",
-                            chat_id=API_CHAT_ID,
-                            on_progress=_discard_api_progress,
-                            on_stream=_on_stream,
-                            on_stream_end=_on_stream_end,
-                            metadata=metadata,
-                        )
+                    lease = await concurrency_gate.acquire(session_key) if concurrency_gate else None
+                    if concurrency_gate and lease is None:
+                        raise TimeoutError("agent concurrency queue timeout")
+                    try:
+                        async with _optional_lease(lease):
+                            async with asyncio.timeout(timeout_s):
+                                await _prepare_agent(request.app)
+                                response = await agent_loop.process_direct(
+                                    content=text,
+                                    media=media_paths if media_paths else None,
+                                    session_key=session_key,
+                                    channel="api",
+                                    chat_id=API_CHAT_ID,
+                                    on_progress=_discard_api_progress,
+                                    on_stream=_on_stream,
+                                    on_stream_end=_on_stream_end,
+                                    metadata=metadata,
+                                )
+                    finally:
+                        if lease is not None:
+                            await lease.release()
                     if not emitted_content:
                         response_text = _response_text(response)
                         if response_text.strip():
@@ -496,29 +522,37 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
     usage_capture = _UsageCaptureHook()
     try:
         async with session_lock:
+            lease = None
             try:
-                async with asyncio.timeout(timeout_s):
-                    await _prepare_agent(request.app)
-                    response = await agent_loop.process_direct(
-                        content=text,
-                        media=media_paths if media_paths else None,
-                        session_key=session_key,
-                        channel="api",
-                        chat_id=API_CHAT_ID,
-                        on_progress=_discard_api_progress,
-                        metadata=metadata,
-                        hooks=[usage_capture],
-                    )
-                response_text = _response_text(response)
-                if not response_text or not response_text.strip():
-                    logger.warning("Empty response for session {}, using fallback", session_key)
-                    response_text = EMPTY_FINAL_RESPONSE_MESSAGE
+                lease = await concurrency_gate.acquire(session_key) if concurrency_gate else None
+                if concurrency_gate and lease is None:
+                    return _error_json(503, "Agent concurrency queue timed out", err_type="server_busy")
+                async with _optional_lease(lease):
+                    async with asyncio.timeout(timeout_s):
+                        await _prepare_agent(request.app)
+                        response = await agent_loop.process_direct(
+                            content=text,
+                            media=media_paths if media_paths else None,
+                            session_key=session_key,
+                            channel="api",
+                            chat_id=API_CHAT_ID,
+                            on_progress=_discard_api_progress,
+                            metadata=metadata,
+                            hooks=[usage_capture],
+                        )
+                    response_text = _response_text(response)
+                    if not response_text or not response_text.strip():
+                        logger.warning("Empty response for session {}, using fallback", session_key)
+                        response_text = EMPTY_FINAL_RESPONSE_MESSAGE
 
             except asyncio.TimeoutError:
                 return _error_json(504, f"Request timed out after {request_timeout_s}s")
             except Exception:
                 logger.exception("Error processing request for session {}", session_key)
                 return _error_json(500, "Internal server error", err_type="server_error")
+            finally:
+                if lease is not None:
+                    await lease.release()
     except Exception:
         logger.exception("Unexpected API lock error for session {}", session_key)
         return _error_json(500, "Internal server error", err_type="server_error")
@@ -563,6 +597,7 @@ def create_app(
     api_key: str = "",
     prepare_agent: Callable[[], Awaitable[None]] | None = None,
     codex_relay: "CodexRelayConfig | None" = None,
+    concurrency_gate: "AgentConcurrencyGate | None" = None,
 ) -> web.Application:
     """Create the aiohttp application.
 
@@ -586,6 +621,7 @@ def create_app(
         app[_REQUEST_TIMEOUT_KEY] = request_timeout
         app[_SESSION_LOCKS_KEY] = {}  # per-user locks, keyed by session_key
         app[_PREPARE_AGENT_KEY] = prepare_agent
+        app[_CONCURRENCY_GATE_KEY] = concurrency_gate
 
     @web.middleware
     async def auth_middleware(
